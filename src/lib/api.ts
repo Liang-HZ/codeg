@@ -5390,7 +5390,12 @@ export async function setChatAuthoringSettings(
  * Does NOT touch chat-side `selectorsCache` or `localStorage` preferences. */
 export async function describeAgentOptions(
   agentType: AgentType,
-  workingDir?: string | null
+  workingDir?: string | null,
+  /** Config selections to apply on the probe session before reading the
+   *  snapshot. Callers pass the model: an agent that derives one option's
+   *  choices from another's value (opencode lists `effort` per model) then
+   *  answers for the user's selection instead of its own default model. */
+  configValues?: Record<string, string> | null
 ): Promise<AgentOptionsSnapshot> {
   // The backend probe has its own 60s timeout (`ConnectionManager::
   // probe_agent_options`) plus 500ms grace + poll/serialization
@@ -5403,6 +5408,7 @@ export async function describeAgentOptions(
     {
       agentType,
       workingDir: workingDir ?? null,
+      configValues: configValues ?? null,
     },
     { timeoutMs: 70_000 }
   )

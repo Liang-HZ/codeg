@@ -232,7 +232,12 @@ function TaskEditorBody({
   // quietly ignored.
   const choosesBranch = task?.source_kind !== "forge_pr"
 
-  const agentOptions = useAgentOptions(agentType, folderPath, true)
+  const agentOptions = useAgentOptions(
+    agentType,
+    folderPath,
+    true,
+    configValues
+  )
 
   // An untouched pill is saved as "inherit" only while it shows the agent that
   // inheriting launches. It can show another: the placeholder when nothing is

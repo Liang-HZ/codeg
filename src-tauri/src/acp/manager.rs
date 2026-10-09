@@ -2419,6 +2419,13 @@ impl ConnectionManager {
     /// what `codeg-mcp` will pass through to `session/set_config_option`
     /// when a delegation actually fires.
     ///
+    /// `preferred_config_values` are applied on the probe session before the
+    /// snapshot is read, exactly as a real launch would apply them: an agent
+    /// that derives one option's choices from another's value (opencode
+    /// re-lists `effort` per selected model) then answers for the user's
+    /// selection instead of its own default. A value the agent rejects is
+    /// logged and skipped — the snapshot still comes back.
+    ///
     /// Returns `Ok(snapshot)` even when the agent advertises no options
     /// (empty `config_options`, `None` modes) — that's a valid outcome the
     /// UI can render as "this agent has nothing to configure."
@@ -2427,6 +2434,7 @@ impl ConnectionManager {
         agent_type: AgentType,
         working_dir: Option<String>,
         runtime_env: BTreeMap<String, String>,
+        preferred_config_values: BTreeMap<String, String>,
     ) -> Result<AgentOptionsSnapshot, AcpError> {
         // Owner window label is informational only (used for
         // disconnect_by_owner_window), but worth being explicit so a probe
@@ -2462,7 +2470,7 @@ impl ConnectionManager {
                 owner_window,
                 EventEmitter::Noop,
                 None,
-                BTreeMap::new(),
+                preferred_config_values,
             )
             .await?;
 

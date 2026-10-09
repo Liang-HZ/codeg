@@ -75,3 +75,45 @@ describe("useAgentOptions snapshot ownership", () => {
     expect(result.current.snapshotAgentType).toBe("codex")
   })
 })
+
+describe("useAgentOptions model-scoped probes", () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+    describeAgentOptions.mockReset()
+    describeAgentOptions.mockImplementation((agent: AgentType) =>
+      Promise.resolve(snapshotFor(agent))
+    )
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it("applies the selected model and re-probes when it changes", async () => {
+    const folder = `/tmp/use-agent-options-model-${Math.random()}`
+    const { rerender } = renderHook(
+      ({ model }: { model: string }) =>
+        useAgentOptions("deepseek" as AgentType, folder, true, { model }),
+      { initialProps: { model: "opencode-go/deepseek-v4.1-flash" } }
+    )
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(300)
+    })
+    expect(describeAgentOptions).toHaveBeenCalledTimes(1)
+    expect(describeAgentOptions).toHaveBeenLastCalledWith("deepseek", folder, {
+      model: "opencode-go/deepseek-v4.1-flash",
+    })
+
+    // A different model derives different option lists — the (agent, folder)
+    // cache must not serve the previous model's snapshot.
+    rerender({ model: "vercel/callstack/apex" })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(300)
+    })
+    expect(describeAgentOptions).toHaveBeenCalledTimes(2)
+    expect(describeAgentOptions).toHaveBeenLastCalledWith("deepseek", folder, {
+      model: "vercel/callstack/apex",
+    })
+  })
+})

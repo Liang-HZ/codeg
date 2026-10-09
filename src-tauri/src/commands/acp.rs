@@ -11238,6 +11238,7 @@ pub async fn acp_describe_agent_options_core(
     data_dir: &Path,
     agent_type: AgentType,
     working_dir: Option<String>,
+    preferred_config_values: BTreeMap<String, String>,
 ) -> Result<crate::acp::types::AgentOptionsSnapshot, AcpError> {
     verify_agent_installed(agent_type).await?;
     // Build the same runtime env delegation/acp_connect would build so
@@ -11247,7 +11248,12 @@ pub async fn acp_describe_agent_options_core(
     // model_provider injects a different model list, etc.).
     let runtime_env = build_session_runtime_env(db, agent_type, None, data_dir).await?;
     manager
-        .probe_agent_options(agent_type, working_dir, runtime_env)
+        .probe_agent_options(
+            agent_type,
+            working_dir,
+            runtime_env,
+            preferred_config_values,
+        )
         .await
 }
 
@@ -11256,6 +11262,9 @@ pub async fn acp_describe_agent_options_core(
 pub async fn acp_describe_agent_options(
     agent_type: AgentType,
     working_dir: Option<String>,
+    // Config selections to apply on the probe session before reading the
+    // snapshot — callers pass the model so per-model option lists match.
+    config_values: Option<BTreeMap<String, String>>,
     manager: State<'_, ConnectionManager>,
     db: State<'_, AppDatabase>,
     app_handle: tauri::AppHandle,
@@ -11265,7 +11274,15 @@ pub async fn acp_describe_agent_options(
         .app_data_dir()
         .map(|p| crate::paths::resolve_effective_data_dir(&p))
         .unwrap_or_else(|_| PathBuf::from("."));
-    acp_describe_agent_options_core(&manager, &db, &app_data_dir, agent_type, working_dir).await
+    acp_describe_agent_options_core(
+        &manager,
+        &db,
+        &app_data_dir,
+        agent_type,
+        working_dir,
+        config_values.unwrap_or_default(),
+    )
+    .await
 }
 
 #[cfg(feature = "tauri-runtime")]
