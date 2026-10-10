@@ -1212,6 +1212,8 @@ export function buildStreamingTurnsFromLiveMessage(
         //   - OpenCode 2:  flat  `meta["codeg.parentToolCallId"]`, stamped by
         //     the backend (`opencode_frame_route`), since OpenCode marks a
         //     sub-agent's calls only with the child SESSION they ran in
+        //   - Qoder:       nested `meta.qoder.parentToolUseId` (emitted by a
+        //                  locally patched qodercli; stock builds send none)
         // Reading them makes those sub-agents nest precisely (like Claude
         // Code) instead of falling back to the positional heuristic, which the
         // sub-agent's interleaved thinking blocks break. Guard each access level
@@ -1237,6 +1239,13 @@ export function buildStreamingTurnsFromLiveMessage(
               PARENT_TOOL_CALL_META_KEY
             ]
             if (typeof codegParent === "string") parentId = codegParent
+          }
+          if (!parentId) {
+            const qd = (meta as Record<string, unknown>).qoder
+            if (qd && typeof qd === "object" && "parentToolUseId" in qd) {
+              const pid = (qd as Record<string, unknown>).parentToolUseId
+              if (typeof pid === "string") parentId = pid
+            }
           }
         }
 
