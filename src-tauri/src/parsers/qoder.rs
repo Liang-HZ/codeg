@@ -8,8 +8,8 @@ use serde_json::Value;
 use walkdir::WalkDir;
 
 use crate::models::{
-    AgentType, ContentBlock, ConversationDetail, ConversationSummary, MessageRole, TurnUsage,
-    UnifiedMessage,
+    AgentType, ContentBlock, ConversationDetail, ConversationSummary, MessageRole, SessionStats,
+    TurnUsage, UnifiedMessage,
 };
 use crate::parsers::claude::{
     api_error_text, capture_title_record, extract_assistant_content, extract_usage,
@@ -780,7 +780,13 @@ fn parse_transcript(bytes: &[u8]) -> Transcript {
                     .pointer("/message/model")
                     .and_then(Value::as_str)
                     .map(String::from);
-                if model.is_none() {
+                // Last NON-EMPTY model wins: a mid-session switch has to land
+                // in `summary.model` (the details dialog reads it ahead of the
+                // turns) and in the context-window fallback below. Pinning the
+                // FIRST model here left both on the session's opening model —
+                // a switch to Qwen3.8-Flash still displayed DeepSeek-Flash
+                // next to the new model's 200K window.
+                if entry_model.is_some() {
                     model.clone_from(&entry_model);
                 }
                 let message_id = value
@@ -1038,8 +1044,10 @@ fn parse_detail(path: &Path, conversation_id: &str) -> Result<ConversationDetail
     // produced: for a session recorded before `QODER_EXPOSE_TOKEN_USAGE` there
     // is no division to do, and where there is, Qoder's figure is the original
     // and the division is a round-trip through a rounded window.
+    let mut session_stats = compute_session_stats(&turns);
+    merge_subagent_usage(&mut session_stats, path);
     let session_stats = with_reported_context_percent(
-        merge_context_window_stats(compute_session_stats(&turns), used_tokens, max_tokens),
+        merge_context_window_stats(session_stats, used_tokens, max_tokens),
         transcript.reported_context.map(ReportedContext::percent),
     );
 
@@ -1063,6 +1071,125 @@ fn parse_detail(path: &Path, conversation_id: &str) -> Result<ConversationDetail
         session_stats,
         transcript_watermark: Some(transcript_watermark),
     })
+}
+
+/// Fold a session's SUB-AGENT model usage into its stats.
+///
+/// Qoder runs sub-agents in-process: their model calls never reach the
+/// transcript, they only appear in the run's segment log
+/// (`<config>/logs/sessions/<encoded-cwd>/<sessionId>/segments/*.jsonl`,
+/// one file per CLI run). Transcript-derived stats therefore under-count
+/// every fan-out — a "review this repo" turn that dispatched two Explore
+/// agents reported roughly a fifth of the tokens actually spent.
+///
+/// Only turns the log itself marks `is_subagent` are added: the main chain in
+/// the same log would double-count what the transcript already carries.
+/// Best-effort by construction — a missing or rotated log leaves the stats
+/// exactly as the transcript computed them.
+fn merge_subagent_usage(stats: &mut Option<SessionStats>, transcript_path: &Path) {
+    let Some(config_root) = transcript_path
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+    else {
+        return;
+    };
+    let Some(encoded_cwd) = transcript_path.parent().and_then(Path::file_name) else {
+        return;
+    };
+    let Some(session_id) = transcript_path.file_stem() else {
+        return;
+    };
+    let segments_dir = config_root
+        .join("logs")
+        .join("sessions")
+        .join(encoded_cwd)
+        .join(session_id)
+        .join("segments");
+    let Ok(entries) = fs::read_dir(&segments_dir) else {
+        return;
+    };
+
+    let mut added = TurnUsage::default();
+    let mut found = false;
+    for entry in entries.flatten() {
+        if entry.path().extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let mut subagent_turns: HashSet<String> = HashSet::new();
+        let mut calls: Vec<(String, TurnUsage)> = Vec::new();
+        for line in text.lines() {
+            let Ok(value) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            match value.get("type").and_then(Value::as_str) {
+                Some("turn.started") => {
+                    if value.pointer("/data/is_subagent").and_then(Value::as_bool) == Some(true) {
+                        if let Some(turn_id) = value.get("turn_id").and_then(Value::as_str) {
+                            subagent_turns.insert(turn_id.to_string());
+                        }
+                    }
+                }
+                Some("model.response.completed") => {
+                    let Some(turn_id) = value.get("turn_id").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let pick = |key: &str| {
+                        value
+                            .pointer(&format!("/data/{key}"))
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0)
+                    };
+                    calls.push((
+                        turn_id.to_string(),
+                        TurnUsage {
+                            input_tokens: pick("input_tokens"),
+                            output_tokens: pick("output_tokens"),
+                            cache_creation_input_tokens: pick("cache_creation_input_tokens"),
+                            cache_read_input_tokens: pick("cache_read_input_tokens"),
+                        },
+                    ));
+                }
+                _ => {}
+            }
+        }
+        for (turn_id, usage) in calls {
+            if !subagent_turns.contains(&turn_id) {
+                continue;
+            }
+            found = true;
+            added.input_tokens += usage.input_tokens;
+            added.output_tokens += usage.output_tokens;
+            added.cache_creation_input_tokens += usage.cache_creation_input_tokens;
+            added.cache_read_input_tokens += usage.cache_read_input_tokens;
+        }
+    }
+    if !found {
+        return;
+    }
+
+    let stats = stats.get_or_insert_with(|| SessionStats {
+        total_usage: None,
+        total_tokens: None,
+        total_duration_ms: 0,
+        context_window_used_tokens: None,
+        context_window_max_tokens: None,
+        context_window_usage_percent: None,
+    });
+    let usage = stats.total_usage.get_or_insert_with(TurnUsage::default);
+    usage.input_tokens += added.input_tokens;
+    usage.output_tokens += added.output_tokens;
+    usage.cache_creation_input_tokens += added.cache_creation_input_tokens;
+    usage.cache_read_input_tokens += added.cache_read_input_tokens;
+    stats.total_tokens = Some(
+        usage.input_tokens
+            + usage.output_tokens
+            + usage.cache_creation_input_tokens
+            + usage.cache_read_input_tokens,
+    );
 }
 
 #[cfg(test)]
@@ -1152,6 +1279,70 @@ mod tests {
         assert_eq!(
             s.ended_at.as_ref().map(|t| t.to_rfc3339()),
             Some("2026-08-16T15:45:34+00:00".to_string())
+        );
+    }
+
+    // A mid-session model switch must reach the summary: the details dialog
+    // reads `summary.model` ahead of the turns, so a summary pinned to the
+    // session's OPENING model contradicted the context gauge (which follows
+    // the last turn's window — Qwen3.8-Flash's 200K next to DeepSeek-Flash).
+    #[test]
+    fn summary_model_follows_a_mid_session_switch() {
+        let tmp = tempfile::tempdir().unwrap();
+        const SWITCHED_ANSWER_LINE: &str = r#"{"type":"assistant","uuid":"b1","timestamp":"2026-08-16T15:46:00.000Z","message":{"id":"chatcmpl-2","type":"message","role":"assistant","model":"qfmodel","stop_reason":"end_turn","content":[{"type":"text","text":"second","citations":null}],"usage":{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":2}},"parentUuid":"a3","isSidechain":false,"cwd":"/private/tmp/probe","sessionId":"s1","userType":"external","entrypoint":"cli","version":"1.1.45","gitBranch":"main"}"#;
+        write_session(
+            tmp.path(),
+            "s1",
+            &[
+                RUNTIME_CONFIG,
+                USER_LINE,
+                THINKING_LINE,
+                TOOL_USE_LINE,
+                TOOL_RESULT_LINE,
+                ANSWER_LINE,
+                SWITCHED_ANSWER_LINE,
+            ],
+        );
+
+        let summaries = parser_in(tmp.path()).list_conversations().unwrap();
+        assert_eq!(summaries[0].model.as_deref(), Some("qfmodel"));
+        let detail = parser_in(tmp.path()).get_conversation("s1").unwrap();
+        assert_eq!(detail.summary.model.as_deref(), Some("qfmodel"));
+    }
+
+    // Sub-agent usage exists ONLY in the run's segment log (Qoder runs
+    // sub-agents in-process; their model calls never reach the transcript), so
+    // transcript-derived stats under-counted every fan-out. This pins the
+    // merge: the log's `is_subagent` turns are added, its main-chain turns are
+    // not (the transcript already carries those).
+    #[test]
+    fn session_stats_add_sub_agent_usage_from_the_segment_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_session(tmp.path(), "s1", &[USER_LINE, ANSWER_LINE]);
+        let segments = tmp
+            .path()
+            .join("logs/sessions/-private-tmp-probe/s1/segments");
+        std::fs::create_dir_all(&segments).unwrap();
+        let lines = [
+            r#"{"ts":"2026-10-10T05:57:58.846+08:00","seq":41,"type":"turn.started","turn_id":"t-main","data":{"model":"dfmodel","is_subagent":false}}"#,
+            r#"{"ts":"2026-10-10T05:58:06.495+08:00","seq":44,"type":"model.response.completed","turn_id":"t-main","data":{"input_tokens":999,"output_tokens":111,"cache_read_input_tokens":222,"cache_creation_input_tokens":0}}"#,
+            r#"{"ts":"2026-10-10T05:59:38.291+08:00","seq":500,"type":"turn.started","turn_id":"s1","data":{"model":"dfmodel","is_subagent":true}}"#,
+            r#"{"ts":"2026-10-10T05:59:42.000+08:00","seq":510,"type":"model.response.completed","turn_id":"s1","data":{"input_tokens":35000,"output_tokens":300,"cache_read_input_tokens":34000,"cache_creation_input_tokens":0}}"#,
+        ];
+        std::fs::write(segments.join("run-1.jsonl"), lines.join("\n") + "\n").unwrap();
+
+        let detail = parser_in(tmp.path()).get_conversation("s1").unwrap();
+        let stats = detail.session_stats.expect("session stats");
+        let usage = stats.total_usage.expect("usage");
+        // Transcript fixture: 10 prompt tokens of which 5 came from cache
+        // (Qoder's counters are OpenAI-shaped — `qoder_turn_usage` stores the
+        // fresh half), claimed once → 5 fresh in / 2 out / 5 cache read.
+        assert_eq!(usage.input_tokens, 5 + 35_000);
+        assert_eq!(usage.output_tokens, 2 + 300);
+        assert_eq!(usage.cache_read_input_tokens, 5 + 34_000);
+        assert_eq!(
+            stats.total_tokens,
+            Some(5 + 2 + 5 + 35_000 + 300 + 34_000)
         );
     }
 
