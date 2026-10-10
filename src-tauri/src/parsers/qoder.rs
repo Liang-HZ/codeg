@@ -2636,6 +2636,65 @@ mod tests {
     }
 
     #[test]
+    fn agent_card_gains_subagent_tool_calls_from_meta_and_transcript() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_use = r#"{"type":"assistant","uuid":"a9","timestamp":"2026-08-16T15:45:33.100Z","message":{"role":"assistant","model":"qmodel","stop_reason":"tool_use","content":[{"type":"tool_use","id":"call_agent1","name":"Agent","input":{"description":"读文件","subagent_type":"Explore"}}]},"parentUuid":"u1","isSidechain":false,"cwd":"/private/tmp/probe","sessionId":"s1","userType":"external","entrypoint":"acp","version":"1.1.67","gitBranch":"main"}"#;
+        let agent_result = r#"{"type":"user","uuid":"u9","timestamp":"2026-08-16T15:45:39.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_agent1","content":"以下是文件前 60 行…"}]},"sourceToolAssistantUUID":"a9","promptId":"s1","toolUseResult":{"isAsync":true,"status":"async_launched","agentId":"aExplore-abc123","description":"读文件"},"parentUuid":"a9","isSidechain":false,"cwd":"/private/tmp/probe","sessionId":"s1","userType":"external","entrypoint":"acp","version":"1.1.67","gitBranch":"main"}"#;
+        let active_leaf = r#"{"type":"active-leaf","sessionId":"s1","leafUuid":"u9","explicit":false,"timestamp":1786895139000}"#;
+        let path = write_session(tmp.path(), "s1", &[USER_LINE, agent_use, agent_result, active_leaf]);
+
+        // Side files a delegated run leaves behind: the meta names the
+        // launching tool call; the transcript carries the child's own calls.
+        let sub = path.with_extension("").join("subagents");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(
+            sub.join("agent-aExplore-abc123.meta.json"),
+            r#"{"agentType":"Explore","toolUseId":"call_agent1","description":"读文件","invocationName":"Explore"}"#,
+        )
+        .unwrap();
+        let child_use = r#"{"type":"assistant","uuid":"c1","timestamp":"2026-08-16T15:45:35.000Z","message":{"role":"assistant","model":"qmodel","content":[{"type":"tool_use","id":"call_r1","name":"Read","input":{"file_path":"/private/tmp/probe/NOTES.md"}}]},"isSidechain":true,"sessionId":"s1"}"#;
+        let child_result = r#"{"type":"user","uuid":"c2","timestamp":"2026-08-16T15:45:35.500Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_r1","content":"1\t# NOTES"}]},"isSidechain":true,"sessionId":"s1"}"#;
+        std::fs::write(
+            sub.join("agent-aExplore-abc123.jsonl"),
+            [child_use, child_result].join("\n") + "\n",
+        )
+        .unwrap();
+
+        let detail = parser_in(tmp.path()).get_conversation("s1").unwrap();
+        let stats = detail
+            .turns
+            .iter()
+            .flat_map(|t| t.blocks.iter())
+            .find_map(|b| match b {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    agent_stats,
+                    ..
+                } if tool_use_id.as_deref() == Some("call_agent1") => agent_stats.clone(),
+                _ => None,
+            })
+            .expect("Agent result carries agent_stats");
+        assert_eq!(stats.agent_type.as_deref(), Some("Explore"));
+        assert_eq!(stats.read_count, Some(1));
+        assert_eq!(
+            stats
+                .tool_calls
+                .iter()
+                .map(|c| c.tool_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Read"]
+        );
+        // Only the Agent result gains stats — exactly one block.
+        let with_stats = detail
+            .turns
+            .iter()
+            .flat_map(|t| t.blocks.iter())
+            .filter(|b| matches!(b, ContentBlock::ToolResult { agent_stats: Some(_), .. }))
+            .count();
+        assert_eq!(with_stats, 1);
+    }
+
+    #[test]
     fn tail_metadata_records_do_not_extend_timestamps() {
         let tmp = tempfile::tempdir().unwrap();
         write_session(
