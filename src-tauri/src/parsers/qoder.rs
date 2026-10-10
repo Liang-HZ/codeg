@@ -8,8 +8,8 @@ use serde_json::Value;
 use walkdir::WalkDir;
 
 use crate::models::{
-    AgentType, ContentBlock, ConversationDetail, ConversationSummary, MessageRole, SessionStats,
-    TurnUsage, UnifiedMessage,
+    AgentExecutionStats, AgentType, ContentBlock, ConversationDetail, ConversationSummary,
+    MessageRole, MessageTurn, SessionStats, TurnUsage, UnifiedMessage,
 };
 use crate::parsers::claude::{
     api_error_text, capture_title_record, extract_assistant_content, extract_usage,
@@ -1024,6 +1024,7 @@ fn parse_detail(path: &Path, conversation_id: &str) -> Result<ConversationDetail
     structurize_read_tool_output(&mut turns);
     resolve_patch_line_numbers(&mut turns, transcript.cwd.as_deref());
     backfill_turn_durations(&mut turns, &[]);
+    attach_subagent_tool_calls(&mut turns, path);
 
     // Qoder's own `token-stats` beats any reconstruction; the Anthropic-shaped
     // fallback is prompt tokens only (`output_tokens` is the reply, which does
@@ -1071,6 +1072,153 @@ fn parse_detail(path: &Path, conversation_id: &str) -> Result<ConversationDetail
         session_stats,
         transcript_watermark: Some(transcript_watermark),
     })
+}
+
+/// Attach each sub-agent's own transcript to the `Agent` tool result that
+/// launched it, as `agent_stats`.
+///
+/// Qoder writes one `subagents/agent-<agentId>.jsonl` per delegated run, an
+/// `agent-<agentId>.meta.json` naming the launching tool call (`toolUseId`)
+/// and the agent type, and `task-*.json` with the run's status / usage. The
+/// conversation itself stays the main chain; this only annotates the Agent
+/// card with the sub-agent's PROCESS (its tool calls), mirroring what
+/// `parsers::claude` does for Claude Code's sidechain layout.
+///
+/// The mapping is explicit (`meta.json` → parent tool-call id), never
+/// positional: it survives parallel sub-agents, interleaved streams, and a
+/// session resumed long after the run.
+fn attach_subagent_tool_calls(turns: &mut [MessageTurn], session_path: &Path) {
+    let dir = session_path.with_extension("").join("subagents");
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return;
+    };
+
+    struct TaskInfo {
+        status: Option<String>,
+        total_tokens: Option<u64>,
+        duration_ms: Option<u64>,
+        tool_uses: Option<u32>,
+    }
+
+    let mut tasks: HashMap<String, TaskInfo> = HashMap::new();
+    // (parent tool-call id, transcript path, agent type)
+    let mut agents: Vec<(String, PathBuf, Option<String>)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with("task-") && name.ends_with(".json") {
+            let Ok(bytes) = fs::read(&path) else { continue };
+            let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+                continue;
+            };
+            let Some(parent) = value
+                .get("parentToolUseId")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            let usage = value.get("usage");
+            tasks.entry(parent.to_string()).or_insert_with(|| TaskInfo {
+                status: value
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                total_tokens: usage
+                    .and_then(|u| u.get("total_tokens"))
+                    .and_then(Value::as_u64),
+                duration_ms: usage
+                    .and_then(|u| u.get("duration_ms"))
+                    .and_then(Value::as_u64),
+                tool_uses: usage
+                    .and_then(|u| u.get("tool_uses"))
+                    .and_then(Value::as_u64)
+                    .map(|n| n as u32),
+            });
+        } else if name.starts_with("agent-") && name.ends_with(".meta.json") {
+            let Ok(bytes) = fs::read(&path) else { continue };
+            let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+                continue;
+            };
+            let Some(parent) = value
+                .get("toolUseId")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            let transcript = path.with_file_name(format!(
+                "{}.jsonl",
+                name.trim_end_matches(".meta.json")
+            ));
+            if transcript.exists() {
+                agents.push((
+                    parent.to_string(),
+                    transcript,
+                    value
+                        .get("agentType")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                ));
+            }
+        }
+    }
+    // Directory order is filesystem-defined; attach deterministically.
+    agents.sort_by(|a, b| a.0.cmp(&b.0));
+
+    for (parent, transcript, agent_type) in agents {
+        let (calls, _usage, _started) =
+            crate::parsers::claude::parse_subagent_tool_calls(&transcript);
+        let info = tasks.remove(&parent);
+        let (mut read, mut search, mut bash, mut edit, mut other) = (0u32, 0u32, 0u32, 0u32, 0u32);
+        for call in &calls {
+            match call.tool_name.as_str() {
+                "Read" => read += 1,
+                "Grep" | "Glob" | "LS" | "List" => search += 1,
+                "Bash" => bash += 1,
+                "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => edit += 1,
+                _ => other += 1,
+            }
+        }
+        let stats = AgentExecutionStats {
+            agent_type,
+            status: info.as_ref().and_then(|i| i.status.clone()),
+            total_duration_ms: info.as_ref().and_then(|i| i.duration_ms),
+            total_tokens: info.as_ref().and_then(|i| i.total_tokens),
+            total_tool_use_count: Some(
+                info.as_ref()
+                    .and_then(|i| i.tool_uses)
+                    .filter(|n| *n > 0)
+                    .unwrap_or(calls.len() as u32),
+            ),
+            read_count: Some(read),
+            search_count: Some(search),
+            bash_count: Some(bash),
+            edit_file_count: Some(edit),
+            other_tool_count: Some(other),
+            tool_calls: calls,
+            ..Default::default()
+        };
+        for turn in turns.iter_mut() {
+            let mut attached = false;
+            for block in turn.blocks.iter_mut() {
+                if let ContentBlock::ToolResult {
+                    tool_use_id,
+                    agent_stats,
+                    ..
+                } = block
+                {
+                    if tool_use_id.as_deref() == Some(parent.as_str()) && agent_stats.is_none() {
+                        *agent_stats = Some(stats.clone());
+                        attached = true;
+                    }
+                }
+            }
+            if attached {
+                break;
+            }
+        }
+    }
 }
 
 /// Fold a session's SUB-AGENT model usage into its stats.
@@ -1523,6 +1671,65 @@ mod tests {
             .blocks
             .iter()
             .all(|b| !matches!(b, ContentBlock::Text { text } if text.contains("sub-agent")))));
+    }
+
+    #[test]
+    fn agent_card_gains_subagent_tool_calls_from_meta_and_transcript() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_use = r#"{"type":"assistant","uuid":"a9","timestamp":"2026-08-16T15:45:33.100Z","message":{"role":"assistant","model":"qmodel","stop_reason":"tool_use","content":[{"type":"tool_use","id":"call_agent1","name":"Agent","input":{"description":"读文件","subagent_type":"Explore"}}]},"parentUuid":"u1","isSidechain":false,"cwd":"/private/tmp/probe","sessionId":"s1","userType":"external","entrypoint":"acp","version":"1.1.67","gitBranch":"main"}"#;
+        let agent_result = r#"{"type":"user","uuid":"u9","timestamp":"2026-08-16T15:45:39.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_agent1","content":"以下是文件前 60 行…"}]},"sourceToolAssistantUUID":"a9","promptId":"s1","toolUseResult":{"isAsync":true,"status":"async_launched","agentId":"aExplore-abc123","description":"读文件"},"parentUuid":"a9","isSidechain":false,"cwd":"/private/tmp/probe","sessionId":"s1","userType":"external","entrypoint":"acp","version":"1.1.67","gitBranch":"main"}"#;
+        let active_leaf = r#"{"type":"active-leaf","sessionId":"s1","leafUuid":"u9","explicit":false,"timestamp":1786895139000}"#;
+        let path = write_session(tmp.path(), "s1", &[USER_LINE, agent_use, agent_result, active_leaf]);
+
+        // Side files a delegated run leaves behind: the meta names the
+        // launching tool call; the transcript carries the child's own calls.
+        let sub = path.with_extension("").join("subagents");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(
+            sub.join("agent-aExplore-abc123.meta.json"),
+            r#"{"agentType":"Explore","toolUseId":"call_agent1","description":"读文件","invocationName":"Explore"}"#,
+        )
+        .unwrap();
+        let child_use = r#"{"type":"assistant","uuid":"c1","timestamp":"2026-08-16T15:45:35.000Z","message":{"role":"assistant","model":"qmodel","content":[{"type":"tool_use","id":"call_r1","name":"Read","input":{"file_path":"/private/tmp/probe/NOTES.md"}}]},"isSidechain":true,"sessionId":"s1"}"#;
+        let child_result = r#"{"type":"user","uuid":"c2","timestamp":"2026-08-16T15:45:35.500Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_r1","content":"1\t# NOTES"}]},"isSidechain":true,"sessionId":"s1"}"#;
+        std::fs::write(
+            sub.join("agent-aExplore-abc123.jsonl"),
+            [child_use, child_result].join("\n") + "\n",
+        )
+        .unwrap();
+
+        let detail = parser_in(tmp.path()).get_conversation("s1").unwrap();
+        let stats = detail
+            .turns
+            .iter()
+            .flat_map(|t| t.blocks.iter())
+            .find_map(|b| match b {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    agent_stats,
+                    ..
+                } if tool_use_id.as_deref() == Some("call_agent1") => agent_stats.clone(),
+                _ => None,
+            })
+            .expect("Agent result carries agent_stats");
+        assert_eq!(stats.agent_type.as_deref(), Some("Explore"));
+        assert_eq!(stats.read_count, Some(1));
+        assert_eq!(
+            stats
+                .tool_calls
+                .iter()
+                .map(|c| c.tool_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Read"]
+        );
+        // Only the Agent result gains stats — exactly one block.
+        let with_stats = detail
+            .turns
+            .iter()
+            .flat_map(|t| t.blocks.iter())
+            .filter(|b| matches!(b, ContentBlock::ToolResult { agent_stats: Some(_), .. }))
+            .count();
+        assert_eq!(with_stats, 1);
     }
 
     #[test]

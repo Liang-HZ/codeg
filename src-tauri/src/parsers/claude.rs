@@ -3309,7 +3309,7 @@ fn attribute_subagent_usage(session_path: &Path, turns: &mut [MessageTurn]) {
 /// uses (see [`ClaudeRecordAccumulator::claim_assistant_usage`]) — a sub-agent
 /// transcript has the identical one-line-per-content-block shape. It is
 /// consumed by [`attribute_subagent_usage`]; the tool-call caller ignores it.
-fn parse_subagent_tool_calls(
+pub(crate) fn parse_subagent_tool_calls(
     path: &PathBuf,
 ) -> (Vec<AgentToolCall>, Option<TurnUsage>, Option<DateTime<Utc>>) {
     let file = match fs::File::open(path) {

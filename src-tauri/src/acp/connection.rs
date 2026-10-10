@@ -4727,7 +4727,7 @@ fn claude_raw_sdk_session_meta(
 ///   `forwardSubagentText`). Subagent text/thought chunks then stream with
 ///   update-level `_meta.claudeCode.parentToolUseId` instead of being
 ///   filtered; codeg routes them into the live Agent capsule (see
-///   `claude_chunk_parent_tool_use_id`). The adapter checks strictly
+///   `subagent_chunk_parent_tool_use_id`). The adapter checks strictly
 ///   `=== true`, and a pre-0.63 binary ignores the unknown key, so this is
 ///   inert everywhere it isn't understood.
 /// - Any agent that launches `cursor-agent … acp` (the built-in Cursor entry
@@ -14943,7 +14943,7 @@ fn codebuddy_chunk_marks_subagent(
 /// Claude Code is NOT handled here: its sub-agent chunks (claude-agent-acp
 /// ≥0.63 with the `subagent-transcript` capability) arrive with a precise
 /// per-chunk `_meta.claudeCode.parentToolUseId` and are forwarded WITH that
-/// attribution instead of suppressed — see `claude_chunk_parent_tool_use_id`.
+/// attribution instead of suppressed — see `subagent_chunk_parent_tool_use_id`.
 ///
 /// Suppress while we're inside an open sub-agent window OR when the chunk's own
 /// meta marks it. The window safety rests on a structural invariant: the window
@@ -14966,23 +14966,35 @@ fn should_suppress_subagent_chunk(
     window_open || codebuddy_chunk_marks_subagent(agent_type, chunk_meta)
 }
 
-/// Extract the update-level `_meta.claudeCode.parentToolUseId` of a live
-/// text/thought chunk — set by claude-agent-acp ≥0.63 on a subagent's
-/// forwarded chunks once the client advertises the `subagent-transcript`
-/// capability (see `build_client_capabilities`). The chunk is emitted WITH
-/// this attribution (never suppressed): the frontend routes parented chunks
-/// into the live Agent capsule instead of the main thread. Gated on
-/// ClaudeCode so no other agent's namespaced meta can alias into parented
-/// routing; empty strings are treated as absent.
-fn claude_chunk_parent_tool_use_id(
+/// Extract the update-level parent-tool-call attribution of a live
+/// text/thought chunk — the id of the Agent/Task call that owns the subagent
+/// whose output this chunk carries. Two producers today:
+///
+/// * Claude Code — `_meta.claudeCode.parentToolUseId`, set by
+///   claude-agent-acp ≥0.63 on a subagent's forwarded chunks once the client
+///   advertises the `subagent-transcript` capability (see
+///   `build_client_capabilities`).
+/// * Qoder — `_meta.qoder.parentToolUseId`, emitted by a locally patched
+///   qodercli (see `~/agentrelay/qoder-attribution-patch`). Stock 1.1.65 /
+///   1.1.67 builds forward subagent chunks with no attribution at all.
+///
+/// The chunk is emitted WITH this attribution (never suppressed): the
+/// frontend routes parented chunks into the live Agent capsule instead of the
+/// main thread. The namespace is selected per agent so no other agent's meta
+/// can alias into parented routing; empty strings are treated as absent.
+fn subagent_chunk_parent_tool_use_id(
     agent_type: AgentType,
     meta: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Option<String> {
-    if agent_type != AgentType::ClaudeCode {
-        return None;
-    }
+    let namespace = match agent_type {
+        AgentType::ClaudeCode => "claudeCode",
+        // A locally patched qodercli (see ~/agentrelay/qoder-attribution-patch)
+        // emits this on sidechain chunks and tools; stock builds carry none.
+        AgentType::Qoder => "qoder",
+        _ => return None,
+    };
     meta?
-        .get("claudeCode")?
+        .get(namespace)?
         .get("parentToolUseId")?
         .as_str()
         .filter(|s| !s.is_empty())
@@ -17239,7 +17251,7 @@ async fn emit_conversation_update(
                         // emit with their parent id so the frontend can route them
                         // into the live Agent capsule.
                         let parent_tool_use_id =
-                            claude_chunk_parent_tool_use_id(agent_type, meta.as_ref());
+                            subagent_chunk_parent_tool_use_id(agent_type, meta.as_ref());
                         emit_with_state(
                             state,
                             emitter,
@@ -17267,7 +17279,7 @@ async fn emit_conversation_update(
                 !cb_state.open_subagents.is_empty(),
                 meta.as_ref(),
             ) {
-                let parent_tool_use_id = claude_chunk_parent_tool_use_id(agent_type, meta.as_ref());
+                let parent_tool_use_id = subagent_chunk_parent_tool_use_id(agent_type, meta.as_ref());
                 emit_with_state(
                     state,
                     emitter,
@@ -30587,33 +30599,49 @@ mod tests {
     fn claude_chunk_parent_reads_only_wellformed_claude_meta() {
         let valid = serde_json::json!({ "claudeCode": { "parentToolUseId": "toolu_01A" } });
         assert_eq!(
-            claude_chunk_parent_tool_use_id(AgentType::ClaudeCode, valid.as_object()),
+            subagent_chunk_parent_tool_use_id(AgentType::ClaudeCode, valid.as_object()),
             Some("toolu_01A".to_string())
         );
         // Gated on ClaudeCode — the same meta on another agent must not alias
         // into parented routing.
         assert_eq!(
-            claude_chunk_parent_tool_use_id(AgentType::CodeBuddy, valid.as_object()),
+            subagent_chunk_parent_tool_use_id(AgentType::CodeBuddy, valid.as_object()),
             None
         );
         // Absent meta / absent key / wrong type / empty string → None.
         assert_eq!(
-            claude_chunk_parent_tool_use_id(AgentType::ClaudeCode, None),
+            subagent_chunk_parent_tool_use_id(AgentType::ClaudeCode, None),
             None
         );
         let no_key = serde_json::json!({ "claudeCode": { "toolName": "Agent" } });
         assert_eq!(
-            claude_chunk_parent_tool_use_id(AgentType::ClaudeCode, no_key.as_object()),
+            subagent_chunk_parent_tool_use_id(AgentType::ClaudeCode, no_key.as_object()),
             None
         );
         let wrong_type = serde_json::json!({ "claudeCode": { "parentToolUseId": 42 } });
         assert_eq!(
-            claude_chunk_parent_tool_use_id(AgentType::ClaudeCode, wrong_type.as_object()),
+            subagent_chunk_parent_tool_use_id(AgentType::ClaudeCode, wrong_type.as_object()),
             None
         );
         let empty = serde_json::json!({ "claudeCode": { "parentToolUseId": "" } });
         assert_eq!(
-            claude_chunk_parent_tool_use_id(AgentType::ClaudeCode, empty.as_object()),
+            subagent_chunk_parent_tool_use_id(AgentType::ClaudeCode, empty.as_object()),
+            None
+        );
+        // Qoder's own namespace (emitted by a locally patched qodercli) reads
+        // on Qoder…
+        let qoder = serde_json::json!({ "qoder": { "parentToolUseId": "call_01A" } });
+        assert_eq!(
+            subagent_chunk_parent_tool_use_id(AgentType::Qoder, qoder.as_object()),
+            Some("call_01A".to_string())
+        );
+        // …and neither namespace aliases onto the other agent.
+        assert_eq!(
+            subagent_chunk_parent_tool_use_id(AgentType::Qoder, valid.as_object()),
+            None
+        );
+        assert_eq!(
+            subagent_chunk_parent_tool_use_id(AgentType::ClaudeCode, qoder.as_object()),
             None
         );
     }

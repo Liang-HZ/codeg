@@ -1134,10 +1134,12 @@ export function buildStreamingTurnsFromLiveMessage(
         // Agent tool call this way — just under different keys:
         //   - Claude Code: nested `meta.claudeCode.parentToolUseId`
         //   - CodeBuddy:   flat  `meta["codebuddy.ai/parentToolCallId"]`
-        // Reading both makes CodeBuddy sub-agents nest precisely (like Claude
-        // Code) instead of falling back to the positional heuristic, which the
-        // sub-agent's interleaved thinking blocks break. Guard each access level
-        // to avoid crashes on unexpected shapes from other agents.
+        //   - Qoder:       nested `meta.qoder.parentToolUseId` (emitted by a
+        //                  locally patched qodercli; stock builds send none)
+        // Reading them makes a sub-agent's child calls nest precisely (like
+        // Claude Code) instead of falling back to the positional heuristic,
+        // which parallel sub-agents break. Guard each access level to avoid
+        // crashes on unexpected shapes from other agents.
         const meta = block.info.meta
         let parentId: string | undefined
         if (meta && typeof meta === "object") {
@@ -1153,6 +1155,13 @@ export function buildStreamingTurnsFromLiveMessage(
               "codebuddy.ai/parentToolCallId"
             ]
             if (typeof cbParent === "string") parentId = cbParent
+          }
+          if (!parentId) {
+            const qd = (meta as Record<string, unknown>).qoder
+            if (qd && typeof qd === "object" && "parentToolUseId" in qd) {
+              const pid = (qd as Record<string, unknown>).parentToolUseId
+              if (typeof pid === "string") parentId = pid
+            }
           }
         }
 

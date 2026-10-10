@@ -1901,6 +1901,43 @@ describe("buildStreamingTurnsFromLiveMessage — subagent transcript routing (cl
     ).toEqual(["read"])
   })
 
+  it("nests a Qoder child tool call via meta.qoder.parentToolUseId", () => {
+    // Qoder's own namespace (emitted by a locally patched qodercli). The
+    // explicit meta must beat the positional fallback: with BOTH agents in
+    // progress, the child belongs to the FIRST one, which is not the most
+    // recently seen.
+    const result = build([
+      agentCall("call_a"),
+      agentCall("call_b"),
+      { type: "thinking", text: "A 在想", parentToolUseId: "call_a" },
+      { type: "thinking", text: "B 在想", parentToolUseId: "call_b" },
+      {
+        type: "tool_call",
+        info: toolInfo({
+          tool_call_id: "call_child",
+          title: "Read",
+          meta: { qoder: { toolName: "Read", parentToolUseId: "call_a" } },
+        }),
+      },
+    ])
+    const blocks = result.turns.flatMap((t) => t.blocks)
+    // No standalone card for the child.
+    expect(
+      blocks.filter(
+        (b) => b.type === "tool_use" && b.tool_use_id === "call_child"
+      )
+    ).toHaveLength(0)
+    const carriers = blocks.filter((b) => b.type === "tool_result")
+    const nested = carriers.map((c) =>
+      c.type === "tool_result"
+        ? (c.agent_stats?.tool_calls ?? []).map((tc) => tc.tool_name)
+        : []
+    )
+    // A (declared first, NOT the positional favourite) owns the child; B does
+    // not — the inverse ordering would prove the positional fallback won.
+    expect(nested).toEqual([["read"], []])
+  })
+
   it("emits the carrier block for a text-only subagent (no child tools yet)", () => {
     const result = build([
       agentCall("toolu_agent"),
