@@ -36,6 +36,7 @@ pub struct AgentTimelineEntry {
     pub child_index: Option<usize>,
 }
 
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AgentExecutionStats {
     #[serde(skip_serializing_if = "Option::is_none")]
