@@ -1108,6 +1108,10 @@ fn attach_subagent_tool_calls(turns: &mut [MessageTurn], session_path: &Path) {
         total_tokens: Option<u64>,
         duration_ms: Option<u64>,
         tool_uses: Option<u32>,
+        // The child's final report, as written by the task file itself. Only
+        // reachable when the parent turn died before the async result was
+        // delivered — the delivery path erases the need for it everywhere else.
+        result: Option<String>,
     }
 
     let mut tasks: HashMap<String, TaskInfo> = HashMap::new();
@@ -1144,6 +1148,11 @@ fn attach_subagent_tool_calls(turns: &mut [MessageTurn], session_path: &Path) {
                     .and_then(|u| u.get("tool_uses"))
                     .and_then(Value::as_u64)
                     .map(|n| n as u32),
+                result: value
+                    .get("result")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                    .map(str::to_string),
             });
         } else if name.starts_with("agent-") && name.ends_with(".meta.json") {
             let Ok(bytes) = fs::read(&path) else { continue };
@@ -1177,7 +1186,7 @@ fn attach_subagent_tool_calls(turns: &mut [MessageTurn], session_path: &Path) {
     agents.sort_by(|a, b| a.0.cmp(&b.0));
 
     for (parent, transcript, agent_type) in agents {
-        let (calls, _usage, _started) =
+        let (calls, timeline, _usage, _started, transcript_duration) =
             crate::parsers::claude::parse_subagent_tool_calls(&transcript);
         let info = tasks.remove(&parent);
         let (mut read, mut search, mut bash, mut edit, mut other) = (0u32, 0u32, 0u32, 0u32, 0u32);
@@ -1193,7 +1202,12 @@ fn attach_subagent_tool_calls(turns: &mut [MessageTurn], session_path: &Path) {
         let stats = AgentExecutionStats {
             agent_type,
             status: info.as_ref().and_then(|i| i.status.clone()),
-            total_duration_ms: info.as_ref().and_then(|i| i.duration_ms),
+            // The task file carries no duration; the child transcript's own
+            // first/last-record span fills the gap.
+            total_duration_ms: info
+                .as_ref()
+                .and_then(|i| i.duration_ms)
+                .or(transcript_duration),
             total_tokens: info.as_ref().and_then(|i| i.total_tokens),
             total_tool_use_count: Some(
                 info.as_ref()
@@ -1207,6 +1221,11 @@ fn attach_subagent_tool_calls(turns: &mut [MessageTurn], session_path: &Path) {
             edit_file_count: Some(edit),
             other_tool_count: Some(other),
             tool_calls: calls,
+            timeline,
+            recovered_result: info
+                .as_ref()
+                .and_then(|i| i.result.clone())
+                .filter(|s| !s.trim().is_empty()),
             ..Default::default()
         };
         for turn in turns.iter_mut() {
@@ -1495,134 +1514,176 @@ mod tests {
         assert_eq!(detail.summary.model.as_deref(), Some("qmodel_38max"));
     }
 
-    /// Write one sub-agent transcript beside a session, in the layout Qoder
-    /// (and Claude Code) uses: `<sessionId>/subagents/agent-<agentId>.jsonl`.
-    fn write_subagent(tmp: &std::path::Path, session_id: &str, agent_id: &str, lines: &[&str]) {
-        let dir = tmp
-            .join("projects")
-            .join("-private-tmp-probe")
-            .join(session_id)
-            .join("subagents");
-        std::fs::create_dir_all(&dir).unwrap();
+    #[test]
+    fn agent_card_stats_carry_the_childs_mixed_timeline_in_arrival_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_use = r#"{"type":"assistant","uuid":"a9","timestamp":"2026-08-16T15:45:33.100Z","message":{"role":"assistant","model":"qmodel","stop_reason":"tool_use","content":[{"type":"tool_use","id":"call_agent1","name":"Agent","input":{"description":"读文件","subagent_type":"Explore"}}]},"parentUuid":"u1","isSidechain":false,"cwd":"/private/tmp/probe","sessionId":"s1","userType":"external","entrypoint":"acp","version":"1.1.67","gitBranch":"main"}"#;
+        let agent_result = r#"{"type":"user","uuid":"u9","timestamp":"2026-08-16T15:45:39.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_agent1","content":"以下是文件前 60 行…"}]},"sourceToolAssistantUUID":"a9","promptId":"s1","toolUseResult":{"isAsync":true,"status":"async_launched","agentId":"aExplore-abc123","description":"读文件"},"parentUuid":"a9","isSidechain":false,"cwd":"/private/tmp/probe","sessionId":"s1","userType":"external","entrypoint":"acp","version":"1.1.67","gitBranch":"main"}"#;
+        let active_leaf = r#"{"type":"active-leaf","sessionId":"s1","leafUuid":"u9","explicit":false,"timestamp":1786895139000}"#;
+        let path = write_session(tmp.path(), "s1", &[USER_LINE, agent_use, agent_result, active_leaf]);
+
+        let sub = path.with_extension("").join("subagents");
+        std::fs::create_dir_all(&sub).unwrap();
         std::fs::write(
-            dir.join(format!("agent-{agent_id}.jsonl")),
-            lines.join("\n") + "\n",
+            sub.join("agent-aExplore-abc123.meta.json"),
+            r#"{"agentType":"Explore","toolUseId":"call_agent1","description":"读文件","invocationName":"Explore"}"#,
         )
         .unwrap();
-    }
-
-    /// One sub-agent API response as Qoder writes it: Anthropic field NAMES
-    /// over OpenAI SEMANTICS — `input_tokens` 35,000 of which 34,000 is the
-    /// cached prefix, `output_tokens` 300.
-    const SUB_AGENT_CALL: &str = r#"{"type":"assistant","uuid":"c1","timestamp":"2026-08-16T15:45:35.000Z","isSidechain":true,"agentId":"aExplore-1","parent_tool_use_id":"call_1","message":{"id":"msg-sub-1","type":"message","role":"assistant","model":"auto","stop_reason":"end_turn","content":[{"type":"text","text":"done"}],"usage":{"input_tokens":35000,"cache_creation_input_tokens":0,"cache_read_input_tokens":34000,"output_tokens":300}},"version":"1.1.65"}"#;
-
-    // Sub-agent spend lives in the run's OWN transcript
-    // (`<sessionId>/subagents/agent-<agentId>.jsonl`, the layout claude uses):
-    // one API response streams as several records sharing one `message.id`,
-    // each repeating the same counters, and Qoder's counters need the cache
-    // split. This pins the whole fold: dedup, split, and turn placement.
-    #[test]
-    fn sub_agent_usage_folds_from_its_transcript_with_cache_split() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_session(tmp.path(), "s1", &[USER_LINE, ANSWER_LINE]);
-        // The same response as Qoder streams it — several fragments, each
-        // repeating the identical usage block.
-        write_subagent(
-            tmp.path(),
-            "s1",
-            "aExplore-1",
-            &[SUB_AGENT_CALL, SUB_AGENT_CALL],
-        );
+        // The child thinks, narrates, calls, then reports — the exact shape
+        // Anthropic-form transcripts interleave on disk.
+        let child_thinking = r#"{"type":"assistant","uuid":"c0","timestamp":"2026-08-16T15:45:34.000Z","message":{"id":"cm1","role":"assistant","model":"qmodel","content":[{"type":"thinking","thinking":"Need the notes first.","signature":""}]}}"#;
+        let child_text = r#"{"type":"assistant","uuid":"c0b","timestamp":"2026-08-16T15:45:34.200Z","message":{"id":"cm1","role":"assistant","model":"qmodel","content":[{"type":"text","text":"Reading."}]}}"#;
+        let child_use = r#"{"type":"assistant","uuid":"c1","timestamp":"2026-08-16T15:45:35.000Z","message":{"role":"assistant","model":"qmodel","content":[{"type":"tool_use","id":"call_r1","name":"Read","input":{"file_path":"/private/tmp/probe/NOTES.md"}}]},"isSidechain":true,"sessionId":"s1"}"#;
+        let child_result = r#"{"type":"user","uuid":"c2","timestamp":"2026-08-16T15:45:35.500Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_r1","content":"1\t# NOTES"}]},"isSidechain":true,"sessionId":"s1"}"#;
+        std::fs::write(
+            sub.join("agent-aExplore-abc123.jsonl"),
+            [child_thinking, child_text, child_use, child_result].join("\n") + "\n",
+        )
+        .unwrap();
 
         let detail = parser_in(tmp.path()).get_conversation("s1").unwrap();
-        // The call (15:45:35) lands on the assistant turn current then —
-        // ANSWER_LINE's, at 15:45:34.
-        let turn = detail
+        let stats = detail
             .turns
             .iter()
-            .rev()
-            .find(|t| matches!(t.role, crate::models::TurnRole::Assistant))
-            .expect("assistant turn");
-        let usage = turn.usage.clone().expect("turn usage");
-        // 35,000 input of which 34,000 cached → 1,000 fresh in; counted ONCE
-        // despite two records sharing `msg-sub-1`.
-        assert_eq!(usage.input_tokens, 5 + 1_000);
-        assert_eq!(usage.cache_read_input_tokens, 5 + 34_000);
-        assert_eq!(usage.output_tokens, 2 + 300);
-
-        // The details dialog's total is the sum of the turns, sub-agent spend
-        // included — one number for the dialog and the Token board.
-        let stats = detail.session_stats.expect("session stats");
+            .flat_map(|t| t.blocks.iter())
+            .find_map(|b| match b {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    agent_stats,
+                    ..
+                } if tool_use_id.as_deref() == Some("call_agent1") => agent_stats.clone(),
+                _ => None,
+            })
+            .expect("Agent result carries agent_stats");
         assert_eq!(
-            stats.total_tokens,
-            Some(5 + 2 + 5 + 1_000 + 34_000 + 300)
+            stats
+                .timeline
+                .iter()
+                .map(|e| (e.entry_type.as_str(), e.child_index, e.text.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("thinking", None, Some("Need the notes first.")),
+                ("text", None, Some("Reading.")),
+                ("tool_call", Some(0), None),
+            ]
         );
+        assert_eq!(stats.tool_calls[0].tool_name, "Read");
     }
 
+    /// A turn the provider killed mid-flight: the CLI writes an `is_error`
+    /// tool_result for each still-pending Agent call, while the children
+    /// actually completed — their task files carry the full reports. The
+    /// attach ignores the error flag (the FRONTEND decides what to show) and
+    /// lands the stats, the timeline AND the recovered report on the errored
+    /// result.
     #[test]
-    fn sub_agent_calls_land_on_the_turn_current_when_each_happened() {
+    fn an_errored_agent_result_still_carries_stats_and_the_recovered_result() {
         let tmp = tempfile::tempdir().unwrap();
-        const SWITCHED_ANSWER_LINE: &str = r#"{"type":"assistant","uuid":"b1","timestamp":"2026-08-16T15:46:00.000Z","message":{"id":"chatcmpl-2","type":"message","role":"assistant","model":"qfmodel","stop_reason":"end_turn","content":[{"type":"text","text":"second","citations":null}],"usage":{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":2}},"parentUuid":"a3","isSidechain":false,"cwd":"/private/tmp/probe","sessionId":"s1","userType":"external","entrypoint":"cli","version":"1.1.45","gitBranch":"main"}"#;
-        const SECOND_CALL: &str = r#"{"type":"assistant","uuid":"c2","timestamp":"2026-08-16T15:46:30.000Z","isSidechain":true,"agentId":"aExplore-1","parent_tool_use_id":"call_1","message":{"id":"msg-sub-2","type":"message","role":"assistant","model":"auto","stop_reason":"end_turn","content":[{"type":"text","text":"done"}],"usage":{"input_tokens":35000,"cache_creation_input_tokens":0,"cache_read_input_tokens":34000,"output_tokens":300}},"version":"1.1.65"}"#;
-        write_session(
-            tmp.path(),
-            "s1",
-            &[USER_LINE, ANSWER_LINE, SWITCHED_ANSWER_LINE],
-        );
-        // First call right after the first answer; second after the switch.
-        write_subagent(
-            tmp.path(),
-            "s1",
-            "aExplore-1",
-            &[SUB_AGENT_CALL, SECOND_CALL],
-        );
+        let agent_use = r#"{"type":"assistant","uuid":"a9","timestamp":"2026-08-16T15:45:33.100Z","message":{"role":"assistant","model":"qmodel","stop_reason":"tool_use","content":[{"type":"tool_use","id":"call_agent1","name":"Agent","input":{"description":"调研","subagent_type":"Explore"}}]},"parentUuid":"u1","isSidechain":false,"cwd":"/private/tmp/probe","sessionId":"s1","userType":"external","entrypoint":"acp","version":"1.1.67","gitBranch":"main"}"#;
+        let agent_result = r#"{"type":"user","uuid":"u9","timestamp":"2026-08-16T15:45:39.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_agent1","is_error":true,"content":"Error: tool execution produced no result"}]},"sourceToolAssistantUUID":"a9","promptId":"s1","toolUseResult":{"isAsync":true,"status":"async_launched","agentId":"aExplore-abc123","description":"调研"},"parentUuid":"a9","isSidechain":false,"cwd":"/private/tmp/probe","sessionId":"s1","userType":"external","entrypoint":"acp","version":"1.1.67","gitBranch":"main"}"#;
+        let active_leaf = r#"{"type":"active-leaf","sessionId":"s1","leafUuid":"u9","explicit":false,"timestamp":1786895139000}"#;
+        let path = write_session(tmp.path(), "s1", &[USER_LINE, agent_use, agent_result, active_leaf]);
+
+        let sub = path.with_extension("").join("subagents");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(
+            sub.join("agent-aExplore-abc123.meta.json"),
+            r#"{"agentType":"Explore","toolUseId":"call_agent1","description":"调研","invocationName":"Explore"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            sub.join("task-t1.json"),
+            r#"{"parentToolUseId":"call_agent1","status":"completed","usage":{"total_tokens":99,"duration_ms":4200,"tool_uses":3},"result":"The full research report, thousands of words."}"#,
+        )
+        .unwrap();
+        let child_use = r#"{"type":"assistant","uuid":"c1","timestamp":"2026-08-16T15:45:35.000Z","message":{"role":"assistant","model":"qmodel","content":[{"type":"tool_use","id":"call_r1","name":"Read","input":{"file_path":"/private/tmp/probe/NOTES.md"}}]},"isSidechain":true,"sessionId":"s1"}"#;
+        let child_result = r#"{"type":"user","uuid":"c2","timestamp":"2026-08-16T15:45:35.500Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_r1","content":"1\t# NOTES"}]},"isSidechain":true,"sessionId":"s1"}"#;
+        std::fs::write(
+            sub.join("agent-aExplore-abc123.jsonl"),
+            [child_use, child_result].join("\n") + "\n",
+        )
+        .unwrap();
 
         let detail = parser_in(tmp.path()).get_conversation("s1").unwrap();
-        let assistants: Vec<_> = detail
+        let (is_error, stats) = detail
             .turns
             .iter()
-            .filter(|t| matches!(t.role, crate::models::TurnRole::Assistant))
-            .collect();
-        assert_eq!(assistants.len(), 2, "two answers, two turns");
-        let first = assistants[0].usage.clone().expect("first turn usage");
-        let second = assistants[1].usage.clone().expect("second turn usage");
-        // Each call lands on the turn current at ITS OWN timestamp — a
-        // background sub-agent keeps working after the parent moves on.
-        assert_eq!(first.input_tokens, 5 + 1_000);
-        assert_eq!(first.cache_read_input_tokens, 5 + 34_000);
-        assert_eq!(first.output_tokens, 2 + 300);
-        assert_eq!(second.input_tokens, 10 + 1_000);
-        assert_eq!(second.cache_read_input_tokens, 34_000);
-        assert_eq!(second.output_tokens, 2 + 300);
+            .flat_map(|t| t.blocks.iter())
+            .find_map(|b| match b {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    is_error,
+                    agent_stats,
+                    ..
+                } if tool_use_id.as_deref() == Some("call_agent1") => {
+                    Some((*is_error, agent_stats.clone()))
+                }
+                _ => None,
+            })
+            .expect("Agent result present");
+        assert!(is_error, "fixture precondition: the result is an error");
+        let stats = stats.expect("errored Agent result still carries stats");
+        assert_eq!(stats.status.as_deref(), Some("completed"));
+        assert_eq!(
+            stats.recovered_result.as_deref(),
+            Some("The full research report, thousands of words.")
+        );
+        assert_eq!(
+            stats
+                .timeline
+                .iter()
+                .map(|e| e.entry_type.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tool_call"]
+        );
     }
 
     #[test]
-    fn sub_agent_usage_does_not_touch_the_context_window() {
+    fn a_task_file_without_a_result_field_leaves_recovered_result_absent() {
         let tmp = tempfile::tempdir().unwrap();
-        write_session(
-            tmp.path(),
-            "s1",
-            &[RUNTIME_CONFIG, USER_LINE, ANSWER_LINE],
-        );
-        // Control parse: no `subagents/` directory at all.
-        let baseline = parser_in(tmp.path()).get_conversation("s1").unwrap();
-        let baseline_stats = baseline.session_stats.clone().expect("baseline stats");
-        assert_eq!(baseline_stats.total_tokens, Some(5 + 2 + 5));
+        let agent_use = r#"{"type":"assistant","uuid":"a9","timestamp":"2026-08-16T15:45:33.100Z","message":{"role":"assistant","model":"qmodel","stop_reason":"tool_use","content":[{"type":"tool_use","id":"call_agent1","name":"Agent","input":{"description":"调研","subagent_type":"Explore"}}]},"parentUuid":"u1","isSidechain":false,"cwd":"/private/tmp/probe","sessionId":"s1","userType":"external","entrypoint":"acp","version":"1.1.67","gitBranch":"main"}"#;
+        let agent_result = r#"{"type":"user","uuid":"u9","timestamp":"2026-08-16T15:45:39.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_agent1","content":"以下是文件前 60 行…"}]},"sourceToolAssistantUUID":"a9","promptId":"s1","toolUseResult":{"isAsync":true,"status":"async_launched","agentId":"aExplore-abc123","description":"调研"},"parentUuid":"a9","isSidechain":false,"cwd":"/private/tmp/probe","sessionId":"s1","userType":"external","entrypoint":"acp","version":"1.1.67","gitBranch":"main"}"#;
+        let active_leaf = r#"{"type":"active-leaf","sessionId":"s1","leafUuid":"u9","explicit":false,"timestamp":1786895139000}"#;
+        let path = write_session(tmp.path(), "s1", &[USER_LINE, agent_use, agent_result, active_leaf]);
 
-        write_subagent(tmp.path(), "s1", "aExplore-1", &[SUB_AGENT_CALL]);
-        let with_sub = parser_in(tmp.path()).get_conversation("s1").unwrap();
-        let stats = with_sub.session_stats.expect("stats");
-        // A sub-agent's context is its own: occupancy and window are untouched
-        // (the fold runs after they were read) while the totals grow.
-        assert_eq!(
-            stats.context_window_used_tokens,
-            baseline_stats.context_window_used_tokens
-        );
-        assert_eq!(
-            stats.context_window_max_tokens,
-            baseline_stats.context_window_max_tokens
-        );
-        assert!(stats.total_tokens.unwrap() > baseline_stats.total_tokens.unwrap());
+        let sub = path.with_extension("").join("subagents");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(
+            sub.join("agent-aExplore-abc123.meta.json"),
+            r#"{"agentType":"Explore","toolUseId":"call_agent1","description":"调研","invocationName":"Explore"}"#,
+        )
+        .unwrap();
+        // Same task shape, but the report field is absent (delivered normally
+        // through the notification turn — nothing to recover).
+        std::fs::write(
+            sub.join("task-t1.json"),
+            r#"{"parentToolUseId":"call_agent1","status":"completed","usage":{"total_tokens":99,"duration_ms":4200,"tool_uses":3}}"#,
+        )
+        .unwrap();
+        let child_use = r#"{"type":"assistant","uuid":"c1","timestamp":"2026-08-16T15:45:35.000Z","message":{"role":"assistant","model":"qmodel","content":[{"type":"tool_use","id":"call_r1","name":"Read","input":{"file_path":"/private/tmp/probe/NOTES.md"}}]},"isSidechain":true,"sessionId":"s1"}"#;
+        let child_result = r#"{"type":"user","uuid":"c2","timestamp":"2026-08-16T15:45:35.500Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_r1","content":"1\t# NOTES"}]},"isSidechain":true,"sessionId":"s1"}"#;
+        std::fs::write(
+            sub.join("agent-aExplore-abc123.jsonl"),
+            [child_use, child_result].join("\n") + "\n",
+        )
+        .unwrap();
+
+        let detail = parser_in(tmp.path()).get_conversation("s1").unwrap();
+        let stats = detail
+            .turns
+            .iter()
+            .flat_map(|t| t.blocks.iter())
+            .find_map(|b| match b {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    agent_stats,
+                    ..
+                } if tool_use_id.as_deref() == Some("call_agent1") => agent_stats.clone(),
+                _ => None,
+            })
+            .expect("Agent result carries agent_stats");
+        assert_eq!(stats.status.as_deref(), Some("completed"));
+        assert_eq!(stats.recovered_result, None);
     }
 
     #[test]
@@ -1802,65 +1863,6 @@ mod tests {
             .blocks
             .iter()
             .all(|b| !matches!(b, ContentBlock::Text { text } if text.contains("sub-agent")))));
-    }
-
-    #[test]
-    fn agent_card_gains_subagent_tool_calls_from_meta_and_transcript() {
-        let tmp = tempfile::tempdir().unwrap();
-        let agent_use = r#"{"type":"assistant","uuid":"a9","timestamp":"2026-08-16T15:45:33.100Z","message":{"role":"assistant","model":"qmodel","stop_reason":"tool_use","content":[{"type":"tool_use","id":"call_agent1","name":"Agent","input":{"description":"读文件","subagent_type":"Explore"}}]},"parentUuid":"u1","isSidechain":false,"cwd":"/private/tmp/probe","sessionId":"s1","userType":"external","entrypoint":"acp","version":"1.1.67","gitBranch":"main"}"#;
-        let agent_result = r#"{"type":"user","uuid":"u9","timestamp":"2026-08-16T15:45:39.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_agent1","content":"以下是文件前 60 行…"}]},"sourceToolAssistantUUID":"a9","promptId":"s1","toolUseResult":{"isAsync":true,"status":"async_launched","agentId":"aExplore-abc123","description":"读文件"},"parentUuid":"a9","isSidechain":false,"cwd":"/private/tmp/probe","sessionId":"s1","userType":"external","entrypoint":"acp","version":"1.1.67","gitBranch":"main"}"#;
-        let active_leaf = r#"{"type":"active-leaf","sessionId":"s1","leafUuid":"u9","explicit":false,"timestamp":1786895139000}"#;
-        let path = write_session(tmp.path(), "s1", &[USER_LINE, agent_use, agent_result, active_leaf]);
-
-        // Side files a delegated run leaves behind: the meta names the
-        // launching tool call; the transcript carries the child's own calls.
-        let sub = path.with_extension("").join("subagents");
-        std::fs::create_dir_all(&sub).unwrap();
-        std::fs::write(
-            sub.join("agent-aExplore-abc123.meta.json"),
-            r#"{"agentType":"Explore","toolUseId":"call_agent1","description":"读文件","invocationName":"Explore"}"#,
-        )
-        .unwrap();
-        let child_use = r#"{"type":"assistant","uuid":"c1","timestamp":"2026-08-16T15:45:35.000Z","message":{"role":"assistant","model":"qmodel","content":[{"type":"tool_use","id":"call_r1","name":"Read","input":{"file_path":"/private/tmp/probe/NOTES.md"}}]},"isSidechain":true,"sessionId":"s1"}"#;
-        let child_result = r#"{"type":"user","uuid":"c2","timestamp":"2026-08-16T15:45:35.500Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_r1","content":"1\t# NOTES"}]},"isSidechain":true,"sessionId":"s1"}"#;
-        std::fs::write(
-            sub.join("agent-aExplore-abc123.jsonl"),
-            [child_use, child_result].join("\n") + "\n",
-        )
-        .unwrap();
-
-        let detail = parser_in(tmp.path()).get_conversation("s1").unwrap();
-        let stats = detail
-            .turns
-            .iter()
-            .flat_map(|t| t.blocks.iter())
-            .find_map(|b| match b {
-                ContentBlock::ToolResult {
-                    tool_use_id,
-                    agent_stats,
-                    ..
-                } if tool_use_id.as_deref() == Some("call_agent1") => agent_stats.clone(),
-                _ => None,
-            })
-            .expect("Agent result carries agent_stats");
-        assert_eq!(stats.agent_type.as_deref(), Some("Explore"));
-        assert_eq!(stats.read_count, Some(1));
-        assert_eq!(
-            stats
-                .tool_calls
-                .iter()
-                .map(|c| c.tool_name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["Read"]
-        );
-        // Only the Agent result gains stats — exactly one block.
-        let with_stats = detail
-            .turns
-            .iter()
-            .flat_map(|t| t.blocks.iter())
-            .filter(|b| matches!(b, ContentBlock::ToolResult { agent_stats: Some(_), .. }))
-            .count();
-        assert_eq!(with_stats, 1);
     }
 
     #[test]
@@ -2492,4 +2494,136 @@ mod tests {
         let percent = s.context_window_usage_percent.expect("percent");
         assert!((percent - (10.0 / 262_144.0) * 100.0).abs() < 1e-9, "{percent}");
     }
+
+    /// Write one sub-agent transcript beside a session, in the layout Qoder
+    /// (and Claude Code) uses: `<sessionId>/subagents/agent-<agentId>.jsonl`.
+    fn write_subagent(tmp: &std::path::Path, session_id: &str, agent_id: &str, lines: &[&str]) {
+        let dir = tmp
+            .join("projects")
+            .join("-private-tmp-probe")
+            .join(session_id)
+            .join("subagents");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("agent-{agent_id}.jsonl")),
+            lines.join("\n") + "\n",
+        )
+        .unwrap();
+    }
+
+    /// One sub-agent API response as Qoder writes it: Anthropic field NAMES
+    /// over OpenAI SEMANTICS — `input_tokens` 35,000 of which 34,000 is the
+    /// cached prefix, `output_tokens` 300.
+    const SUB_AGENT_CALL: &str = r#"{"type":"assistant","uuid":"c1","timestamp":"2026-08-16T15:45:35.000Z","isSidechain":true,"agentId":"aExplore-1","parent_tool_use_id":"call_1","message":{"id":"msg-sub-1","type":"message","role":"assistant","model":"auto","stop_reason":"end_turn","content":[{"type":"text","text":"done"}],"usage":{"input_tokens":35000,"cache_creation_input_tokens":0,"cache_read_input_tokens":34000,"output_tokens":300}},"version":"1.1.65"}"#;
+
+    // Sub-agent spend lives in the run's OWN transcript
+    // (`<sessionId>/subagents/agent-<agentId>.jsonl`, the layout claude uses):
+    // one API response streams as several records sharing one `message.id`,
+    // each repeating the same counters, and Qoder's counters need the cache
+    // split. This pins the whole fold: dedup, split, and turn placement.
+    #[test]
+    fn sub_agent_usage_folds_from_its_transcript_with_cache_split() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_session(tmp.path(), "s1", &[USER_LINE, ANSWER_LINE]);
+        // The same response as Qoder streams it — several fragments, each
+        // repeating the identical usage block.
+        write_subagent(
+            tmp.path(),
+            "s1",
+            "aExplore-1",
+            &[SUB_AGENT_CALL, SUB_AGENT_CALL],
+        );
+
+        let detail = parser_in(tmp.path()).get_conversation("s1").unwrap();
+        // The call (15:45:35) lands on the assistant turn current then —
+        // ANSWER_LINE's, at 15:45:34.
+        let turn = detail
+            .turns
+            .iter()
+            .rev()
+            .find(|t| matches!(t.role, crate::models::TurnRole::Assistant))
+            .expect("assistant turn");
+        let usage = turn.usage.clone().expect("turn usage");
+        // 35,000 input of which 34,000 cached → 1,000 fresh in; counted ONCE
+        // despite two records sharing `msg-sub-1`.
+        assert_eq!(usage.input_tokens, 5 + 1_000);
+        assert_eq!(usage.cache_read_input_tokens, 5 + 34_000);
+        assert_eq!(usage.output_tokens, 2 + 300);
+
+        // The details dialog's total is the sum of the turns, sub-agent spend
+        // included — one number for the dialog and the Token board.
+        let stats = detail.session_stats.expect("session stats");
+        assert_eq!(
+            stats.total_tokens,
+            Some(5 + 2 + 5 + 1_000 + 34_000 + 300)
+        );
+    }
+
+    #[test]
+    fn sub_agent_calls_land_on_the_turn_current_when_each_happened() {
+        let tmp = tempfile::tempdir().unwrap();
+        const SWITCHED_ANSWER_LINE: &str = r#"{"type":"assistant","uuid":"b1","timestamp":"2026-08-16T15:46:00.000Z","message":{"id":"chatcmpl-2","type":"message","role":"assistant","model":"qfmodel","stop_reason":"end_turn","content":[{"type":"text","text":"second","citations":null}],"usage":{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":2}},"parentUuid":"a3","isSidechain":false,"cwd":"/private/tmp/probe","sessionId":"s1","userType":"external","entrypoint":"cli","version":"1.1.45","gitBranch":"main"}"#;
+        const SECOND_CALL: &str = r#"{"type":"assistant","uuid":"c2","timestamp":"2026-08-16T15:46:30.000Z","isSidechain":true,"agentId":"aExplore-1","parent_tool_use_id":"call_1","message":{"id":"msg-sub-2","type":"message","role":"assistant","model":"auto","stop_reason":"end_turn","content":[{"type":"text","text":"done"}],"usage":{"input_tokens":35000,"cache_creation_input_tokens":0,"cache_read_input_tokens":34000,"output_tokens":300}},"version":"1.1.65"}"#;
+        write_session(
+            tmp.path(),
+            "s1",
+            &[USER_LINE, ANSWER_LINE, SWITCHED_ANSWER_LINE],
+        );
+        // First call right after the first answer; second after the switch.
+        write_subagent(
+            tmp.path(),
+            "s1",
+            "aExplore-1",
+            &[SUB_AGENT_CALL, SECOND_CALL],
+        );
+
+        let detail = parser_in(tmp.path()).get_conversation("s1").unwrap();
+        let assistants: Vec<_> = detail
+            .turns
+            .iter()
+            .filter(|t| matches!(t.role, crate::models::TurnRole::Assistant))
+            .collect();
+        assert_eq!(assistants.len(), 2, "two answers, two turns");
+        let first = assistants[0].usage.clone().expect("first turn usage");
+        let second = assistants[1].usage.clone().expect("second turn usage");
+        // Each call lands on the turn current at ITS OWN timestamp — a
+        // background sub-agent keeps working after the parent moves on.
+        assert_eq!(first.input_tokens, 5 + 1_000);
+        assert_eq!(first.cache_read_input_tokens, 5 + 34_000);
+        assert_eq!(first.output_tokens, 2 + 300);
+        assert_eq!(second.input_tokens, 10 + 1_000);
+        assert_eq!(second.cache_read_input_tokens, 34_000);
+        assert_eq!(second.output_tokens, 2 + 300);
+    }
+
+    #[test]
+    fn sub_agent_usage_does_not_touch_the_context_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_session(
+            tmp.path(),
+            "s1",
+            &[RUNTIME_CONFIG, USER_LINE, ANSWER_LINE],
+        );
+        // Control parse: no `subagents/` directory at all.
+        let baseline = parser_in(tmp.path()).get_conversation("s1").unwrap();
+        let baseline_stats = baseline.session_stats.clone().expect("baseline stats");
+        assert_eq!(baseline_stats.total_tokens, Some(5 + 2 + 5));
+
+        write_subagent(tmp.path(), "s1", "aExplore-1", &[SUB_AGENT_CALL]);
+        let with_sub = parser_in(tmp.path()).get_conversation("s1").unwrap();
+        let stats = with_sub.session_stats.expect("stats");
+        // A sub-agent's context is its own: occupancy and window are untouched
+        // (the fold runs after they were read) while the totals grow.
+        assert_eq!(
+            stats.context_window_used_tokens,
+            baseline_stats.context_window_used_tokens
+        );
+        assert_eq!(
+            stats.context_window_max_tokens,
+            baseline_stats.context_window_max_tokens
+        );
+        assert!(stats.total_tokens.unwrap() > baseline_stats.total_tokens.unwrap());
+    }
+
+    #[test]
 }
