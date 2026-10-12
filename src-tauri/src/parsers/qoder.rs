@@ -2624,6 +2624,4 @@ mod tests {
         );
         assert!(stats.total_tokens.unwrap() > baseline_stats.total_tokens.unwrap());
     }
-
-    #[test]
 }
