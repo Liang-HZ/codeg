@@ -14974,6 +14974,12 @@ fn codebuddy_chunk_marks_subagent(
 /// ≥0.63 with the `subagent-transcript` capability) arrive with a precise
 /// per-chunk `_meta.claudeCode.parentToolUseId` and are forwarded WITH that
 /// attribution instead of suppressed — see `subagent_chunk_parent_tool_use_id`.
+/// The CodeBuddy family follows the same contract (LOCAL, codeg-fix
+/// 2026-10-12): a chunk carrying its own flat `codebuddy.ai/parentToolCallId`
+/// is routed with that attribution into the live Agent capsule, so sub-agent
+/// thinking/text survives into the settled card instead of vanishing with the
+/// suppressed stream. Only chunks the wire did NOT link fall through to
+/// suppression below.
 ///
 /// Suppress while we're inside an open sub-agent window OR when the chunk's own
 /// meta marks it. The window safety rests on a structural invariant: the window
@@ -14983,8 +14989,8 @@ fn codebuddy_chunk_marks_subagent(
 /// the sub-agent's chunks, never main-agent output. BACKGROUND sub-agents (which
 /// run concurrently and could interleave main-agent output) are deliberately
 /// excluded from the window by `track_subagent_window`, so `window_open` can
-/// never cause a main-agent chunk to be dropped. Gated on CodeBuddy; every other
-/// agent always emits.
+/// never cause a main-agent chunk to be dropped. Gated on the CodeBuddy family;
+/// every other agent always emits.
 fn should_suppress_subagent_chunk(
     agent_type: AgentType,
     window_open: bool,
@@ -14993,12 +14999,15 @@ fn should_suppress_subagent_chunk(
     if !is_codebuddy_family(agent_type) {
         return false;
     }
+    if subagent_chunk_parent_tool_use_id(agent_type, chunk_meta).is_some() {
+        return false;
+    }
     window_open || codebuddy_chunk_marks_subagent(agent_type, chunk_meta)
 }
 
 /// Extract the update-level parent-tool-call attribution of a live
 /// text/thought chunk — the id of the Agent/Task call that owns the subagent
-/// whose output this chunk carries. Two producers today:
+/// whose output this chunk carries. Three producers today:
 ///
 /// * Claude Code — `_meta.claudeCode.parentToolUseId`, set by
 ///   claude-agent-acp ≥0.63 on a subagent's forwarded chunks once the client
@@ -15007,6 +15016,9 @@ fn should_suppress_subagent_chunk(
 /// * Qoder — `_meta.qoder.parentToolUseId`, emitted by a locally patched
 ///   qodercli (see `~/agentrelay/qoder-attribution-patch`). Stock 1.1.65 /
 ///   1.1.67 builds forward subagent chunks with no attribution at all.
+/// * CodeBuddy family — the FLAT `_meta["codebuddy.ai/parentToolCallId"]`,
+///   present on every sub-agent thought/message chunk of the stock 2.164.0
+///   CLI (verified on real streams; main-thread chunks never carry it).
 ///
 /// The chunk is emitted WITH this attribution (never suppressed): the
 /// frontend routes parented chunks into the live Agent capsule instead of the
@@ -15016,6 +15028,15 @@ fn subagent_chunk_parent_tool_use_id(
     agent_type: AgentType,
     meta: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Option<String> {
+    // CodeBuddy's link is a flat single key, not nested under a namespace
+    // object — read it before the namespaced pairs.
+    if is_codebuddy_family(agent_type) {
+        return meta?
+            .get("codebuddy.ai/parentToolCallId")?
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+    }
     let namespace = match agent_type {
         AgentType::ClaudeCode => "claudeCode",
         // A locally patched qodercli (see ~/agentrelay/qoder-attribution-patch)
@@ -17237,8 +17258,9 @@ async fn emit_conversation_update(
             // shape — see `pi_take_startup_banner`. No-op for every other agent.
             let is_pi_startup_banner =
                 pi_take_startup_banner(agent_type, state, &text.text).await;
-            // Drop a CodeBuddy sub-agent's interleaved message text — it belongs
-            // to the Agent pill, not the main thread (see
+            // Drop a CodeBuddy sub-agent's interleaved message text that the
+            // wire did not link — it belongs to the Agent pill, not the main
+            // thread; linked chunks are routed into the capsule instead (see
             // `should_suppress_subagent_chunk`). No-op for every other agent.
             if !is_pi_startup_banner
                 && !should_suppress_subagent_chunk(
@@ -17303,7 +17325,7 @@ async fn emit_conversation_update(
             meta,
             ..
         }) => {
-            // Same suppression for a sub-agent's interleaved reasoning.
+            // Same suppression/routing for a sub-agent's interleaved reasoning.
             if !should_suppress_subagent_chunk(
                 agent_type,
                 !cb_state.open_subagents.is_empty(),
@@ -30457,11 +30479,21 @@ mod tests {
         let custom = AgentType::Custom("codebuddy-cn");
         // Window open, chunk meta absent → suppressed (the window invariant).
         assert!(should_suppress_subagent_chunk(custom, true, None));
-        // Window closed but the chunk's own meta marks a sub-agent → suppressed.
+        // Window closed, meta marks a sub-agent but carries no link → suppressed
+        // (fallback path).
         let meta = serde_json::json!({ "codebuddy.ai/isSubagent": true });
         assert!(should_suppress_subagent_chunk(custom, false, meta.as_object()));
         // Window closed, no marker → emitted.
         assert!(!should_suppress_subagent_chunk(custom, false, None));
+        // A LINKED chunk is routed, not suppressed: it emits with its parent id
+        // (even inside an open window) and the frontend files it into the live
+        // Agent capsule — this is the settled-card fix.
+        let linked = serde_json::json!({ "codebuddy.ai/parentToolCallId": "chatcmpl-tool-x" });
+        assert!(!should_suppress_subagent_chunk(custom, true, linked.as_object()));
+        assert_eq!(
+            subagent_chunk_parent_tool_use_id(custom, linked.as_object()),
+            Some("chatcmpl-tool-x".to_string())
+        );
         // Meta-based classification and title rewrite work for the variant.
         let agent_meta = serde_json::json!({ "codebuddy.ai/toolName": "Agent" });
         assert!(codebuddy_meta_marks_subagent(custom, agent_meta.as_object()));
@@ -30661,17 +30693,31 @@ mod tests {
             false,
             None
         ));
-        // Window closed but the chunk's own meta marks it → suppress (precision
-        // supplement; never relied on alone).
+        // Window closed, meta marks it but carries NO parent link → suppress
+        // (the fallback path; suppression is never relied on alone).
         let sub = serde_json::json!({ "codebuddy.ai/isSubagent": true });
+        assert!(should_suppress_subagent_chunk(
+            AgentType::CodeBuddy,
+            false,
+            sub.as_object()
+        ));
+        // Window closed and the chunk carries its own parent link → ROUTED, not
+        // suppressed: it emits with that attribution and the frontend files it
+        // into the live Agent capsule (LOCAL, codeg-fix: sub-agent thinking/text
+        // survives into the settled card instead of vanishing).
         let parented = serde_json::json!({ "codebuddy.ai/parentToolCallId": "call_x" });
-        for meta in [&sub, &parented] {
-            assert!(should_suppress_subagent_chunk(
-                AgentType::CodeBuddy,
-                false,
-                meta.as_object()
-            ));
-        }
+        assert!(!should_suppress_subagent_chunk(
+            AgentType::CodeBuddy,
+            false,
+            parented.as_object()
+        ));
+        // Even inside an open window a linked chunk is routed — suppression
+        // only ever catches chunks the wire did not link.
+        assert!(!should_suppress_subagent_chunk(
+            AgentType::CodeBuddy,
+            true,
+            parented.as_object()
+        ));
         // Other agents never suppress, even inside a (spurious) open window.
         assert!(!should_suppress_subagent_chunk(AgentType::OpenCode, true, None));
     }
@@ -30725,6 +30771,48 @@ mod tests {
             subagent_chunk_parent_tool_use_id(AgentType::ClaudeCode, qoder.as_object()),
             None
         );
+    }
+
+    #[test]
+    fn codebuddy_chunk_parent_reads_the_flat_meta_only_for_the_family() {
+        let valid = serde_json::json!({ "codebuddy.ai/parentToolCallId": "chatcmpl-tool-1" });
+        // The built-in and both dual-account custom variants all read it.
+        for agent in [
+            AgentType::CodeBuddy,
+            AgentType::Custom("codebuddy-cn"),
+            AgentType::Custom("codebuddy-intl"),
+        ] {
+            assert_eq!(
+                subagent_chunk_parent_tool_use_id(agent, valid.as_object()),
+                Some("chatcmpl-tool-1".to_string())
+            );
+        }
+        // The same flat key on a non-family agent must not alias into routing.
+        assert_eq!(
+            subagent_chunk_parent_tool_use_id(AgentType::ClaudeCode, valid.as_object()),
+            None
+        );
+        assert_eq!(
+            subagent_chunk_parent_tool_use_id(AgentType::Qoder, valid.as_object()),
+            None
+        );
+        // Empty / wrong type / absent key / absent meta → None.
+        let empty = serde_json::json!({ "codebuddy.ai/parentToolCallId": "" });
+        assert_eq!(
+            subagent_chunk_parent_tool_use_id(AgentType::CodeBuddy, empty.as_object()),
+            None
+        );
+        let wrong_type = serde_json::json!({ "codebuddy.ai/parentToolCallId": 42 });
+        assert_eq!(
+            subagent_chunk_parent_tool_use_id(AgentType::CodeBuddy, wrong_type.as_object()),
+            None
+        );
+        let no_key = serde_json::json!({ "codebuddy.ai/isSubagent": true });
+        assert_eq!(
+            subagent_chunk_parent_tool_use_id(AgentType::CodeBuddy, no_key.as_object()),
+            None
+        );
+        assert_eq!(subagent_chunk_parent_tool_use_id(AgentType::CodeBuddy, None), None);
     }
 
     #[test]
