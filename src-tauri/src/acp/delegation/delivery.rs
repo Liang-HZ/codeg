@@ -1413,7 +1413,7 @@ mod tests {
     #[test]
     fn notification_text_custom_agent_slug() {
         let mut n = note("t1", TaskStatus::Completed, Some("ok"));
-        n.agent_type = AgentType::Custom("zcode".into());
+        n.agent_type = AgentType::Custom("zcode");
         let text = build_notification_text(&[n]);
         assert!(text.contains("custom:zcode"), "got: {text}");
     }

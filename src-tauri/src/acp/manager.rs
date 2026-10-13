@@ -5445,7 +5445,7 @@ mod tests {
         let ConnectionCommand::Prompt {
             blocks,
             user_message,
-            source,
+            source: _,
         } = command
         else {
             panic!("expected prompt command");
