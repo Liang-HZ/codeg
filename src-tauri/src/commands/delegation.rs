@@ -25,6 +25,7 @@ use sea_orm::DatabaseConnection;
 use serde::{Deserialize, Serialize};
 
 use crate::acp::delegation::broker::{DelegationBroker, DelegationConfig};
+use crate::acp::delegation::delivery::ResultDeliveryMode;
 use crate::acp::delegation::types::AgentDelegationDefaults;
 use crate::app_error::AppCommandError;
 use crate::db::service::app_metadata_service;
@@ -39,6 +40,10 @@ pub const KEY_DELEGATION_DEPTH: &str = "delegation.depth_limit";
 pub const KEY_DELEGATION_AGENT_DEFAULTS: &str = "delegation.agent_defaults";
 /// Per-parent completed-result cache budget, in MB. `0` = unlimited.
 pub const KEY_DELEGATION_COMPLETED_CACHE_MB: &str = "delegation.completed_cache_max_mb";
+/// How terminal results reach the parent agent: `push` (default) or `off`
+/// (pull-only). Persisted as a plain string; an unknown value falls back to
+/// the default.
+pub const KEY_DELEGATION_RESULT_DELIVERY: &str = "delegation.result_delivery";
 
 pub const DEPTH_MIN: u32 = 1;
 pub const DEPTH_MAX: u32 = 8;
@@ -72,6 +77,12 @@ pub struct DelegationSettings {
     /// unlimited), so an older client can't silently disable the valve.
     #[serde(default = "default_completed_cache_max_mb")]
     pub completed_cache_max_mb: u32,
+    /// How terminal results reach the parent agent. `push` (default) wakes the
+    /// parent with a notification turn; `off` is pull-only. Absent in a
+    /// payload → the product default (push), so an older client cannot
+    /// silently disable delivery by omission.
+    #[serde(default)]
+    pub result_delivery: ResultDeliveryMode,
 }
 
 impl Default for DelegationSettings {
@@ -81,6 +92,7 @@ impl Default for DelegationSettings {
             depth_limit: 1,
             agent_defaults: BTreeMap::new(),
             completed_cache_max_mb: DEFAULT_COMPLETED_CACHE_MB,
+            result_delivery: ResultDeliveryMode::default(),
         }
     }
 }
@@ -98,6 +110,7 @@ impl DelegationSettings {
             // No upper clamp: the cache budget is a user memory choice, not a
             // safety rail. `0` stays `0` (unlimited).
             completed_cache_max_mb: self.completed_cache_max_mb,
+            result_delivery: self.result_delivery,
         }
     }
 
@@ -110,6 +123,7 @@ impl DelegationSettings {
             // value from wrapping on 32-bit `usize` targets.
             completed_cache_cap_bytes: (self.completed_cache_max_mb as usize)
                 .saturating_mul(1024 * 1024),
+            result_delivery: self.result_delivery,
         }
     }
 }
@@ -134,6 +148,17 @@ pub async fn load_delegation_settings(conn: &DatabaseConnection) -> DelegationSe
     {
         if let Ok(v) = raw.parse::<u32>() {
             settings.completed_cache_max_mb = v;
+        }
+    }
+    if let Ok(Some(raw)) =
+        app_metadata_service::get_value(conn, KEY_DELEGATION_RESULT_DELIVERY).await
+    {
+        // An unknown value (hand-edited DB, downgraded build) keeps the
+        // default rather than erroring — same "never errors hard" contract.
+        if let Ok(v) = serde_json::from_value::<ResultDeliveryMode>(
+            serde_json::Value::String(raw),
+        ) {
+            settings.result_delivery = v;
         }
     }
     if let Ok(Some(raw)) =
@@ -216,6 +241,13 @@ pub async fn set_delegation_settings_core(
     )
     .await
     .map_err(AppCommandError::from)?;
+    let result_delivery = serde_json::to_value(clamped.result_delivery)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| "push".to_string());
+    app_metadata_service::upsert_value(conn, KEY_DELEGATION_RESULT_DELIVERY, &result_delivery)
+        .await
+        .map_err(AppCommandError::from)?;
     // Whole-blob replace semantics: save mirrors what the UI sent. Empty map
     // serializes to "{}" — still write it so a user can clear all overrides
     // back to the agent defaults.
@@ -334,6 +366,62 @@ mod tests {
         let cfg = broker.config_snapshot().await;
         assert!(!cfg.enabled);
         assert_eq!(cfg.depth_limit, 3);
+    }
+
+    #[tokio::test]
+    async fn result_delivery_round_trips_and_defaults_to_push() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let broker = make_broker();
+
+        // Unset → the product default (push), both on load and in the broker.
+        let loaded = load_delegation_settings(&db.conn).await;
+        assert_eq!(loaded.result_delivery, ResultDeliveryMode::Push);
+        assert_eq!(
+            broker.config_snapshot().await.result_delivery,
+            ResultDeliveryMode::Push
+        );
+
+        // Persist `off` and confirm DB + broker agree.
+        let desired = DelegationSettings {
+            result_delivery: ResultDeliveryMode::Off,
+            ..DelegationSettings::default()
+        };
+        let saved = set_delegation_settings_core(&db.conn, &broker, &EventEmitter::Noop, desired)
+            .await
+            .unwrap();
+        assert_eq!(saved.result_delivery, ResultDeliveryMode::Off);
+        assert_eq!(
+            load_delegation_settings(&db.conn).await.result_delivery,
+            ResultDeliveryMode::Off
+        );
+        assert_eq!(
+            broker.config_snapshot().await.result_delivery,
+            ResultDeliveryMode::Off
+        );
+
+        // A legacy payload without the field deserializes to the default
+        // (push) rather than erroring.
+        let legacy: DelegationSettings = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "depth_limit": 2,
+            "completed_cache_max_mb": 64,
+            "agent_defaults": {}
+        }))
+        .unwrap();
+        assert_eq!(legacy.result_delivery, ResultDeliveryMode::Push);
+
+        // An unknown persisted string keeps the default rather than erroring.
+        app_metadata_service::upsert_value(
+            &db.conn,
+            KEY_DELEGATION_RESULT_DELIVERY,
+            "wat",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            load_delegation_settings(&db.conn).await.result_delivery,
+            ResultDeliveryMode::Push
+        );
     }
 
     #[tokio::test]
