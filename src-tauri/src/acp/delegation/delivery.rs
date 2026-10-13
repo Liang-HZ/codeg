@@ -43,18 +43,28 @@
 //!   `task_terminal` (both run after the broker's pending lock is released).
 //! * Entries expire after [`DEFAULT_TTL`] so a parent that never comes back
 //!   cannot grow the queue forever; the result itself stays in the broker's
-//!   completed cache (and the DB) for the pull channels.
+//!   completed cache (and the DB) for the pull channels. Pruning is lazy —
+//!   each `enqueue` drops expired entries across every parent, so no timer or
+//!   watcher task is needed.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::acp::delegation::types::TaskStatus;
 use crate::models::AgentType;
+
+/// Prefix of the synthetic client-message id the delivery sink mints for a
+/// notice turn (`codeg-delegation-notice:<task_id>`). The manager derives two
+/// things from it in `send_prompt_linked_with_message_id`: the notice is never
+/// broadcast as a user message, and its transcript prompt is recorded with
+/// [`crate::acp_transcript::SOURCE_DELEGATION_RESULT`] so the UI renders the
+/// turn split without the message (see `parsers::acp_native`).
+pub const NOTICE_MESSAGE_ID_PREFIX: &str = "codeg-delegation-notice:";
 
 /// Inline cap for a result body inside the notification message. The full text
 /// stays reachable through `get_delegation_status` / the child conversation;
@@ -66,27 +76,9 @@ pub const RESULT_INLINE_CAP: usize = 8_000;
 /// (the result itself is not lost — only the push attempt is).
 pub const DEFAULT_TTL: Duration = Duration::from_secs(30 * 60);
 
-/// First watcher cadence. The watcher backs off up to [`MAX_BACKOFF`] while
-/// the parent stays busy / away.
-pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(1);
-const MAX_BACKOFF: Duration = Duration::from_secs(10);
-
 /// Bound on the consumed-task memo, so a long-lived process cannot accumulate
 /// one entry per delegation forever.
 const CONSUMED_CAP: usize = 1024;
-
-/// How terminal delegation results reach the parent agent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ResultDeliveryMode {
-    /// Push: notify the parent when it is idle, or at the end of its current
-    /// turn when it is busy. (default)
-    #[default]
-    Push,
-    /// Pull-only: results wait in the completed cache for
-    /// `get_delegation_status`; nothing is pushed.
-    Off,
-}
 
 /// One terminal result on its way to the parent.
 #[derive(Debug, Clone)]
@@ -119,9 +111,6 @@ pub trait DelegationResultSink: Send + Sync {
     /// The result was handed to the parent by a pull (`get_delegation_status`
     /// / `cancel_delegation`); the push must stand down.
     async fn task_consumed(&self, parent_connection_id: &str, task_id: &str);
-
-    /// Settings changed. `Off` drops anything still queued.
-    async fn set_mode(&self, mode: ResultDeliveryMode);
 }
 
 /// No-op sink for tests and for wiring that predates the push channel.
@@ -132,7 +121,6 @@ pub struct NoopResultSink;
 impl DelegationResultSink for NoopResultSink {
     async fn task_terminal(&self, _notification: TerminalNotification) {}
     async fn task_consumed(&self, _parent_connection_id: &str, _task_id: &str) {}
-    async fn set_mode(&self, _mode: ResultDeliveryMode) {}
 }
 
 /// Whether the parent's current turn is in flight.
@@ -147,6 +135,10 @@ pub enum ParentBusy {
 pub struct DeliveryTarget {
     pub connection_id: String,
     pub busy: ParentBusy,
+    /// The connection's adapter proved native `_session/steering` support, so
+    /// a busy parent can take the notice mid-turn instead of waiting for the
+    /// turn to end.
+    pub steer: bool,
 }
 
 /// Why a notification prompt could not be admitted.
@@ -179,7 +171,9 @@ pub trait DeliveryTransport: Send + Sync {
 
     /// Send one merged notification prompt. `notice_id` is the synthetic
     /// client message id for the broadcast (kept stable per notification so
-    /// viewers can tell the message apart from user speech).
+    /// viewers can tell the message apart from user speech). `notice_id` is
+    /// not broadcast for notices — it is the manager's signal that this prompt
+    /// is system content (see [`NOTICE_MESSAGE_ID_PREFIX`]).
     async fn send(
         &self,
         target: &DeliveryTarget,
@@ -188,6 +182,12 @@ pub trait DeliveryTransport: Send + Sync {
         text: String,
         notice_id: String,
     ) -> Result<(), DeliverySendError>;
+
+    /// Deliver one merged notification into the parent's RUNNING turn over
+    /// native `_session/steering`. Only called when `target.steer` is set and
+    /// the parent is busy; a failure is the queue's fallback.
+    async fn steer(&self, target: &DeliveryTarget, text: String)
+        -> Result<(), DeliverySendError>;
 }
 
 /// A queued notification plus its arrival stamp (for [`DEFAULT_TTL`]).
@@ -199,27 +199,29 @@ struct QueuedNotification {
 
 #[derive(Default)]
 struct DeliveryInner {
-    mode: ResultDeliveryMode,
     /// parent connection id → queued notifications, arrival order.
     queues: HashMap<String, Vec<QueuedNotification>>,
-    /// `(parent_connection_id, task_id)` pairs a pull already returned. Guards
-    /// the pull-vs-terminal ordering race.
-    consumed: HashSet<(String, String)>,
-    consumed_order: VecDeque<(String, String)>,
-    /// Parents with a live watcher task. `task_terminal` starts one per
-    /// parent; it exits when the queue drains.
-    watching: HashSet<String>,
+    /// `(parent_connection_id, task_id)` pairs already settled on the push
+    /// side: a pull returned the result (`mark_consumed`), or the sink
+    /// delivered it. Bounds both the pull-vs-terminal ordering race and a
+    /// duplicated terminal announcement.
+    resolved: HashSet<(String, String)>,
+    resolved_order: VecDeque<(String, String)>,
+    /// Parents whose queue a flush pass is currently working on. Several
+    /// triggers can reach the same parent at once (its immediate attempt races
+    /// a turn end, a turn end races a reconnect); the loser must not deliver
+    /// the same batch again.
+    flushing: HashSet<String>,
 }
 
 /// Outcome of one flush pass over a parent's queue.
 enum Flush {
     /// The pass completed (delivered, dropped, or the queue was already
-    /// empty). The watcher re-checks emptiness and exits when drained.
+    /// empty).
     Settled,
-    /// Not deliverable right now (busy parent / no connection / send failed).
+    /// Not deliverable right now (busy parent / no connection / send failed);
+    /// the entry waits for the parent's next event.
     Retry,
-    /// Push was switched off — drop the queue and stop watching.
-    Disabled,
 }
 
 /// Production push channel: per-parent queues + watchers over a
@@ -228,57 +230,70 @@ pub struct DeliverySink {
     inner: Arc<Mutex<DeliveryInner>>,
     transport: Arc<dyn DeliveryTransport>,
     ttl: Duration,
-    interval: Duration,
-    /// Whether `enqueue` starts the flush watcher. Production always does;
-    /// unit tests disable it and drive [`DeliverySink::flush_parent`] by hand
-    /// so assertions are deterministic (the watcher's first pass is immediate).
-    watch_enabled: bool,
+    /// In-process ACP event fan-out: the delivery triggers are all events —
+    /// a task reaching terminal (enqueue's immediate attempt), the parent's
+    /// turn ending (`TurnComplete`), and the parent (re)connecting
+    /// (`SessionStarted`). `None` in unit tests, which drive
+    /// [`DeliverySink::flush_parent`] by hand.
+    bus: Option<Arc<crate::acp::internal_bus::InternalEventBus>>,
+    /// One-shot latch for the bus-hook subscriber task.
+    bus_hook_started: Arc<AtomicBool>,
 }
 
 impl DeliverySink {
     pub fn new(transport: Arc<dyn DeliveryTransport>) -> Self {
-        Self::with_tuning(transport, DEFAULT_TTL, DEFAULT_INTERVAL)
+        Self::with_tuning(transport, DEFAULT_TTL)
     }
 
-    /// Test-only tuning of the TTL / watcher cadence.
-    pub fn with_tuning(
-        transport: Arc<dyn DeliveryTransport>,
-        ttl: Duration,
-        interval: Duration,
-    ) -> Self {
+    /// Tuning of the entry TTL (tests shrink it).
+    pub fn with_tuning(transport: Arc<dyn DeliveryTransport>, ttl: Duration) -> Self {
         Self {
             inner: Arc::new(Mutex::new(DeliveryInner::default())),
             transport,
             ttl,
-            interval,
-            watch_enabled: true,
+            bus: None,
+            bus_hook_started: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// Test-only: no watcher — every flush is driven by the test.
+    /// Wire the in-process ACP event bus (production). See `ensure_bus_hook`.
+    pub fn with_event_bus(
+        mut self,
+        bus: Arc<crate::acp::internal_bus::InternalEventBus>,
+    ) -> Self {
+        self.bus = Some(bus);
+        self
+    }
+
+    /// Test-only: no event hook — every flush is driven by the test.
     #[cfg(test)]
     fn for_test(transport: Arc<dyn DeliveryTransport>, ttl: Duration) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(DeliveryInner::default())),
-            transport,
-            ttl,
-            interval: DEFAULT_INTERVAL,
-            watch_enabled: false,
-        }
+        Self::with_tuning(transport, ttl)
     }
 
-    /// Queue a terminal notification and make sure a watcher is running for
-    /// its parent. The watcher's first pass is immediate, so an idle parent
-    /// still gets the notification without a timer delay.
+    /// Queue a terminal notification, then make one immediate delivery
+    /// attempt: an idle parent is served right here (the broker's terminal
+    /// transition IS the event for that), and the attempt doubles as the
+    /// safety net for a turn that ended between the broker's resolve and this
+    /// enqueue. A busy or away parent is served by the event hook — its turn
+    /// ending (`TurnComplete`) or its conversation reconnecting
+    /// (`SessionStarted`) — never by polling.
+    ///
+    /// Expired entries are pruned here too (lazy TTL): a parent that never
+    /// comes back leaves its entry behind, and the next terminal of any
+    /// conversation collects it.
     pub async fn enqueue(&self, notification: TerminalNotification) {
+        self.ensure_bus_hook();
         let parent = notification.parent_connection_id.clone();
-        let spawn = {
+        {
             let mut inner = self.inner.lock().await;
-            if inner.mode == ResultDeliveryMode::Off {
-                return;
+            let now = Instant::now();
+            for queue in inner.queues.values_mut() {
+                queue.retain(|q| now.duration_since(q.queued_at) < self.ttl);
             }
+            inner.queues.retain(|_, queue| !queue.is_empty());
             let key = (parent.clone(), notification.task_id.clone());
-            if inner.consumed.contains(&key) {
+            if inner.resolved.contains(&key) {
                 // The pull got there first (or an earlier terminal already
                 // queued this exact task) — nothing to push.
                 return;
@@ -292,33 +307,66 @@ impl DeliverySink {
             }
             queue.push(QueuedNotification {
                 notification,
-                queued_at: Instant::now(),
-            });
-            inner.watching.insert(parent.clone())
-        };
-        if spawn && self.watch_enabled {
-            let inner = self.inner.clone();
-            let transport = self.transport.clone();
-            let ttl = self.ttl;
-            let interval = self.interval;
-            tokio::spawn(async move {
-                watch(inner, transport, ttl, interval, parent).await;
+                queued_at: now,
             });
         }
+        let _ = flush(&parent, &self.inner, &self.transport, self.ttl).await;
+    }
+
+    /// Start the delivery event hook, once. The two events that advance a
+    /// queued notice are both here — the same event-driven retry the chat
+    /// channel's session bridge applies to a deferred kickoff:
+    ///
+    /// * `TurnComplete` — the parent was busy and its turn just ended; this is
+    ///   the main exit for a queued batch.
+    /// * `SessionStarted` — the parent's conversation (re)connected, e.g. the
+    ///   user reopened it after the child finished. A new connection id serves
+    ///   the same conversation, which is why the flush re-resolves the target
+    ///   by conversation.
+    ///
+    /// Lazy-spawned from `enqueue` (the first async touch) because the sink is
+    /// constructed outside any tokio context.
+    fn ensure_bus_hook(&self) {
+        let Some(bus) = self.bus.clone() else {
+            return;
+        };
+        if self.bus_hook_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        // Subscribe SYNCHRONOUSLY here: the bus drops envelopes while it has
+        // no receivers, and the first delivery attempt (this enqueue) races
+        // the parent's next turn end.
+        let mut rx = bus.subscribe();
+        let inner = self.inner.clone();
+        let transport = self.transport.clone();
+        let ttl = self.ttl;
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(envelope) => {
+                        if matches!(
+                            envelope.payload,
+                            crate::acp::types::AcpEvent::TurnComplete { .. }
+                                | crate::acp::types::AcpEvent::SessionStarted { .. }
+                        ) {
+                            // Best-effort: a Retry outcome leaves the entry
+                            // queued for the next event.
+                            let _ = flush(&envelope.connection_id, &inner, &transport, ttl).await;
+                        }
+                    }
+                    // Slow subscriber: the gap dropped envelopes for every
+                    // consumer; the entry waits for the next turn end.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
     }
 
     /// A pull returned this result to the parent — stand the push down.
     pub async fn mark_consumed(&self, parent_connection_id: &str, task_id: &str) {
         let mut inner = self.inner.lock().await;
-        let key = (parent_connection_id.to_string(), task_id.to_string());
-        if inner.consumed.insert(key.clone()) {
-            inner.consumed_order.push_back(key);
-            while inner.consumed_order.len() > CONSUMED_CAP {
-                if let Some(old) = inner.consumed_order.pop_front() {
-                    inner.consumed.remove(&old);
-                }
-            }
-        }
+        mark_resolved_locked(&mut inner, parent_connection_id, task_id);
         let mut empty = false;
         if let Some(queue) = inner.queues.get_mut(parent_connection_id) {
             queue.retain(|q| q.notification.task_id != task_id);
@@ -329,26 +377,12 @@ impl DeliverySink {
         }
     }
 
-    /// Settings changed. Turning push off drops anything still queued; the
-    /// results themselves remain pull-able.
-    pub async fn apply_mode(&self, mode: ResultDeliveryMode) {
-        let mut inner = self.inner.lock().await;
-        if inner.mode == mode {
-            return;
-        }
-        inner.mode = mode;
-        if mode == ResultDeliveryMode::Off {
-            inner.queues.clear();
-        }
-    }
-
     /// One flush pass for a parent — public so tests can drive it directly
     /// instead of waiting on watcher timers.
     pub async fn flush_parent(&self, parent: &str) -> FlushOutcome {
         match flush(parent, &self.inner, &self.transport, self.ttl).await {
             Flush::Settled => FlushOutcome::Settled,
             Flush::Retry => FlushOutcome::Retry,
-            Flush::Disabled => FlushOutcome::Disabled,
         }
     }
 
@@ -368,7 +402,6 @@ impl DeliverySink {
 pub enum FlushOutcome {
     Settled,
     Retry,
-    Disabled,
 }
 
 #[async_trait]
@@ -380,59 +413,45 @@ impl DelegationResultSink for DeliverySink {
     async fn task_consumed(&self, parent_connection_id: &str, task_id: &str) {
         self.mark_consumed(parent_connection_id, task_id).await;
     }
+}
 
-    async fn set_mode(&self, mode: ResultDeliveryMode) {
-        self.apply_mode(mode).await;
+/// Memoize one `(parent, task)` pair on the push side, evicting oldest first.
+fn mark_resolved_locked(inner: &mut DeliveryInner, parent_connection_id: &str, task_id: &str) {
+    let key = (parent_connection_id.to_string(), task_id.to_string());
+    if inner.resolved.insert(key.clone()) {
+        inner.resolved_order.push_back(key);
+        while inner.resolved_order.len() > CONSUMED_CAP {
+            if let Some(old) = inner.resolved_order.pop_front() {
+                inner.resolved.remove(&old);
+            }
+        }
     }
 }
 
-/// Watcher loop for one parent. First pass immediate, then exponential backoff
-/// while the parent is busy / unreachable; exits once the queue drains.
-///
-/// The exit check is ATOMIC (one lock acquisition that either keeps watching
-/// or removes the watcher slot): if it were two steps, an `enqueue` landing
-/// between "queue looks empty" and "remove the slot" would observe the slot as
-/// taken, skip spawning, and leave its entry unwatched until the next
-/// terminal. Holding the lock across the decision closes that window, and it
-/// is why this loop never re-spawns itself.
-async fn watch(
-    inner: Arc<Mutex<DeliveryInner>>,
-    transport: Arc<dyn DeliveryTransport>,
+/// One flush pass, serialized per parent: the watcher and the turn-end bus
+/// hook can both arrive here, and two concurrent sends would deliver the same
+/// batch twice. A caller that loses the race reports `Settled` — the running
+/// pass either delivers or leaves the queue for the next one.
+async fn flush(
+    parent: &str,
+    inner: &Arc<Mutex<DeliveryInner>>,
+    transport: &Arc<dyn DeliveryTransport>,
     ttl: Duration,
-    interval: Duration,
-    parent: String,
-) {
-    let mut delay = Duration::ZERO;
-    loop {
-        if !delay.is_zero() {
-            tokio::time::sleep(delay).await;
-        }
-        match flush(&parent, &inner, &transport, ttl).await {
-            Flush::Settled => delay = interval,
-            Flush::Retry => delay = (delay.max(interval) * 2).min(MAX_BACKOFF),
-            // Push was switched off: the keep-check below retires us.
-            Flush::Disabled => {}
-        }
-        let keep = {
-            let mut inner = inner.lock().await;
-            let has_work = inner.mode == ResultDeliveryMode::Push
-                && inner
-                    .queues
-                    .get(&parent)
-                    .is_some_and(|queue| !queue.is_empty());
-            if !has_work {
-                inner.watching.remove(&parent);
-            }
-            has_work
-        };
-        if !keep {
-            break;
-        }
+) -> Flush {
+    let acquired = {
+        let mut guard = inner.lock().await;
+        guard.flushing.insert(parent.to_string())
+    };
+    if !acquired {
+        return Flush::Settled;
     }
+    let outcome = flush_inner(parent, inner, transport, ttl).await;
+    inner.lock().await.flushing.remove(parent);
+    outcome
 }
 
 /// One flush pass. Never holds the queue lock across a transport await.
-async fn flush(
+async fn flush_inner(
     parent: &str,
     inner: &Arc<Mutex<DeliveryInner>>,
     transport: &Arc<dyn DeliveryTransport>,
@@ -441,10 +460,6 @@ async fn flush(
     // 1. Snapshot the batch (and prune TTL-expired entries).
     let batch = {
         let mut guard = inner.lock().await;
-        if guard.mode == ResultDeliveryMode::Off {
-            guard.queues.remove(parent);
-            return Flush::Disabled;
-        }
         let Some(queue) = guard.queues.get_mut(parent) else {
             return Flush::Settled;
         };
@@ -474,7 +489,33 @@ async fn flush(
         return Flush::Retry; // parent is away; retry when it reconnects
     };
     if target.busy == ParentBusy::Busy {
-        return Flush::Retry; // deliver at the end of the current turn
+        // A capable adapter takes the notice mid-turn (native steering); one
+        // that cannot or whose steer races the turn's end waits for the turn
+        // to settle — the next pass re-resolves and sends a turn instead.
+        if !target.steer {
+            return Flush::Retry;
+        }
+        let text = build_notification_text(&batch_notifications(&batch));
+        return match transport.steer(&target, text).await {
+            Ok(()) => {
+                remove_batch(inner, parent, &batch).await;
+                tracing::info!(
+                    parent_connection_id = parent,
+                    connection_id = target.connection_id,
+                    tasks = batch.len(),
+                    "[delegation][delivery] steered result notification"
+                );
+                Flush::Settled
+            }
+            Err(err) => {
+                tracing::debug!(
+                    parent_connection_id = parent,
+                    ?err,
+                    "[delegation][delivery] steer not admitted; will retry"
+                );
+                Flush::Retry
+            }
+        };
     }
 
     // 3. The conversation row must still exist to file the turn.
@@ -485,12 +526,7 @@ async fn flush(
         return Flush::Settled;
     };
 
-    let text = build_notification_text(
-        &batch
-            .iter()
-            .map(|q| q.notification.clone())
-            .collect::<Vec<_>>(),
-    );
+    let text = build_notification_text(&batch_notifications(&batch));
     let notice_id = format!(
         "codeg-delegation-notice:{}",
         batch[0].notification.task_id
@@ -523,6 +559,14 @@ async fn flush(
     }
 }
 
+/// The payloads of one flush batch, cloned out of their queue entries.
+fn batch_notifications(batch: &[QueuedNotification]) -> Vec<TerminalNotification> {
+    batch
+        .iter()
+        .map(|queued| queued.notification.clone())
+        .collect()
+}
+
 /// Remove exactly the delivered batch's entries (entries queued while the
 /// send was in flight stay for the next pass).
 async fn remove_batch(
@@ -535,6 +579,12 @@ async fn remove_batch(
         .map(|q| q.notification.task_id.as_str())
         .collect();
     let mut guard = inner.lock().await;
+    // Delivered = settled: a repeated terminal announcement for the same task
+    // (which the broker's one-shot transition should prevent anyway) is
+    // dropped instead of waking the parent twice.
+    for queued in batch {
+        mark_resolved_locked(&mut guard, parent, &queued.notification.task_id);
+    }
     let mut empty = false;
     if let Some(queue) = guard.queues.get_mut(parent) {
         queue.retain(|q| !ids.contains(q.notification.task_id.as_str()));
@@ -667,6 +717,7 @@ impl DeliveryTransport for ManagerDeliveryTransport {
                 return Some(DeliveryTarget {
                     connection_id: preferred.to_string(),
                     busy: busy_of(&guard),
+                    steer: guard.native_steering_available,
                 });
             }
         }
@@ -679,8 +730,9 @@ impl DeliveryTransport for ManagerDeliveryTransport {
         let state = self.manager.get_state(&conn_id).await?;
         let guard = state.read().await;
         Some(DeliveryTarget {
-            connection_id: conn_id,
             busy: busy_of(&guard),
+            steer: guard.native_steering_available,
+            connection_id: conn_id,
         })
     }
 
@@ -723,6 +775,30 @@ impl DeliveryTransport for ManagerDeliveryTransport {
             Err(e) => Err(DeliverySendError::Other(e.to_string())),
         }
     }
+
+    async fn steer(
+        &self,
+        target: &DeliveryTarget,
+        text: String,
+    ) -> Result<(), DeliverySendError> {
+        match self
+            .manager
+            .steer_notice(
+                &target.connection_id,
+                vec![crate::acp::types::PromptInputBlock::Text { text }],
+            )
+            .await
+        {
+            Ok(()) => Ok(()),
+            // The turn settled first (or the adapter downgraded): the queue's
+            // next pass re-resolves and sends a turn instead.
+            Err(crate::acp::error::AcpError::NoActiveTurn) => Err(DeliverySendError::Busy),
+            Err(crate::acp::error::AcpError::ConnectionNotFound(_)) => {
+                Err(DeliverySendError::Gone)
+            }
+            Err(e) => Err(DeliverySendError::Other(e.to_string())),
+        }
+    }
 }
 
 /// Truncate on a char boundary, appending a marker when anything was dropped.
@@ -747,7 +823,6 @@ pub mod mock {
     pub struct MockResultSink {
         pub terminals: Mutex<Vec<TerminalNotification>>,
         pub consumed: Mutex<Vec<(String, String)>>,
-        pub modes: Mutex<Vec<ResultDeliveryMode>>,
     }
 
     impl MockResultSink {
@@ -759,9 +834,6 @@ pub mod mock {
         }
         pub async fn consumed(&self) -> Vec<(String, String)> {
             self.consumed.lock().await.clone()
-        }
-        pub async fn modes(&self) -> Vec<ResultDeliveryMode> {
-            self.modes.lock().await.clone()
         }
     }
 
@@ -775,9 +847,6 @@ pub mod mock {
                 .lock()
                 .await
                 .push((parent_connection_id.to_string(), task_id.to_string()));
-        }
-        async fn set_mode(&self, mode: ResultDeliveryMode) {
-            self.modes.lock().await.push(mode);
         }
     }
 }
@@ -793,7 +862,10 @@ mod tests {
         folder: Option<i32>,
         /// `None` = send succeeds; `Some("busy" | "gone" | other)` = fail.
         send_error: Option<String>,
+        /// Same script for [`DeliveryTransport::steer`].
+        steer_error: Option<String>,
         sends: Vec<(String, i32, i32, String, String)>,
+        steers: Vec<(String, String)>,
     }
 
     struct MockTransport {
@@ -818,6 +890,12 @@ mod tests {
         }
         fn set_send_error(&self, error: Option<&str>) {
             self.inner.lock().unwrap().send_error = error.map(str::to_string);
+        }
+        fn set_steer_error(&self, error: Option<&str>) {
+            self.inner.lock().unwrap().steer_error = error.map(str::to_string);
+        }
+        fn steers(&self) -> Vec<(String, String)> {
+            self.inner.lock().unwrap().steers.clone()
         }
         fn sends(&self) -> Vec<(String, i32, i32, String, String)> {
             self.inner.lock().unwrap().sends.clone()
@@ -861,12 +939,38 @@ mod tests {
             ));
             Ok(())
         }
+
+        async fn steer(
+            &self,
+            target: &DeliveryTarget,
+            text: String,
+        ) -> Result<(), DeliverySendError> {
+            let mut guard = self.inner.lock().unwrap();
+            if let Some(error) = guard.steer_error.clone() {
+                return Err(match error.as_str() {
+                    "busy" => DeliverySendError::Busy,
+                    "gone" => DeliverySendError::Gone,
+                    other => DeliverySendError::Other(other.to_string()),
+                });
+            }
+            guard.steers.push((target.connection_id.clone(), text));
+            Ok(())
+        }
     }
 
     fn idle_target() -> DeliveryTarget {
         DeliveryTarget {
             connection_id: "c1".into(),
             busy: ParentBusy::Idle,
+            steer: false,
+        }
+    }
+
+    fn busy_target(steer: bool) -> DeliveryTarget {
+        DeliveryTarget {
+            connection_id: "c1".into(),
+            busy: ParentBusy::Busy,
+            steer,
         }
     }
 
@@ -892,42 +996,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn idle_parent_gets_one_merged_notification_turn() {
+    async fn idle_parent_is_served_on_enqueue_without_a_flush_call() {
         let (sink, mock) = fixture(DEFAULT_TTL);
-        sink.enqueue(note("t1", TaskStatus::Completed, Some("first result")))
+        sink.enqueue(note("t1", TaskStatus::Completed, Some("the result")))
             .await;
-        sink.enqueue(note("t2", TaskStatus::Completed, Some("second result")))
-            .await;
-
-        assert_eq!(sink.flush_parent("p1").await, FlushOutcome::Settled);
 
         let sends = mock.sends();
-        assert_eq!(sends.len(), 1, "a fan-out must merge into ONE turn");
+        assert_eq!(sends.len(), 1, "an idle parent is served immediately");
         let (conn, folder, conv, text, notice) = &sends[0];
         assert_eq!(conn, "c1");
         assert_eq!(*folder, 7);
         assert_eq!(*conv, 42);
-        assert!(text.contains("t1") && text.contains("t2"));
-        assert!(text.contains("first result") && text.contains("second result"));
-        assert!(text.contains("2 tasks finished"));
+        assert!(text.contains("t1") && text.contains("the result"));
+        assert!(text.contains("1 task finished"));
         assert!(notice.starts_with("codeg-delegation-notice:"));
         assert_eq!(sink.queued_len("p1").await, 0);
     }
 
     #[tokio::test]
-    async fn busy_parent_retries_then_delivers_when_idle() {
+    async fn busy_parents_pile_up_into_one_merged_turn() {
         let (sink, mock) = fixture(DEFAULT_TTL);
-        mock.set_resolve(Some(DeliveryTarget {
-            connection_id: "c1".into(),
-            busy: ParentBusy::Busy,
-        }));
+        mock.set_resolve(Some(busy_target(false)));
+        sink.enqueue(note("t1", TaskStatus::Completed, Some("first result")))
+            .await;
+        sink.enqueue(note("t2", TaskStatus::Completed, Some("second result")))
+            .await;
+        assert_eq!(sink.queued_len("p1").await, 2);
+        assert!(mock.sends().is_empty());
+
+        mock.set_resolve(Some(idle_target()));
+        assert_eq!(sink.flush_parent("p1").await, FlushOutcome::Settled);
+
+        let sends = mock.sends();
+        assert_eq!(sends.len(), 1, "a fan-out must merge into ONE turn");
+        let text = &sends[0].3;
+        assert!(text.contains("t1") && text.contains("t2"));
+        assert!(text.contains("first result") && text.contains("second result"));
+        assert!(text.contains("2 tasks finished"));
+        assert_eq!(sink.queued_len("p1").await, 0);
+    }
+
+    #[tokio::test]
+    async fn busy_parent_waits_for_its_next_event() {
+        let (sink, mock) = fixture(DEFAULT_TTL);
+        mock.set_resolve(Some(busy_target(false)));
         sink.enqueue(note("t1", TaskStatus::Completed, Some("done")))
             .await;
 
-        assert_eq!(sink.flush_parent("p1").await, FlushOutcome::Retry);
+        // The enqueue's attempt was refused (busy): queued, nothing sent.
         assert_eq!(mock.sends().len(), 0);
         assert_eq!(sink.queued_len("p1").await, 1);
 
+        // The parent's turn ends (in production: the TurnComplete event).
         mock.set_resolve(Some(idle_target()));
         assert_eq!(sink.flush_parent("p1").await, FlushOutcome::Settled);
         assert_eq!(mock.sends().len(), 1);
@@ -936,14 +1056,19 @@ mod tests {
 
     #[tokio::test]
     async fn consumed_result_is_not_pushed() {
+        // The pull can only win while the notice is waiting, i.e. the parent
+        // was busy when the child finished and polled before its turn ended.
         let (sink, mock) = fixture(DEFAULT_TTL);
+        mock.set_resolve(Some(busy_target(false)));
         sink.enqueue(note("t1", TaskStatus::Completed, Some("done")))
             .await;
         sink.mark_consumed("p1", "t1").await;
 
         assert_eq!(sink.queued_len("p1").await, 0);
+        mock.set_resolve(Some(idle_target()));
         assert_eq!(sink.flush_parent("p1").await, FlushOutcome::Settled);
         assert_eq!(mock.sends().len(), 0);
+        assert!(mock.steers().is_empty());
     }
 
     #[tokio::test]
@@ -961,38 +1086,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplicate_terminal_is_idempotent() {
+    async fn duplicate_terminal_is_idempotent_across_delivery() {
         let (sink, mock) = fixture(DEFAULT_TTL);
         sink.enqueue(note("t1", TaskStatus::Completed, Some("done")))
             .await;
-        sink.enqueue(note("t1", TaskStatus::Completed, Some("done")))
-            .await;
-        assert_eq!(sink.queued_len("p1").await, 1);
-
-        assert_eq!(sink.flush_parent("p1").await, FlushOutcome::Settled);
         assert_eq!(mock.sends().len(), 1);
-    }
 
-    #[tokio::test]
-    async fn off_mode_drops_queue_and_ignores_new() {
-        let (sink, mock) = fixture(DEFAULT_TTL);
+        // A repeated announcement for the same task never wakes the parent a
+        // second time, even though the queue no longer holds it.
         sink.enqueue(note("t1", TaskStatus::Completed, Some("done")))
             .await;
-        sink.apply_mode(ResultDeliveryMode::Off).await;
-        assert_eq!(sink.queued_len("p1").await, 0);
-
-        // New terminals are ignored while off…
-        sink.enqueue(note("t2", TaskStatus::Completed, Some("done")))
-            .await;
-        assert_eq!(sink.queued_len("p1").await, 0);
-        assert_eq!(sink.flush_parent("p1").await, FlushOutcome::Disabled);
-        assert_eq!(mock.sends().len(), 0);
-
-        // …and push resumes when re-enabled.
-        sink.apply_mode(ResultDeliveryMode::Push).await;
-        sink.enqueue(note("t3", TaskStatus::Completed, Some("done")))
-            .await;
-        assert_eq!(sink.flush_parent("p1").await, FlushOutcome::Settled);
         assert_eq!(mock.sends().len(), 1);
     }
 
@@ -1017,6 +1120,54 @@ mod tests {
             .await;
         assert_eq!(sink.flush_parent("p1").await, FlushOutcome::Settled);
         assert_eq!(mock.sends().len(), 0);
+        assert_eq!(sink.queued_len("p1").await, 0);
+    }
+
+    #[tokio::test]
+    async fn busy_steer_capable_parent_takes_the_notice_mid_turn() {
+        let (sink, mock) = fixture(DEFAULT_TTL);
+        mock.set_resolve(Some(busy_target(true)));
+        sink.enqueue(note("t1", TaskStatus::Completed, Some("done")))
+            .await;
+
+        let steers = mock.steers();
+        assert_eq!(steers.len(), 1, "a capable parent is steered right away");
+        let (conn, text) = &steers[0];
+        assert_eq!(conn, "c1");
+        assert!(text.contains("t1") && text.contains("done"));
+        assert!(text.contains("<codeg-delegation-result>"));
+        // Delivered mid-turn — nothing is left queued and no turn was opened.
+        assert_eq!(sink.queued_len("p1").await, 0);
+        assert!(mock.sends().is_empty());
+    }
+
+    #[tokio::test]
+    async fn busy_without_steering_waits_even_when_the_steer_helper_exists() {
+        let (sink, mock) = fixture(DEFAULT_TTL);
+        mock.set_resolve(Some(busy_target(false)));
+        sink.enqueue(note("t1", TaskStatus::Completed, Some("done")))
+            .await;
+
+        assert_eq!(sink.flush_parent("p1").await, FlushOutcome::Retry);
+        assert!(mock.steers().is_empty());
+        assert_eq!(sink.queued_len("p1").await, 1);
+    }
+
+    #[tokio::test]
+    async fn failed_steer_falls_back_to_the_queue_and_later_turns() {
+        let (sink, mock) = fixture(DEFAULT_TTL);
+        mock.set_resolve(Some(busy_target(true)));
+        mock.set_steer_error(Some("busy")); // the turn settled mid-steer
+        sink.enqueue(note("t1", TaskStatus::Completed, Some("done")))
+            .await;
+
+        assert_eq!(sink.flush_parent("p1").await, FlushOutcome::Retry);
+        assert_eq!(sink.queued_len("p1").await, 1);
+
+        // The turn is over: the next pass sends an ordinary notice turn.
+        mock.set_resolve(Some(idle_target()));
+        assert_eq!(sink.flush_parent("p1").await, FlushOutcome::Settled);
+        assert_eq!(mock.sends().len(), 1);
         assert_eq!(sink.queued_len("p1").await, 0);
     }
 
@@ -1055,13 +1206,34 @@ mod tests {
         assert_eq!(sink.queued_len("p1").await, 0);
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn watcher_delivers_without_manual_flush() {
-        let mock = Arc::new(MockTransport::new(Some(idle_target()), Some(7)));
-        let sink = DeliverySink::new(mock.clone());
+    /// The event hook's two triggers, exercised through a real bus: a queued
+    /// notice is delivered when the parent's turn ends, and when the parent's
+    /// conversation (re)connects.
+    #[tokio::test]
+    async fn queued_notice_waits_for_the_parents_next_event() {
+        let bus = Arc::new(crate::acp::internal_bus::InternalEventBus::new(Arc::new(
+            crate::acp::EventBusMetrics::default(),
+        )));
+        let mock = Arc::new(MockTransport::new(Some(busy_target(false)), Some(7)));
+        let sink = DeliverySink::new(mock.clone()).with_event_bus(bus.clone());
+
+        // Busy parent: queued, nothing sent, nothing steered (no capability).
         sink.enqueue(note("t1", TaskStatus::Completed, Some("done")))
             .await;
+        assert_eq!(sink.queued_len("p1").await, 1);
+        assert!(mock.sends().is_empty());
 
+        // The turn ends: the flush runs off the event, no polling.
+        mock.set_resolve(Some(idle_target()));
+        bus.send(Arc::new(crate::acp::types::EventEnvelope {
+            seq: 1,
+            connection_id: "p1".into(),
+            payload: crate::acp::types::AcpEvent::TurnComplete {
+                session_id: "s1".into(),
+                stop_reason: "end_turn".into(),
+                agent_type: "custom:test".into(),
+            },
+        }));
         let mut delivered = false;
         for _ in 0..50 {
             tokio::task::yield_now().await;
@@ -1070,8 +1242,32 @@ mod tests {
                 break;
             }
         }
-        assert!(delivered, "the watcher's immediate pass must deliver");
+        assert!(delivered, "TurnComplete must flush the queue");
         assert_eq!(sink.queued_len("p1").await, 0);
+
+        // A parent that was away when its child finished gets the notice on
+        // the reconnect event, even though it never had a turn end.
+        mock.set_resolve(None);
+        sink.enqueue(note("t2", TaskStatus::Completed, Some("done")))
+            .await;
+        assert_eq!(sink.queued_len("p1").await, 1);
+        mock.set_resolve(Some(idle_target()));
+        bus.send(Arc::new(crate::acp::types::EventEnvelope {
+            seq: 2,
+            connection_id: "p1".into(),
+            payload: crate::acp::types::AcpEvent::SessionStarted {
+                session_id: "s1".into(),
+            },
+        }));
+        let mut delivered = false;
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+            if mock.sends().len() == 2 {
+                delivered = true;
+                break;
+            }
+        }
+        assert!(delivered, "SessionStarted must flush the queue");
     }
 
     #[test]
