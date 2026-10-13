@@ -1912,12 +1912,11 @@ mod route_sanitizer_tests {
     /// transcript, where codeg has no structural marker.
     #[test]
     fn a_delegation_notice_never_renders_as_a_user_turn() {
-        let notice = format!(
-            "Delegation result: 1 task finished.\n\n<codeg-delegation-result>\n\
+        let notice = "Delegation result: 1 task finished.\n\n<codeg-delegation-result>\n\
              task t1 (completed, open_code):\ndone\n</codeg-delegation-result>\n\n\
              Full result: get_delegation_status([\"t1\"]) — or open child \
              conversation #74.\nThis is a system notification from codeg; no reply needed."
-        );
+            .to_string();
         let detail = sanitized(Fixture {
             summary: summary(Some("please delegate"), 2),
             turns: vec![
