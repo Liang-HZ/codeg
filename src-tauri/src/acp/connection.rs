@@ -1251,7 +1251,8 @@ pub enum ConnectionCommand {
         /// agent request, so its seq strictly precedes the turn's assistant /
         /// status events (viewers apply in seq order) and it only fires for a
         /// prompt actually being processed. `None` for delegation children,
-        /// empty prompts, unbound conversations, and non-linked senders.
+        /// empty prompts, unbound conversations, non-linked senders, and the
+        /// delegation-result notice (system content the UI never shows).
         user_message: Option<(String, Vec<UserMessageBlock>)>,
         /// Codeg-authored blocks appended after `blocks` at the final agent
         /// boundary, and only there: the assistant brief a delegated child
@@ -1829,7 +1830,12 @@ fn queue_transcript_header(
 /// end, which is the other place codeg waits). A prompt happens once per turn,
 /// so closing it costs one disk write per turn — nothing the user can perceive,
 /// against a failure that is permanent and silent.
-async fn record_prompt(agent_type: AgentType, session_id: &str, blocks: &[ContentBlock]) {
+async fn record_prompt(
+    agent_type: AgentType,
+    session_id: &str,
+    blocks: &[ContentBlock],
+    source: Option<&str>,
+) {
     let Some(dir) = transcript_dir_for(agent_type) else {
         return;
     };
@@ -1841,6 +1847,7 @@ async fn record_prompt(agent_type: AgentType, session_id: &str, blocks: &[Conten
         session_id,
         crate::acp_transcript::EntryKind::Prompt,
         payload,
+        source,
     );
     let _ = tokio::time::timeout(std::time::Duration::from_millis(2000), ack).await;
 }
@@ -1854,14 +1861,19 @@ async fn record_prompt(agent_type: AgentType, session_id: &str, blocks: &[Conten
 /// hold it: the reply to the steer would glue onto the reply before it, and the
 /// message would vanish once the conversation is reopened. Recorded as the
 /// prompt it is, marked so the reader knows the turn did not start there.
-async fn record_steer(agent_type: AgentType, session_id: &str, blocks: &[ContentBlock]) {
+async fn record_steer(
+    agent_type: AgentType,
+    session_id: &str,
+    blocks: &[ContentBlock],
+    source: Option<&str>,
+) {
     let Some(dir) = transcript_dir_for(agent_type) else {
         return;
     };
     let Ok(payload) = serde_json::to_value(blocks) else {
         return;
     };
-    let ack = crate::acp_transcript::record_steer(dir, session_id, payload);
+    let ack = crate::acp_transcript::record_steer(dir, session_id, payload, source);
     let _ = tokio::time::timeout(std::time::Duration::from_millis(2000), ack).await;
 }
 
@@ -1904,6 +1916,7 @@ async fn record_turn_end(
         session_id,
         crate::acp_transcript::EntryKind::TurnEnd,
         payload,
+        None,
     );
     let _ = tokio::time::timeout(std::time::Duration::from_millis(2000), ack).await;
 }
@@ -1977,6 +1990,7 @@ fn queue_transcript_update(
         session_id,
         crate::acp_transcript::EntryKind::Update,
         payload,
+        None,
     ))
 }
 
@@ -13680,7 +13694,7 @@ async fn run_conversation_loop(
                 // order matches the wire order even if the agent replies
                 // instantly — and awaited, so the replay gate can never see
                 // this conversation as transcript-less (see `record_prompt`).
-                record_prompt(agent_type, &sid.0, &prompt_blocks).await;
+                record_prompt(agent_type, &sid.0, &prompt_blocks, source.as_deref()).await;
                 prompted = true;
                 // claude-agent-acp answers a `/remote-control` prompt itself;
                 // its reply says whether Remote Control is on.
@@ -14398,7 +14412,11 @@ async fn run_conversation_loop(
                                         let _ = reply.send(landed);
                                     }
                                 }
-                                Some(ConnectionCommand::Steer { blocks, reply }) => {
+                                Some(ConnectionCommand::Steer {
+                                    blocks,
+                                    reply,
+                                    source,
+                                }) => {
                                     // Protocol round-trip only — the manager's
                                     // cancellation-shielded task records the
                                     // note + broadcasts `FeedbackSubmitted`
@@ -14491,6 +14509,7 @@ async fn run_conversation_loop(
                                             agent_type,
                                             &sid.0,
                                             &map_prompt_blocks(blocks.clone()),
+                                            source.as_deref(),
                                         )
                                         .await;
                                     }
@@ -14759,7 +14778,11 @@ async fn run_conversation_loop(
                     let _ = reply.send(landed);
                 }
             }
-            Some(ConnectionCommand::Steer { blocks: _, reply }) => {
+            Some(ConnectionCommand::Steer {
+                blocks: _,
+                reply,
+                source: _,
+            }) => {
                 // Steering only means something for a RUNNING turn. Reply —
                 // never drop — so the manager's shielded task can't hang on
                 // the oneshot; the caller falls back to a normal prompt (the
@@ -41101,6 +41124,7 @@ mod tests {
             let (reply, outcome) = oneshot::channel();
             self.cmd_tx
                 .send(ConnectionCommand::Steer {
+                    source: None,
                     blocks: vec![PromptInputBlock::Text { text: text.into() }],
                     reply,
                 })
@@ -42456,6 +42480,7 @@ mod tests {
             let (reply, outcome) = oneshot::channel();
             self.cmd_tx
                 .send(ConnectionCommand::Steer {
+                    source: None,
                     blocks: vec![PromptInputBlock::Text { text: text.into() }],
                     reply,
                 })
@@ -43003,6 +43028,7 @@ mod tests {
             "writer-barrier",
             crate::acp_transcript::EntryKind::TurnEnd,
             serde_json::json!({"stopReason": "end_turn"}),
+            None,
         );
         tokio::time::timeout(std::time::Duration::from_secs(30), barrier)
             .await
