@@ -207,11 +207,17 @@ struct DeliveryInner {
     /// duplicated terminal announcement.
     resolved: HashSet<(String, String)>,
     resolved_order: VecDeque<(String, String)>,
-    /// Parents whose queue a flush pass is currently working on. Several
-    /// triggers can reach the same parent at once (its immediate attempt races
-    /// a turn end, a turn end races a reconnect); the loser must not deliver
-    /// the same batch again.
-    flushing: HashSet<String>,
+    /// One gate per parent. Several triggers can reach the same parent at once
+    /// (its immediate attempt races a turn end, a turn end races a reconnect);
+    /// a gate serializes them so the same batch is never delivered twice, and —
+    /// unlike a "drop the loser" flag — the second caller still runs its own
+    /// pass afterwards, so an event that raced a delivery attempt is never
+    /// silently swallowed. Gates are kept forever on purpose: removing one
+    /// while another caller holds its `Arc` would let a later caller mint a
+    /// SECOND gate for the same parent and deliver concurrently again. One
+    /// `Arc` per connection ever seen is nothing next to the connection's own
+    /// state.
+    flush_gates: HashMap<String, Arc<Mutex<()>>>,
 }
 
 /// Outcome of one flush pass over a parent's queue.
@@ -265,12 +271,6 @@ impl DeliverySink {
         self
     }
 
-    /// Test-only: no event hook — every flush is driven by the test.
-    #[cfg(test)]
-    fn for_test(transport: Arc<dyn DeliveryTransport>, ttl: Duration) -> Self {
-        Self::with_tuning(transport, ttl)
-    }
-
     /// Queue a terminal notification, then make one immediate delivery
     /// attempt: an idle parent is served right here (the broker's terminal
     /// transition IS the event for that), and the attempt doubles as the
@@ -278,6 +278,10 @@ impl DeliverySink {
     /// enqueue. A busy or away parent is served by the event hook — its turn
     /// ending (`TurnComplete`) or its conversation reconnecting
     /// (`SessionStarted`) — never by polling.
+    ///
+    /// The attempt runs in a SPAWNED task: this is the broker's terminal path
+    /// (see the sink trait's fire-and-forget contract), and it must not ride
+    /// on a database write, a prompt enqueue or a steering round-trip.
     ///
     /// Expired entries are pruned here too (lazy TTL): a parent that never
     /// comes back leaves its entry behind, and the next terminal of any
@@ -310,7 +314,12 @@ impl DeliverySink {
                 queued_at: now,
             });
         }
-        let _ = flush(&parent, &self.inner, &self.transport, self.ttl).await;
+        let inner = self.inner.clone();
+        let transport = self.transport.clone();
+        let ttl = self.ttl;
+        tokio::spawn(async move {
+            let _ = flush(&parent, &inner, &transport, ttl).await;
+        });
     }
 
     /// Start the delivery event hook, once. The two events that advance a
@@ -428,26 +437,22 @@ fn mark_resolved_locked(inner: &mut DeliveryInner, parent_connection_id: &str, t
     }
 }
 
-/// One flush pass, serialized per parent: the watcher and the turn-end bus
-/// hook can both arrive here, and two concurrent sends would deliver the same
-/// batch twice. A caller that loses the race reports `Settled` — the running
-/// pass either delivers or leaves the queue for the next one.
+/// One flush pass, serialized per parent through that parent's gate: two
+/// concurrent sends would deliver the same batch twice. Callers queue up
+/// rather than one being dropped — a trigger that raced a delivery attempt
+/// still gets its own pass on the freshly-updated queue.
 async fn flush(
     parent: &str,
     inner: &Arc<Mutex<DeliveryInner>>,
     transport: &Arc<dyn DeliveryTransport>,
     ttl: Duration,
 ) -> Flush {
-    let acquired = {
+    let gate = {
         let mut guard = inner.lock().await;
-        guard.flushing.insert(parent.to_string())
+        guard.flush_gates.entry(parent.to_string()).or_default().clone()
     };
-    if !acquired {
-        return Flush::Settled;
-    }
-    let outcome = flush_inner(parent, inner, transport, ttl).await;
-    inner.lock().await.flushing.remove(parent);
-    outcome
+    let _gate = gate.lock().await;
+    flush_inner(parent, inner, transport, ttl).await
 }
 
 /// One flush pass. Never holds the queue lock across a transport await.
@@ -864,6 +869,9 @@ mod tests {
         send_error: Option<String>,
         /// Same script for [`DeliveryTransport::steer`].
         steer_error: Option<String>,
+        /// When set, `send` parks on it before recording — lets a test hold a
+        /// delivery in flight (the terminal path must not wait on it).
+        send_hold: Option<Arc<tokio::sync::Semaphore>>,
         sends: Vec<(String, i32, i32, String, String)>,
         steers: Vec<(String, String)>,
     }
@@ -894,6 +902,9 @@ mod tests {
         fn set_steer_error(&self, error: Option<&str>) {
             self.inner.lock().unwrap().steer_error = error.map(str::to_string);
         }
+        fn set_send_hold(&self, hold: Option<Arc<tokio::sync::Semaphore>>) {
+            self.inner.lock().unwrap().send_hold = hold;
+        }
         fn steers(&self) -> Vec<(String, String)> {
             self.inner.lock().unwrap().steers.clone()
         }
@@ -922,6 +933,12 @@ mod tests {
             text: String,
             notice_id: String,
         ) -> Result<(), DeliverySendError> {
+            // Park, if the test is holding deliveries. Read the hold and drop
+            // the std lock BEFORE awaiting.
+            let hold = { self.inner.lock().unwrap().send_hold.clone() };
+            if let Some(hold) = hold {
+                let _ = hold.acquire().await;
+            }
             let mut guard = self.inner.lock().unwrap();
             if let Some(error) = guard.send_error.clone() {
                 return Err(match error.as_str() {
@@ -989,9 +1006,21 @@ mod tests {
         }
     }
 
+    /// Yield until `check` holds (bounded), for assertions that follow a
+    /// spawned delivery attempt.
+    async fn until(check: impl Fn() -> bool) {
+        for _ in 0..2000 {
+            if check() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("condition never became true");
+    }
+
     fn fixture(ttl: Duration) -> (DeliverySink, Arc<MockTransport>) {
         let mock = Arc::new(MockTransport::new(Some(idle_target()), Some(7)));
-        let sink = DeliverySink::for_test(mock.clone(), ttl);
+        let sink = DeliverySink::with_tuning(mock.clone(), ttl);
         (sink, mock)
     }
 
@@ -1000,6 +1029,7 @@ mod tests {
         let (sink, mock) = fixture(DEFAULT_TTL);
         sink.enqueue(note("t1", TaskStatus::Completed, Some("the result")))
             .await;
+        until(|| !mock.sends().is_empty()).await;
 
         let sends = mock.sends();
         assert_eq!(sends.len(), 1, "an idle parent is served immediately");
@@ -1010,6 +1040,61 @@ mod tests {
         assert!(text.contains("t1") && text.contains("the result"));
         assert!(text.contains("1 task finished"));
         assert!(notice.starts_with("codeg-delegation-notice:"));
+        assert_eq!(sink.queued_len("p1").await, 0);
+    }
+
+    #[tokio::test]
+    async fn enqueue_never_waits_for_the_delivery_attempt() {
+        // `enqueue` is the broker's terminal path (see the sink trait's
+        // fire-and-forget contract): it must return while the actual delivery
+        // — a DB write, a prompt enqueue, a steering round-trip — is still in
+        // flight.
+        let (sink, mock) = fixture(DEFAULT_TTL);
+        let hold = Arc::new(tokio::sync::Semaphore::new(0));
+        mock.set_send_hold(Some(hold.clone()));
+
+        tokio::time::timeout(
+            // Generous: the send is parked indefinitely, so any bound proves
+            // the point; a tight one would only flake under load.
+            std::time::Duration::from_secs(2),
+            sink.enqueue(note("t1", TaskStatus::Completed, Some("done"))),
+        )
+        .await
+        .expect("enqueue must not ride on the delivery attempt");
+        assert!(mock.sends().is_empty(), "the send is still parked");
+
+        hold.add_permits(1);
+        until(|| !mock.sends().is_empty()).await;
+        assert_eq!(sink.queued_len("p1").await, 0);
+    }
+
+    #[tokio::test]
+    async fn concurrent_flush_triggers_never_double_deliver() {
+        // The immediate attempt and a turn end can race; the per-parent gate
+        // serializes them (and the loser still runs its own pass, so nothing
+        // is swallowed).
+        let (sink, mock) = fixture(DEFAULT_TTL);
+        mock.set_resolve(Some(busy_target(false)));
+        sink.enqueue(note("t1", TaskStatus::Completed, Some("done")))
+            .await;
+        assert_eq!(sink.queued_len("p1").await, 1);
+        mock.set_resolve(Some(idle_target()));
+        let hold = Arc::new(tokio::sync::Semaphore::new(0));
+        mock.set_send_hold(Some(hold.clone()));
+
+        let releaser = {
+            let hold = hold.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                hold.add_permits(4);
+            })
+        };
+        let (a, b) = tokio::join!(sink.flush_parent("p1"), sink.flush_parent("p1"));
+        releaser.await.unwrap();
+
+        assert_eq!(a, FlushOutcome::Settled);
+        assert_eq!(b, FlushOutcome::Settled);
+        assert_eq!(mock.sends().len(), 1, "one batch, one delivery");
         assert_eq!(sink.queued_len("p1").await, 0);
     }
 
@@ -1090,12 +1175,16 @@ mod tests {
         let (sink, mock) = fixture(DEFAULT_TTL);
         sink.enqueue(note("t1", TaskStatus::Completed, Some("done")))
             .await;
+        until(|| !mock.sends().is_empty()).await;
         assert_eq!(mock.sends().len(), 1);
 
         // A repeated announcement for the same task never wakes the parent a
         // second time, even though the queue no longer holds it.
         sink.enqueue(note("t1", TaskStatus::Completed, Some("done")))
             .await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
         assert_eq!(mock.sends().len(), 1);
     }
 
@@ -1118,6 +1207,10 @@ mod tests {
         let (sink, mock) = fixture(Duration::ZERO);
         sink.enqueue(note("t1", TaskStatus::Completed, Some("done")))
             .await;
+        // The spawned attempt is what drops the expired entry; let it run.
+        for _ in 0..40 {
+            tokio::task::yield_now().await;
+        }
         assert_eq!(sink.flush_parent("p1").await, FlushOutcome::Settled);
         assert_eq!(mock.sends().len(), 0);
         assert_eq!(sink.queued_len("p1").await, 0);
@@ -1129,6 +1222,7 @@ mod tests {
         mock.set_resolve(Some(busy_target(true)));
         sink.enqueue(note("t1", TaskStatus::Completed, Some("done")))
             .await;
+        until(|| !mock.steers().is_empty()).await;
 
         let steers = mock.steers();
         assert_eq!(steers.len(), 1, "a capable parent is steered right away");
