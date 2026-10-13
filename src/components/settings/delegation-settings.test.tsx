@@ -101,7 +101,6 @@ function settings(
     enabled: false,
     depth_limit: 1,
     completed_cache_max_mb: 512,
-    result_delivery: "push",
     agent_defaults: {},
     ...overrides,
   }
@@ -164,9 +163,6 @@ describe("DelegationSettingsSection", () => {
     expect(screen.getByLabelText("Enable delegation")).toBeInTheDocument()
     expect(
       screen.getByLabelText("Completed-result cache (MB)")
-    ).toBeInTheDocument()
-    expect(
-      screen.getByLabelText("Deliver results proactively")
     ).toBeInTheDocument()
     // No timeout knob anymore — cancel flows through MCP notifications.
     expect(screen.queryByLabelText(/timeout/i)).not.toBeInTheDocument()
@@ -234,7 +230,6 @@ describe("DelegationSettingsSection", () => {
         enabled: true,
         depth_limit: 1,
         completed_cache_max_mb: 0,
-        result_delivery: "push",
         agent_defaults: {},
       })
     })
@@ -258,7 +253,6 @@ describe("DelegationSettingsSection", () => {
         enabled: true,
         depth_limit: 1,
         completed_cache_max_mb: 512,
-        result_delivery: "push",
         agent_defaults: {},
       })
     })
@@ -282,7 +276,6 @@ describe("DelegationSettingsSection", () => {
         enabled: true,
         depth_limit: 5,
         completed_cache_max_mb: 512,
-        result_delivery: "push",
         agent_defaults: {},
       })
     })
@@ -308,44 +301,6 @@ describe("DelegationSettingsSection", () => {
 
     expect(enableSwitch).toHaveAttribute("data-state", "unchecked")
     expect(depthInput).toBeDisabled()
-  })
-
-  it("saves the result-delivery switch as off when toggled", async () => {
-    mockGetDelegationSettings.mockResolvedValue(settings({ enabled: true }))
-    mockSetDelegationSettings.mockImplementation(async (next) => next)
-
-    renderWithIntl()
-
-    const deliverySwitch = await screen.findByLabelText(
-      "Deliver results proactively"
-    )
-    expect(deliverySwitch).toHaveAttribute("data-state", "checked")
-
-    fireEvent.click(deliverySwitch)
-    fireEvent.click(screen.getByRole("button", { name: "Save" }))
-
-    await waitFor(() => {
-      expect(mockSetDelegationSettings).toHaveBeenCalledWith({
-        enabled: true,
-        depth_limit: 1,
-        completed_cache_max_mb: 512,
-        result_delivery: "off",
-        agent_defaults: {},
-      })
-    })
-  })
-
-  it("loads result_delivery off as an unchecked switch", async () => {
-    mockGetDelegationSettings.mockResolvedValue(
-      settings({ enabled: true, result_delivery: "off" })
-    )
-
-    renderWithIntl()
-
-    const deliverySwitch = await screen.findByLabelText(
-      "Deliver results proactively"
-    )
-    expect(deliverySwitch).toHaveAttribute("data-state", "unchecked")
   })
 })
 

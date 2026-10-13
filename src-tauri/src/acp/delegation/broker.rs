@@ -60,7 +60,7 @@ use async_trait::async_trait;
 use tokio::sync::{Mutex, Notify};
 
 use crate::acp::delegation::delivery::{
-    DelegationResultSink, NoopResultSink, ResultDeliveryMode, TerminalNotification,
+    DelegationResultSink, NoopResultSink, TerminalNotification,
 };
 use crate::acp::delegation::event_emitter::{DelegationEventEmitter, NoopEventEmitter};
 use crate::acp::delegation::live_reply::{ChildLiveReplyLookup, NoopChildLiveReplyLookup};
@@ -247,10 +247,6 @@ pub struct DelegationConfig {
     /// converted to bytes in `into_broker_config`. Pushed into the pending-calls
     /// bucket by `set_config` so `insert_completed` reads it lock-free.
     pub completed_cache_cap_bytes: usize,
-    /// How terminal delegation results reach the parent agent — pushed by the
-    /// result-delivery channel (default) or pull-only. Forwarded to the
-    /// [`DelegationResultSink`] by `set_config`.
-    pub result_delivery: ResultDeliveryMode,
 }
 
 impl Default for DelegationConfig {
@@ -260,7 +256,6 @@ impl Default for DelegationConfig {
             depth_limit: 1,
             agent_defaults: BTreeMap::new(),
             completed_cache_cap_bytes: DEFAULT_COMPLETED_CACHE_CAP_BYTES,
-            result_delivery: ResultDeliveryMode::default(),
         }
     }
 }
@@ -2436,12 +2431,7 @@ impl DelegationBroker {
 
     pub async fn set_config(&self, cfg: DelegationConfig) {
         let cap_bytes = cfg.completed_cache_cap_bytes;
-        let result_delivery = cfg.result_delivery;
         *self.config.lock().await = cfg;
-        // Result-delivery mode lives with the sink (it owns the queue); the
-        // broker is just the settings carrier. Forwarded BEFORE the pending
-        // lock below so the two settings never interleave observably.
-        self.result_sink.set_mode(result_delivery).await;
         // Seed the byte cap into the pending-calls bucket so `insert_completed`
         // reads it lock-free (it already holds the pending lock). Acquired AFTER
         // the config guard above is dropped — sequential, never nested — so no
@@ -5489,25 +5479,6 @@ mod tests {
         // push channel must stay silent.
         broker.cancel_by_parent_turn("parent-conn").await;
         assert!(sink.terminals().await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn set_config_forwards_delivery_mode_to_sink() {
-        let mock = Arc::new(MockSpawner::new());
-        let sink = Arc::new(MockResultSink::new());
-        let broker = broker_with_result_sink(mock, sink.clone()).await;
-
-        broker
-            .set_config(DelegationConfig {
-                result_delivery: ResultDeliveryMode::Off,
-                ..DelegationConfig::default()
-            })
-            .await;
-        assert_eq!(
-            sink.modes().await.last(),
-            Some(&ResultDeliveryMode::Off),
-            "set_config must forward the delivery mode to the sink"
-        );
     }
 
     /// `StatusWait::Infinite` (the explicit `wait_ms = 0` escape hatch) must
