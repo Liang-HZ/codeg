@@ -24,7 +24,14 @@
 
 import { useCallback, useEffect, useRef, useState } from "react"
 import { useTranslations } from "next-intl"
-import { AlertTriangle, Bubbles, Gauge, HardDrive, Power } from "lucide-react"
+import {
+  AlertTriangle,
+  Bubbles,
+  Gauge,
+  HardDrive,
+  Power,
+  Send,
+} from "lucide-react"
 import { toast } from "sonner"
 
 import { SettingCard, SettingRow } from "@/components/shared/setting-card"
@@ -96,6 +103,7 @@ export function DelegationSettingsSection() {
   const [enabled, setEnabled] = useState(false)
   const [depth, setDepth] = useState<number>(1)
   const [cacheMb, setCacheMb] = useState<number>(DEFAULT_CACHE_MB)
+  const [resultDelivery, setResultDelivery] = useState<"push" | "off">("push")
   const [agentDefaults, setAgentDefaults] = useState<
     Partial<Record<AgentType, AgentDelegationDefaults>>
   >({})
@@ -122,6 +130,9 @@ export function DelegationSettingsSection() {
    * it on and broadcast, then the late reply would switch it back). */
   const [persisted, setPersisted] = useState<DelegationSettings | null>(null)
   const [tab, setTab] = useState<DelegationTab>("general")
+  /** Same baseline trick for the result-delivery switch: the broadcast carries
+   * it too, and a pending edit must survive an unrelated remote write. */
+  const baselineDeliveryRef = useRef<"push" | "off">("push")
 
   useEffect(() => {
     let cancelled = false
@@ -133,6 +144,10 @@ export function DelegationSettingsSection() {
           setEnabled(s.enabled)
           baselineEnabledRef.current = s.enabled
           setPersisted(s)
+          const delivery: "push" | "off" =
+            s.result_delivery === "off" ? "off" : "push"
+          setResultDelivery(delivery)
+          baselineDeliveryRef.current = delivery
         }
         setDepth(s.depth_limit)
         setCacheMb(s.completed_cache_max_mb)
@@ -215,6 +230,13 @@ export function DelegationSettingsSection() {
           current === previousBaseline ? remote.enabled : current
         )
         setPersisted(remote)
+        const previousDelivery = baselineDeliveryRef.current
+        const remoteDelivery: "push" | "off" =
+          remote.result_delivery === "off" ? "off" : "push"
+        baselineDeliveryRef.current = remoteDelivery
+        setResultDelivery((current) =>
+          current === previousDelivery ? remoteDelivery : current
+        )
       }
     )
       .then((fn) => {
@@ -235,6 +257,7 @@ export function DelegationSettingsSection() {
       enabled,
       depth_limit: clamp(depth, DEPTH_MIN, DEPTH_MAX),
       completed_cache_max_mb: clampCacheMb(cacheMb),
+      result_delivery: resultDelivery,
       agent_defaults: agentDefaults,
     }
     setSaving(true)
@@ -256,6 +279,10 @@ export function DelegationSettingsSection() {
       // inputs reflect what was actually persisted.
       setDepth(applied.depth_limit)
       setCacheMb(applied.completed_cache_max_mb)
+      const appliedDelivery: "push" | "off" =
+        applied.result_delivery === "off" ? "off" : "push"
+      setResultDelivery(appliedDelivery)
+      baselineDeliveryRef.current = appliedDelivery
       setAgentDefaults(applied.agent_defaults ?? {})
       toast.success(t("saved"))
     } catch (err: unknown) {
@@ -265,7 +292,7 @@ export function DelegationSettingsSection() {
     } finally {
       setSaving(false)
     }
-  }, [enabled, depth, cacheMb, agentDefaults, t])
+  }, [enabled, depth, cacheMb, resultDelivery, agentDefaults, t])
 
   const generalDirty =
     persisted !== null &&
@@ -383,6 +410,22 @@ export function DelegationSettingsSection() {
                   }}
                   disabled={loading || !enabled}
                   className="h-8 w-24 bg-background text-xs"
+                />
+              }
+            />
+            <SettingRow
+              icon={Send}
+              title={t("resultDeliveryLabel")}
+              description={t("resultDeliveryHint")}
+              htmlFor="delegation-result-delivery"
+              control={
+                <Switch
+                  id="delegation-result-delivery"
+                  checked={resultDelivery === "push"}
+                  onCheckedChange={(checked) =>
+                    setResultDelivery(checked ? "push" : "off")
+                  }
+                  disabled={loading || !enabled}
                 />
               }
             />
