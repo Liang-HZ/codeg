@@ -122,6 +122,11 @@ pub fn default_chat_channel_manager() -> ChatChannelManager {
 /// path. Shared between codeg-server bootstrap and the Tauri `setup` block
 /// so both modes apply identical depth limit + timeout defaults.
 ///
+/// `event_bus` is the in-process ACP fan-out: the result-delivery sink
+/// subscribes to it so a parent's `TurnComplete` flushes a queued result
+/// notice immediately (the event-driven half of the delivery retry; the
+/// watcher inside the sink is the fallback).
+///
 /// The listener task is _not_ spawned here — callers spawn it after they
 /// own an `Arc<AppState>` (or the relevant pieces) so the listener can
 /// borrow the long-lived state without circular Arc shenanigans.
@@ -129,6 +134,7 @@ pub fn build_delegation_stack(
     connection_manager: &ConnectionManager,
     db_conn: sea_orm::DatabaseConnection,
     data_dir: PathBuf,
+    event_bus: Arc<crate::acp::InternalEventBus>,
 ) -> (
     Arc<DelegationBroker>,
     Arc<TokenRegistry>,
@@ -172,7 +178,8 @@ pub fn build_delegation_stack(
             connection_manager.clone_ref(),
             db_arc.clone(),
         ));
-        Arc::new(DeliverySink::new(transport)) as Arc<dyn DelegationResultSink>
+        Arc::new(DeliverySink::new(transport).with_event_bus(event_bus.clone()))
+            as Arc<dyn DelegationResultSink>
     };
     let spawner = Arc::new(ConnectionManagerSpawner {
         manager: cm_arc.clone(),
@@ -267,7 +274,12 @@ impl AppState {
             chat_authoring_config,
             browser_tools_config,
             computer_tools_config,
-        ) = build_delegation_stack(&connection_manager, db.conn.clone(), data_dir.clone());
+        ) = build_delegation_stack(
+            &connection_manager,
+            db.conn.clone(),
+            data_dir.clone(),
+            acp_event_bus.clone(),
+        );
 
         Self {
             db,
