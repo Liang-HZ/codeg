@@ -754,6 +754,8 @@
       "depthHint": "Allowed range: {min}–{max}. Caps how deep a chain (root → child → grandchild …) can recurse.",
       "completedCacheLabel": "Completed-result cache (MB)",
       "completedCacheHint": "In-memory cache of finished sub-agent results, held only while the delegating session is running and cleared automatically when it ends. Over this budget the oldest results are dropped from memory first (still viewable in the sub-agent's own session); 0 = unlimited (still cleared when the session ends).",
+      "resultDeliveryLabel": "Deliver results proactively",
+      "resultDeliveryHint": "Finished sub-agent results are pushed to the parent automatically — right away when it is idle, or at the end of its current turn when busy. Off: results wait for get_delegation_status.",
       "save": "Save",
       "saving": "Saving…",
       "saved": "Delegation settings saved",

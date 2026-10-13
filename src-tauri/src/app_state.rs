@@ -159,6 +159,21 @@ pub fn build_delegation_stack(
     let db_arc = Arc::new(AppDatabase {
         conn: db_conn.clone(),
     });
+    // Result-delivery ("push") channel: the broker announces terminal tasks
+    // (after its running→completed migration); the sink queues per parent and
+    // pushes a notification turn when the parent is idle — or at the end of
+    // its current turn when it is busy. Pull (`get_delegation_status`) still
+    // wins when it gets there first.
+    let result_sink = {
+        use crate::acp::delegation::delivery::{
+            DelegationResultSink, DeliverySink, ManagerDeliveryTransport,
+        };
+        let transport = Arc::new(ManagerDeliveryTransport::new(
+            connection_manager.clone_ref(),
+            db_arc.clone(),
+        ));
+        Arc::new(DeliverySink::new(transport)) as Arc<dyn DelegationResultSink>
+    };
     let spawner = Arc::new(ConnectionManagerSpawner {
         manager: cm_arc.clone(),
         db: db_arc.clone(),
@@ -182,7 +197,8 @@ pub fn build_delegation_stack(
     let broker = Arc::new(
         DelegationBroker::with_writers(spawner, depth_lookup, meta_writer, event_emitter)
             .with_status_lookup(status_lookup)
-            .with_live_reply_lookup(live_reply_lookup),
+            .with_live_reply_lookup(live_reply_lookup)
+            .with_result_sink(result_sink),
     );
     let tokens = Arc::new(TokenRegistry::default());
     let socket_path = default_socket_path(&std::env::temp_dir());

@@ -754,6 +754,8 @@
       "depthHint": "允许范围：{min}–{max}。限制委托链（根 → 子 → 孙 …）的最大递归深度。",
       "completedCacheLabel": "已完成结果缓存（MB）",
       "completedCacheHint": "运行中委托会话已完成子智能体结果的内存缓存，仅在该会话运行期间保留，会话结束后自动清除。超出此预算时优先从内存中丢弃最旧的结果（仍可在子智能体自己的会话中查看）；0 表示不限（会话结束后仍会清除）。",
+      "resultDeliveryLabel": "主动送达结果",
+      "resultDeliveryHint": "子代理完成后，结果自动推送给父代理：父代理空闲时立即送达，忙碌时在当前回合结束时送达。关闭后仅能通过 get_delegation_status 查询结果。",
       "save": "保存",
       "saving": "保存中…",
       "saved": "委托设置已保存",
