@@ -754,6 +754,8 @@
       "depthHint": "Plage autorisée : {min}–{max}. Limite la profondeur de récursion d’une chaîne de délégation (racine → enfant → petit-enfant …).",
       "completedCacheLabel": "Cache des résultats terminés (MB)",
       "completedCacheHint": "Cache en mémoire des résultats terminés des sous-agents, conservé uniquement tant que la session de délégation est en cours et libéré automatiquement à la fin de cette session. Au-delà de ce budget, les résultats les plus anciens sont supprimés de la mémoire en premier (toujours consultables dans la session du sous-agent) ; 0 = illimité (libéré quand même à la fin de la session).",
+      "resultDeliveryLabel": "Livrer les résultats de manière proactive",
+      "resultDeliveryHint": "Les résultats des sous-agents terminés sont transmis automatiquement à l'agent parent : immédiatement s'il est inactif, ou à la fin de son tour en cours s'il est occupé. Désactivé : les résultats attendent get_delegation_status.",
       "save": "Enregistrer",
       "saving": "Enregistrement…",
       "saved": "Paramètres de délégation enregistrés",

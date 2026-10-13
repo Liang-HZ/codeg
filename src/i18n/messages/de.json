@@ -754,6 +754,8 @@
       "depthHint": "Zulässiger Bereich: {min}–{max}. Begrenzt, wie tief eine Delegationskette (Root → Kind → Enkel …) rekursieren kann.",
       "completedCacheLabel": "Cache abgeschlossener Ergebnisse (MB)",
       "completedCacheHint": "In-Memory-Cache abgeschlossener Subagent-Ergebnisse, der nur gehalten wird, solange die Delegationssitzung läuft, und beim Ende dieser Sitzung automatisch freigegeben wird. Bei Überschreitung dieses Budgets werden die ältesten Ergebnisse zuerst aus dem Speicher verworfen (weiterhin in der eigenen Sitzung des Subagenten einsehbar); 0 = unbegrenzt (wird trotzdem beim Sitzungsende freigegeben).",
+      "resultDeliveryLabel": "Ergebnisse proaktiv zustellen",
+      "resultDeliveryHint": "Fertige Ergebnisse von Subagenten werden dem übergeordneten Agenten automatisch zugestellt — sofort im Leerlauf oder am Ende seines laufenden Turns, wenn er beschäftigt ist. Aus: Ergebnisse warten auf get_delegation_status.",
       "save": "Speichern",
       "saving": "Wird gespeichert…",
       "saved": "Delegationseinstellungen gespeichert",

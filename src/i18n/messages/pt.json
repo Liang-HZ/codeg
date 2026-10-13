@@ -754,6 +754,8 @@
       "depthHint": "Intervalo permitido: {min}–{max}. Limita a profundidade de recursão de uma cadeia de delegação (raiz → filho → neto …).",
       "completedCacheLabel": "Cache de resultados concluídos (MB)",
       "completedCacheHint": "Cache em memória dos resultados concluídos de subagentes, mantido apenas enquanto a sessão de delegação está em execução e liberado automaticamente quando essa sessão termina. Acima deste limite, os resultados mais antigos são descartados da memória primeiro (ainda visíveis na sessão do próprio subagente); 0 = ilimitado (ainda assim liberado ao terminar a sessão).",
+      "resultDeliveryLabel": "Entregar resultados proativamente",
+      "resultDeliveryHint": "Os resultados dos subagentes concluídos são enviados automaticamente ao agente pai — imediatamente quando ele está ocioso, ou no fim do turno atual quando está ocupado. Desligado: os resultados aguardam get_delegation_status.",
       "save": "Salvar",
       "saving": "Salvando…",
       "saved": "Configurações de delegação salvas",

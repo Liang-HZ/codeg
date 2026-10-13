@@ -59,6 +59,9 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use tokio::sync::{Mutex, Notify};
 
+use crate::acp::delegation::delivery::{
+    DelegationResultSink, NoopResultSink, ResultDeliveryMode, TerminalNotification,
+};
 use crate::acp::delegation::event_emitter::{DelegationEventEmitter, NoopEventEmitter};
 use crate::acp::delegation::live_reply::{ChildLiveReplyLookup, NoopChildLiveReplyLookup};
 use crate::acp::delegation::meta_writer::{
@@ -204,6 +207,10 @@ pub struct DelegationConfig {
     /// converted to bytes in `into_broker_config`. Pushed into the pending-calls
     /// bucket by `set_config` so `insert_completed` reads it lock-free.
     pub completed_cache_cap_bytes: usize,
+    /// How terminal delegation results reach the parent agent — pushed by the
+    /// result-delivery channel (default) or pull-only. Forwarded to the
+    /// [`DelegationResultSink`] by `set_config`.
+    pub result_delivery: ResultDeliveryMode,
 }
 
 impl Default for DelegationConfig {
@@ -213,6 +220,7 @@ impl Default for DelegationConfig {
             depth_limit: 1,
             agent_defaults: BTreeMap::new(),
             completed_cache_cap_bytes: DEFAULT_COMPLETED_CACHE_CAP_BYTES,
+            result_delivery: ResultDeliveryMode::default(),
         }
     }
 }
@@ -228,6 +236,11 @@ struct RunningTask {
     child_connection_id: String,
     child_conversation_id: i32,
     parent_connection_id: String,
+    /// The parent conversation the delegation was dispatched from. Carried so
+    /// the terminal result-delivery hook can file its notification turn even
+    /// after the parent's original connection is gone (the conversation — not
+    /// the connection — is the durable address).
+    parent_conversation_id: i32,
     parent_tool_use_id: String,
     /// Target agent — surfaced in status reports.
     agent_type: AgentType,
@@ -288,6 +301,10 @@ struct CompletedTask {
     error_code: Option<String>,
     message: Option<String>,
     duration_ms: u64,
+    /// Set when the result was handed to the parent through a PULL
+    /// (`get_delegation_status` / `cancel_delegation`). A consumed result is
+    /// never pushed by the result-delivery channel — the parent already has it.
+    consumed_at: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -730,6 +747,7 @@ fn build_completed(
         error_code,
         message,
         duration_ms,
+        consumed_at: None,
     }
 }
 
@@ -1422,6 +1440,12 @@ pub struct DelegationBroker {
     tool_calls: Arc<ToolCallTracker>,
     pre_canceled_handles: Arc<PreCanceledHandles>,
     config: Arc<Mutex<DelegationConfig>>,
+    /// Result-delivery ("push") side channel. Terminal tasks are announced here
+    /// after the running→completed migration; the sink owns the queue/watcher
+    /// and never blocks the broker's terminal path. Defaults to a no-op so
+    /// tests that don't exercise the push channel need no wiring; production
+    /// constructs the sink in `build_delegation_stack`.
+    result_sink: Arc<dyn DelegationResultSink>,
     /// Woken after every terminal `record_completed` so a `get_delegation_status`
     /// long-poll wakes the instant its task finishes instead of busy-polling.
     result_notify: Arc<Notify>,
@@ -1483,9 +1507,18 @@ impl DelegationBroker {
             tool_calls: Arc::new(ToolCallTracker::default()),
             pre_canceled_handles: Arc::new(PreCanceledHandles::default()),
             config: Arc::new(Mutex::new(DelegationConfig::default())),
+            result_sink: Arc::new(NoopResultSink),
             result_notify: Arc::new(Notify::new()),
             block_resurface: BLOCK_RESURFACE_INTERVAL,
         }
+    }
+
+    /// Replace the result-delivery sink (push channel). Builder-style, layered
+    /// onto `with_writers` by the production wiring; tests opt in with a
+    /// recording mock.
+    pub fn with_result_sink(mut self, result_sink: Arc<dyn DelegationResultSink>) -> Self {
+        self.result_sink = result_sink;
+        self
     }
 
     /// Replace the DB status fallback used by `get_delegation_status` /
@@ -2226,7 +2259,12 @@ impl DelegationBroker {
 
     pub async fn set_config(&self, cfg: DelegationConfig) {
         let cap_bytes = cfg.completed_cache_cap_bytes;
+        let result_delivery = cfg.result_delivery;
         *self.config.lock().await = cfg;
+        // Result-delivery mode lives with the sink (it owns the queue); the
+        // broker is just the settings carrier. Forwarded BEFORE the pending
+        // lock below so the two settings never interleave observably.
+        self.result_sink.set_mode(result_delivery).await;
         // Seed the byte cap into the pending-calls bucket so `insert_completed`
         // reads it lock-free (it already holds the pending lock). Acquired AFTER
         // the config guard above is dropped — sequential, never nested — so no
@@ -2735,6 +2773,7 @@ impl DelegationBroker {
                             child_connection_id: child_connection_id.clone(),
                             child_conversation_id,
                             parent_connection_id: req.parent_connection_id.clone(),
+                            parent_conversation_id: req.parent_conversation_id,
                             parent_tool_use_id: req.parent_tool_use_id.clone(),
                             agent_type: req.agent_type,
                             task_preview: task_preview.clone(),
@@ -2923,17 +2962,15 @@ impl DelegationBroker {
                     // Atomic running → completed so a concurrent status query
                     // never sees the task as neither running nor completed.
                     let duration_ms = task.started_at.elapsed().as_millis() as u64;
-                    inner.insert_completed(
-                        call_id,
-                        build_completed(
-                            &task.parent_connection_id,
-                            task.child_conversation_id,
-                            task.agent_type,
-                            duration_ms,
-                            &outcome,
-                        ),
+                    let completed = build_completed(
+                        &task.parent_connection_id,
+                        task.child_conversation_id,
+                        task.agent_type,
+                        duration_ms,
+                        &outcome,
                     );
-                    Some((task, duration_ms))
+                    inner.insert_completed(call_id, completed.clone());
+                    Some((task, duration_ms, completed))
                 }
                 None => {
                     // Buffer for the racing `start_delegation` to drain iff still
@@ -2944,7 +2981,7 @@ impl DelegationBroker {
                 }
             }
         };
-        if let Some((task, duration_ms)) = task {
+        if let Some((task, duration_ms, completed)) = task {
             self.finalize_delegation(
                 &task.parent_connection_id,
                 &task.parent_tool_use_id,
@@ -2958,6 +2995,24 @@ impl DelegationBroker {
             )
             .await;
             self.result_notify.notify_waiters();
+            // Push side channel: announce the terminal result. The sink only
+            // queues (and starts a flush watcher) — it never blocks this path.
+            // A pull racing us marks the task consumed and the sink stands
+            // down (see `delivery.rs`).
+            self.result_sink
+                .task_terminal(TerminalNotification {
+                    task_id: call_id.to_string(),
+                    parent_connection_id: task.parent_connection_id.clone(),
+                    parent_conversation_id: task.parent_conversation_id,
+                    child_conversation_id: task.child_conversation_id,
+                    agent_type: task.agent_type,
+                    status: completed.status,
+                    text: completed.text.clone(),
+                    error_code: completed.error_code.clone(),
+                    message: completed.message.clone(),
+                    duration_ms,
+                })
+                .await;
         }
     }
 
@@ -3436,13 +3491,37 @@ impl DelegationBroker {
             // One lock acquisition classifies every requested id. The async
             // resolution of running (live reply) / not-in-memory (DB) ids is
             // deferred to `assemble_reports`, OUTSIDE this lock.
-            let classes: Vec<StatusClass> = {
-                let inner = self.pending.inner.lock().await;
-                task_ids
+            //
+            // A terminal report is about to be handed to the parent — every
+            // `Settled` class is returned by this call — so the same critical
+            // section marks the result CONSUMED. That is what makes the
+            // pull-vs-push race have exactly one winner: the delivery sink's
+            // queue entry is dropped (or a late terminal announcement is
+            // suppressed) and the parent is never told twice.
+            let (classes, newly_consumed): (Vec<StatusClass>, Vec<String>) = {
+                let mut inner = self.pending.inner.lock().await;
+                let mut newly_consumed: Vec<String> = Vec::new();
+                let classes = task_ids
                     .iter()
-                    .map(|id| classify_locked(&inner, parent_connection_id, id))
-                    .collect()
+                    .map(|id| {
+                        if let Some(c) = inner.completed.get_mut(id) {
+                            if c.parent_connection_id == parent_connection_id
+                                && c.consumed_at.is_none()
+                            {
+                                c.consumed_at = Some(Instant::now());
+                                newly_consumed.push(id.clone());
+                            }
+                        }
+                        classify_locked(&inner, parent_connection_id, id)
+                    })
+                    .collect();
+                (classes, newly_consumed)
             };
+            for id in &newly_consumed {
+                self.result_sink
+                    .task_consumed(parent_connection_id, id)
+                    .await;
+            }
             let running_count = classes
                 .iter()
                 .filter(|c| matches!(c, StatusClass::Running { .. }))
@@ -3677,14 +3756,37 @@ impl DelegationBroker {
         parent_conversation_id: Option<i32>,
         task_id: &str,
     ) -> DelegationTaskReport {
+        // An already-completed task answers from the cache. That answer is a
+        // pull — mark it consumed so a queued push for the same result stands
+        // down. (The actual cancel below is a parent-initiated terminal, which
+        // never reaches the push channel at all.)
+        let mut consumed_now = false;
+        let early_report = {
+            let mut inner = self.pending.inner.lock().await;
+            if let Some(c) = inner.completed.get_mut(task_id) {
+                if c.parent_connection_id == parent_connection_id {
+                    if c.consumed_at.is_none() {
+                        c.consumed_at = Some(Instant::now());
+                        consumed_now = true;
+                    }
+                    Some(completed_report(task_id, c))
+                } else {
+                    Some(unknown_report(task_id))
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(report) = early_report {
+            if consumed_now {
+                self.result_sink
+                    .task_consumed(parent_connection_id, task_id)
+                    .await;
+            }
+            return report;
+        }
         let drained = {
             let mut inner = self.pending.inner.lock().await;
-            if let Some(c) = inner.completed.get(task_id) {
-                if c.parent_connection_id == parent_connection_id {
-                    return completed_report(task_id, c);
-                }
-                return unknown_report(task_id);
-            }
             match inner.running.get(task_id) {
                 Some(r) if r.parent_connection_id == parent_connection_id => {
                     drain_and_record_canceled(
@@ -4275,6 +4377,7 @@ impl DelegationBroker {
                             child_connection_id: child_connection_id.clone(),
                             child_conversation_id: ctx.child_conversation_id,
                             parent_connection_id: req.parent_connection_id.clone(),
+                            parent_conversation_id: req.parent_conversation_id,
                             parent_tool_use_id: parent_tool_use_id.clone(),
                             agent_type: ctx.agent_type,
                             task_preview: task_preview.clone(),
@@ -4770,6 +4873,242 @@ mod tests {
         assert_eq!(broker.pending_count().await, 0);
         // complete_call disconnects the child once.
         assert_eq!(mock.disconnects.lock().await.as_slice(), &["child-conn-1"]);
+    }
+
+    // -- Result delivery (push channel) ------------------------------------
+
+    use crate::acp::delegation::delivery::mock::MockResultSink;
+
+    async fn broker_with_result_sink(
+        mock: Arc<MockSpawner>,
+        sink: Arc<MockResultSink>,
+    ) -> DelegationBroker {
+        let broker = DelegationBroker::new(
+            mock as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        )
+        .with_result_sink(sink as Arc<dyn DelegationResultSink>);
+        enable_delegation(&broker).await;
+        broker
+    }
+
+    /// Drive one delegation to its Running ack, returning the broker + the
+    /// driver's task id so tests can complete it deterministically.
+    async fn start_and_get_call_id(broker: &DelegationBroker) -> String {
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move { broker.handle_request(request(1, "pt-1")).await })
+        };
+        let call_id = loop {
+            if let Some(id) = broker.peek_first_pending_call_id().await {
+                break id;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        driver.abort();
+        call_id
+    }
+
+    #[tokio::test]
+    async fn complete_call_announces_terminal_to_sink_once() {
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("child-conn-1".into())).await;
+        mock.queue_send(Ok(42)).await;
+        let sink = Arc::new(MockResultSink::new());
+        let broker = broker_with_result_sink(mock.clone(), sink.clone()).await;
+
+        let call_id = start_and_get_call_id(&broker).await;
+        broker
+            .complete_call(
+                &call_id,
+                DelegationOutcome::Ok(DelegationSuccess {
+                    text: "the answer".into(),
+                    child_conversation_id: 42,
+                    child_agent_type: AgentType::Codex,
+                    turn_count: 1,
+                    duration_ms: 5,
+                    token_usage: None,
+                }),
+            )
+            .await;
+
+        let terminals = sink.terminals().await;
+        assert_eq!(terminals.len(), 1);
+        let n = &terminals[0];
+        assert_eq!(n.task_id, call_id);
+        assert_eq!(n.parent_connection_id, "parent-conn");
+        assert_eq!(n.parent_conversation_id, 1);
+        assert_eq!(n.child_conversation_id, 42);
+        assert_eq!(n.status, TaskStatus::Completed);
+        assert_eq!(n.text.as_deref(), Some("the answer"));
+        assert!(n.error_code.is_none());
+
+        // A repeat terminal for the same call is a silent no-op — the result
+        // is announced exactly once.
+        broker
+            .complete_call(
+                &call_id,
+                DelegationOutcome::Ok(DelegationSuccess {
+                    text: "the answer".into(),
+                    child_conversation_id: 42,
+                    child_agent_type: AgentType::Codex,
+                    turn_count: 1,
+                    duration_ms: 5,
+                    token_usage: None,
+                }),
+            )
+            .await;
+        assert_eq!(sink.terminals().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_terminal_announces_error_fields() {
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("child-conn-1".into())).await;
+        mock.queue_send(Ok(42)).await;
+        let sink = Arc::new(MockResultSink::new());
+        let broker = broker_with_result_sink(mock.clone(), sink.clone()).await;
+
+        let call_id = start_and_get_call_id(&broker).await;
+        broker
+            .complete_call(
+                &call_id,
+                DelegationOutcome::Err {
+                    code: "child_auth_required".into(),
+                    message: "login expired".into(),
+                    child_conversation_id: Some(42),
+                },
+            )
+            .await;
+
+        let terminals = sink.terminals().await;
+        assert_eq!(terminals.len(), 1);
+        assert_eq!(terminals[0].status, TaskStatus::Failed);
+        assert_eq!(
+            terminals[0].error_code.as_deref(),
+            Some("child_auth_required")
+        );
+        assert_eq!(terminals[0].message.as_deref(), Some("login expired"));
+        assert!(terminals[0].text.is_none());
+    }
+
+    #[tokio::test]
+    async fn status_pull_consumes_result_and_tells_sink_once() {
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("child-conn-1".into())).await;
+        mock.queue_send(Ok(42)).await;
+        let sink = Arc::new(MockResultSink::new());
+        let broker = broker_with_result_sink(mock.clone(), sink.clone()).await;
+
+        let call_id = start_and_get_call_id(&broker).await;
+        broker
+            .complete_call(
+                &call_id,
+                DelegationOutcome::Ok(DelegationSuccess {
+                    text: "pulled".into(),
+                    child_conversation_id: 42,
+                    child_agent_type: AgentType::Codex,
+                    turn_count: 1,
+                    duration_ms: 5,
+                    token_usage: None,
+                }),
+            )
+            .await;
+
+        let report = broker
+            .get_task_status("parent-conn", Some(1), &call_id, StatusWait::Immediate)
+            .await;
+        assert_eq!(report.status, TaskStatus::Completed);
+
+        let consumed = sink.consumed().await;
+        assert_eq!(consumed, vec![("parent-conn".to_string(), call_id.clone())]);
+
+        // A second poll re-reads the same report but does not re-consume.
+        let report = broker
+            .get_task_status("parent-conn", Some(1), &call_id, StatusWait::Immediate)
+            .await;
+        assert_eq!(report.status, TaskStatus::Completed);
+        assert_eq!(sink.consumed().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn running_poll_does_not_consume() {
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("child-conn-1".into())).await;
+        mock.queue_send(Ok(42)).await;
+        let sink = Arc::new(MockResultSink::new());
+        let broker = broker_with_result_sink(mock.clone(), sink.clone()).await;
+
+        let call_id = start_and_get_call_id(&broker).await;
+        let report = broker
+            .get_task_status("parent-conn", Some(1), &call_id, StatusWait::Immediate)
+            .await;
+        assert_eq!(report.status, TaskStatus::Running);
+        assert!(sink.consumed().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancel_of_completed_task_consumes_result() {
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("child-conn-1".into())).await;
+        mock.queue_send(Ok(42)).await;
+        let sink = Arc::new(MockResultSink::new());
+        let broker = broker_with_result_sink(mock.clone(), sink.clone()).await;
+
+        let call_id = start_and_get_call_id(&broker).await;
+        broker
+            .complete_call(
+                &call_id,
+                DelegationOutcome::Ok(DelegationSuccess {
+                    text: "done".into(),
+                    child_conversation_id: 42,
+                    child_agent_type: AgentType::Codex,
+                    turn_count: 1,
+                    duration_ms: 5,
+                    token_usage: None,
+                }),
+            )
+            .await;
+
+        let report = broker
+            .cancel_task_by_id("parent-conn", Some(1), &call_id)
+            .await;
+        assert_eq!(report.status, TaskStatus::Completed);
+        assert_eq!(sink.consumed().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn parent_cancel_path_does_not_announce_terminal() {
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("child-conn-1".into())).await;
+        mock.queue_send(Ok(42)).await;
+        let sink = Arc::new(MockResultSink::new());
+        let broker = broker_with_result_sink(mock.clone(), sink.clone()).await;
+
+        let _call_id = start_and_get_call_id(&broker).await;
+        // Parent turn failed → cascade cancel. The parent already knows; the
+        // push channel must stay silent.
+        broker.cancel_by_parent_turn("parent-conn").await;
+        assert!(sink.terminals().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn set_config_forwards_delivery_mode_to_sink() {
+        let mock = Arc::new(MockSpawner::new());
+        let sink = Arc::new(MockResultSink::new());
+        let broker = broker_with_result_sink(mock, sink.clone()).await;
+
+        broker
+            .set_config(DelegationConfig {
+                result_delivery: ResultDeliveryMode::Off,
+                ..DelegationConfig::default()
+            })
+            .await;
+        assert_eq!(
+            sink.modes().await.last(),
+            Some(&ResultDeliveryMode::Off),
+            "set_config must forward the delivery mode to the sink"
+        );
     }
 
     /// `StatusWait::Infinite` (the explicit `wait_ms = 0` escape hatch) must
@@ -9232,6 +9571,7 @@ mod tests {
 
     fn completed_with_text(parent: &str, text_len: usize) -> CompletedTask {
         CompletedTask {
+            consumed_at: None,
             parent_connection_id: parent.to_string(),
             child_conversation_id: 1,
             agent_type: AgentType::ClaudeCode,

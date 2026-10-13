@@ -5216,6 +5216,12 @@ export interface DelegationSettings {
   /** Optional per-agent overrides applied when codeg-mcp spawns a subagent.
    * Keyed by `agent_type`. Missing entries mean "use agent defaults." */
   agent_defaults?: Partial<Record<AgentType, AgentDelegationDefaults>>
+  /** How terminal sub-agent results reach the parent agent: `"push"` wakes
+   * the parent with a notification turn when it is idle (or delivers at the
+   * end of its current turn when busy); `"off"` is pull-only via
+   * get_delegation_status. Absent in a legacy payload → the backend default
+   * (push). */
+  result_delivery?: "push" | "off"
 }
 
 export async function getDelegationSettings(): Promise<DelegationSettings> {
