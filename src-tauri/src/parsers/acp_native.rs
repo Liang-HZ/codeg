@@ -56,8 +56,13 @@ use crate::acp::types::PromptInputBlock;
 use crate::acp_transcript::{self, EntryKind, Transcript, TranscriptEntry};
 use crate::models::agent::AgentType;
 use crate::models::conversation::{ConversationDetail, ConversationSummary, SessionStats};
-use crate::models::message::{ContentBlock, ImageData, MessageTurn, TurnRole, TurnUsage};
-use crate::parsers::{user_turn_block, user_turn_block_from_wire, AgentParser, ParseError};
+use crate::models::message::{
+    AgentExecutionStats, AgentTimelineEntry, AgentToolCall, ContentBlock, ImageData, MessageTurn,
+    TurnRole, TurnUsage,
+};
+use crate::parsers::{
+    truncate_str, user_turn_block, user_turn_block_from_wire, AgentParser, ParseError,
+};
 
 pub struct AcpNativeParser {
     agent_type: AgentType,
@@ -444,6 +449,9 @@ pub fn project_turns(entries: &[TranscriptEntry]) -> Vec<MessageTurn> {
     // under construction started at the steer, not at the turn's prompt.
     let mut steered = false;
     let mut seq = 0usize;
+    // Native sub-agents folded out of parented frames (see [`AgentSide`]),
+    // keyed by the launching Agent tool call's id.
+    let mut agent_sides: HashMap<String, AgentSide> = HashMap::new();
 
     for entry in entries {
         match entry.k {
@@ -537,11 +545,13 @@ pub fn project_turns(entries: &[TranscriptEntry]) -> Vec<MessageTurn> {
                     &mut prompt_just_recorded,
                     &mut turn_start_hint,
                     &mut user_prose_open,
+                    &mut agent_sides,
                 );
             }
         }
     }
     flush(&mut pending, &mut turns, &mut seq);
+    attach_agent_sides(&mut turns, &mut agent_sides);
     turns
 }
 
@@ -642,6 +652,7 @@ fn apply_update(
     prompt_just_recorded: &mut bool,
     turn_start_hint: &mut Option<u64>,
     user_prose_open: &mut bool,
+    agent_sides: &mut HashMap<String, AgentSide>,
 ) {
     // Opening a turn consumes the prompt's timestamp, so the turn's span covers
     // time-to-first-token; without a recorded prompt (replay) it starts here.
@@ -704,6 +715,14 @@ fn apply_update(
             *user_prose_open = is_text;
         }
         SessionUpdate::AgentMessageChunk(chunk) => {
+            // A forwarded sub-agent's prose rides the parent session with a
+            // parent link — it belongs to the Agent capsule, never the main
+            // thread (see [`AgentSide`]).
+            if let Some(parent) = parent_link_from_meta(chunk.meta.as_ref()) {
+                let text = content_block_text(&chunk.content);
+                push_agent_prose(agent_sides, &parent, "text", &text, at_ms);
+                return;
+            }
             *prompt_just_recorded = false;
             let p = open_turn!();
             p.last_at_ms = at_ms;
@@ -723,6 +742,12 @@ fn apply_update(
             }
         }
         SessionUpdate::AgentThoughtChunk(chunk) => {
+            // Same parented routing as message chunks above.
+            if let Some(parent) = parent_link_from_meta(chunk.meta.as_ref()) {
+                let text = content_block_text(&chunk.content);
+                push_agent_prose(agent_sides, &parent, "thinking", &text, at_ms);
+                return;
+            }
             *prompt_just_recorded = false;
             let p = open_turn!();
             p.last_at_ms = at_ms;
@@ -730,6 +755,25 @@ fn apply_update(
             p.push_text(&text, true);
         }
         SessionUpdate::ToolCall(tc) => {
+            // Parented child frame → the Agent capsule's side state, no
+            // standalone card (see [`AgentSide`]).
+            if let Some(parent) = parent_link_from_meta(tc.meta.as_ref()) {
+                let id = tc.tool_call_id.to_string();
+                let status = format!("{:?}", tc.status).to_lowercase();
+                upsert_agent_child_tool(
+                    agent_sides,
+                    &parent,
+                    &id,
+                    Some(tc.title.as_str()),
+                    tc.meta.as_ref(),
+                    tc.raw_input.as_ref(),
+                    &tc.content,
+                    tc.raw_output.as_ref(),
+                    Some(status.as_str()),
+                    at_ms,
+                );
+                return;
+            }
             *prompt_just_recorded = false;
             let p = open_turn!();
             p.last_at_ms = at_ms;
@@ -747,6 +791,25 @@ fn apply_update(
             );
         }
         SessionUpdate::ToolCallUpdate(tcu) => {
+            // Same parented routing as `ToolCall` above — a child's update
+            // never reaches the closed-turn fallback below.
+            if let Some(parent) = parent_link_from_meta(tcu.meta.as_ref()) {
+                let id = tcu.tool_call_id.to_string();
+                let status = tcu.fields.status.map(|s| format!("{s:?}").to_lowercase());
+                upsert_agent_child_tool(
+                    agent_sides,
+                    &parent,
+                    &id,
+                    tcu.fields.title.as_deref(),
+                    tcu.meta.as_ref(),
+                    tcu.fields.raw_input.as_ref(),
+                    tcu.fields.content.as_deref().unwrap_or(&[]),
+                    tcu.fields.raw_output.as_ref(),
+                    status.as_deref(),
+                    at_ms,
+                );
+                return;
+            }
             let id = tcu.tool_call_id.to_string();
             let status = tcu.fields.status.map(|s| format!("{s:?}").to_lowercase());
             // An update for a call the open part of the turn did not start can
@@ -868,6 +931,252 @@ fn closed_tool_card(
         }
     }
     (!uses.is_empty()).then_some((uses, results))
+}
+
+/// The sub-agent fold's per-entry text cap, mirroring `claude.rs`'s
+/// `TIMELINE_ENTRY_MAX_CHARS`: the guard exists so one pathologically large
+/// block cannot balloon the stats payload attached to the Agent card.
+const AGENT_TIMELINE_TEXT_MAX: usize = 16_384;
+
+/// Input/output preview caps — the same 500 the live store applies to a
+/// running card's `agent_stats.tool_calls`, so live and reloaded views match.
+const AGENT_TOOL_PREVIEW_MAX: usize = 500;
+
+/// One native sub-agent's running aggregation, folded out of the parented
+/// `session/update` frames that ride the PARENT session id.
+///
+/// Three producers forward a sub-agent's frames this way today —
+/// claude-agent-acp ≥0.63 (`_meta.claudeCode.parentToolUseId`), the patched
+/// qodercli (`_meta.qoder.parentToolUseId`) and the ZCode bridge
+/// (`_meta.zcode.parentToolUseId` — the custom-agent case this parser
+/// actually serves) — plus CodeBuddy's flat
+/// `_meta["codebuddy.ai/parentToolCallId"]`. Each frame names the launching
+/// Agent tool call; at the end of [`project_turns`] the aggregate lands on
+/// that call's `ToolResult` as `agent_stats` — the same shape the built-in
+/// parsers attach from their own sidecar transcripts — so a settled card
+/// renders the identical capsule (nested tool cards + interleaved timeline)
+/// the live stream showed.
+#[derive(Default)]
+struct AgentSide {
+    tool_calls: Vec<AgentToolCall>,
+    /// Sub-agent tool-call id → its ordinal in `tool_calls`.
+    call_index: HashMap<String, usize>,
+    timeline: Vec<AgentTimelineEntry>,
+    /// The kind of prose (`"thinking"` / `"text"`) this agent's transcript is
+    /// currently in the middle of; `None` after one of its own tool calls, so
+    /// a following chunk starts a fresh entry — the live store's
+    /// `transcriptRun` rule, reproduced.
+    run: Option<&'static str>,
+    first_at_ms: u64,
+    last_at_ms: u64,
+}
+
+/// The update-level parent link of a forwarded sub-agent frame, read from the
+/// `_meta` shapes the known producers use (see [`AgentSide`]).
+///
+/// The live path scopes extraction per agent type so no agent's meta can
+/// alias into another agent's routing. The parser is reading our OWN recorded
+/// transcript for ONE agent, where routing any of these links into the
+/// capsule is the intended reading — namespace-generous on purpose. (Custom
+/// agents get no quirk handling elsewhere; this is not a quirk, it is the
+/// one contract all three producers of parented frames share.)
+fn parent_link_from_meta(
+    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Option<String> {
+    let meta = meta?;
+    let non_empty = |s: Option<&str>| s.filter(|s| !s.is_empty()).map(str::to_owned);
+    if let Some(id) = non_empty(
+        meta.get("codebuddy.ai/parentToolCallId")
+            .and_then(serde_json::Value::as_str),
+    ) {
+        return Some(id);
+    }
+    for ns in ["claudeCode", "qoder", "zcode"] {
+        if let Some(id) = non_empty(
+            meta.get(ns)
+                .and_then(|ns| ns.get("parentToolUseId"))
+                .and_then(serde_json::Value::as_str),
+        ) {
+            return Some(id);
+        }
+    }
+    None
+}
+
+/// The tool name a parented child frame carries: the ZCode bridge stamps the
+/// raw name under `_meta.zcode.toolName`; other producers ship only the
+/// display title, whose first token is the conventional tool word
+/// ("Read foo.mjs" → "Read"). Falls back to `"tool"` like the live store's
+/// generic card.
+fn agent_child_tool_name(
+    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+    title: Option<&str>,
+) -> String {
+    meta.and_then(|m| m.get("zcode"))
+        .and_then(|z| z.get("toolName"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            title
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.split_whitespace().next().unwrap_or(s).to_string())
+        })
+        .unwrap_or_else(|| "tool".to_string())
+}
+
+/// Fold one parented prose chunk into its sub-agent's timeline, coalescing a
+/// trailing same-kind entry (the live store's split/merge rule).
+fn push_agent_prose(
+    sides: &mut HashMap<String, AgentSide>,
+    parent: &str,
+    kind: &'static str,
+    text: &str,
+    at_ms: u64,
+) {
+    if text.is_empty() {
+        return;
+    }
+    let side = sides.entry(parent.to_string()).or_default();
+    if side.first_at_ms == 0 {
+        side.first_at_ms = at_ms;
+    }
+    side.last_at_ms = at_ms;
+    if side.run == Some(kind) {
+        if let Some(last) = side.timeline.last_mut() {
+            if last.entry_type == kind {
+                last.text.get_or_insert_with(String::new).push_str(text);
+                return;
+            }
+        }
+    }
+    side.timeline.push(AgentTimelineEntry {
+        entry_type: kind.to_string(),
+        text: Some(text.to_string()),
+        child_index: None,
+    });
+    side.run = Some(kind);
+}
+
+/// Insert or patch one parented sub-agent tool call in its agent's side
+/// state. Mirrors [`upsert_tool_call`]'s merge semantics (an opening frame
+/// announces, later frames patch status/output) without touching the turn's
+/// main blocks — a child call never gets a standalone card.
+#[allow(clippy::too_many_arguments)]
+fn upsert_agent_child_tool(
+    sides: &mut HashMap<String, AgentSide>,
+    parent: &str,
+    call_id: &str,
+    title: Option<&str>,
+    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+    raw_input: Option<&serde_json::Value>,
+    content: &[ToolCallContent],
+    raw_output: Option<&serde_json::Value>,
+    status: Option<&str>,
+    at_ms: u64,
+) {
+    if call_id.is_empty() {
+        return;
+    }
+    let output = serialize_tool_call_content(content, true)
+        .or_else(|| json_value_to_text(&raw_output.cloned()))
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| truncate_str(&s, AGENT_TOOL_PREVIEW_MAX));
+    let input = json_value_to_text(&raw_input.cloned())
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| truncate_str(&s, AGENT_TOOL_PREVIEW_MAX));
+    let side = sides.entry(parent.to_string()).or_default();
+    if side.first_at_ms == 0 {
+        side.first_at_ms = at_ms;
+    }
+    side.last_at_ms = at_ms;
+    match side.call_index.get(call_id).copied() {
+        Some(idx) => {
+            let call = &mut side.tool_calls[idx];
+            if call.tool_name == "tool" {
+                call.tool_name = agent_child_tool_name(meta, title);
+            }
+            if call.input_preview.is_none() {
+                call.input_preview = input;
+            }
+            if output.is_some() {
+                call.output_preview = output;
+            }
+            if status == Some("failed") {
+                call.is_error = true;
+            }
+        }
+        None => {
+            let idx = side.tool_calls.len();
+            side.call_index.insert(call_id.to_string(), idx);
+            side.tool_calls.push(AgentToolCall {
+                tool_name: agent_child_tool_name(meta, title),
+                input_preview: input,
+                output_preview: output,
+                is_error: status == Some("failed"),
+            });
+            side.timeline.push(AgentTimelineEntry {
+                entry_type: "tool_call".to_string(),
+                text: None,
+                child_index: Some(idx),
+            });
+            side.run = None;
+        }
+    }
+}
+
+/// Attach each folded sub-agent's stats to its launching Agent call's
+/// `ToolResult`. An agent whose launching call never got a result block (the
+/// turn died mid-flight) stays unattached — matching the built-in parsers'
+/// behavior when a sidecar transcript has no anchor.
+fn attach_agent_sides(turns: &mut [MessageTurn], sides: &mut HashMap<String, AgentSide>) {
+    for (agent_id, side) in sides.iter_mut() {
+        if side.tool_calls.is_empty() && side.timeline.is_empty() {
+            continue;
+        }
+        for entry in side.timeline.iter_mut() {
+            if let Some(text) = entry.text.as_mut() {
+                if text.chars().count() > AGENT_TIMELINE_TEXT_MAX {
+                    *text = truncate_str(text, AGENT_TIMELINE_TEXT_MAX);
+                }
+            }
+        }
+        let stats = AgentExecutionStats {
+            total_duration_ms: side
+                .last_at_ms
+                .checked_sub(side.first_at_ms)
+                .filter(|d| *d > 0),
+            total_tool_use_count: (!side.tool_calls.is_empty())
+                .then_some(side.tool_calls.len() as u32),
+            tool_calls: std::mem::take(&mut side.tool_calls),
+            timeline: std::mem::take(&mut side.timeline),
+            ..Default::default()
+        };
+        let mut attached = false;
+        for turn in turns.iter_mut() {
+            for block in turn.blocks.iter_mut() {
+                if let ContentBlock::ToolResult {
+                    tool_use_id,
+                    agent_stats,
+                    ..
+                } = block
+                {
+                    if tool_use_id.as_deref() == Some(agent_id.as_str()) {
+                        if agent_stats.is_none() {
+                            *agent_stats = Some(stats.clone());
+                        }
+                        attached = true;
+                        break;
+                    }
+                }
+            }
+            if attached {
+                break;
+            }
+        }
+    }
 }
 
 /// Insert or patch one tool call's `ToolUse` / `ToolResult` pair.
@@ -1514,6 +1823,181 @@ mod tests {
             }
             other => panic!("expected tool result, got {other:?}"),
         }
+    }
+
+    /// LOCAL, 2026-10-14: the ZCode bridge forwards a native sub-agent's
+    /// thinking/text/tool frames on the PARENT session id under
+    /// `_meta.zcode.parentToolUseId`. History must fold them into the
+    /// launching Agent card's `agent_stats` — never onto the main thread —
+    /// so a settled card renders the same capsule the live stream showed.
+    #[test]
+    fn parented_subagent_frames_fold_into_the_agent_card_stats() {
+        let zmeta = |parent: &str| {
+            serde_json::json!({
+                "zcode": {"parentToolUseId": parent, "childSessionId": "sess_sub"}
+            })
+        };
+        let entries = vec![
+            prompt(1, "do it"),
+            update(
+                2,
+                serde_json::json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "zc-call_p",
+                    "title": "Agent 实施修复",
+                    "kind": "think",
+                    "status": "pending",
+                    "rawInput": {"description": "实施修复", "prompt": "…", "subagent_type": "general-purpose"}
+                }),
+            ),
+            update(
+                3,
+                serde_json::json!({
+                    "sessionUpdate": "agent_thought_chunk",
+                    "content": {"type": "text", "text": "先读文件。"},
+                    "_meta": zmeta("zc-call_p")
+                }),
+            ),
+            update(
+                4,
+                serde_json::json!({
+                    "sessionUpdate": "agent_thought_chunk",
+                    "content": {"type": "text", "text": "再列目录。"},
+                    "_meta": zmeta("zc-call_p")
+                }),
+            ),
+            update(
+                5,
+                serde_json::json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "zc-call_c1",
+                    "title": "Read foo.mjs",
+                    "kind": "read",
+                    "status": "pending",
+                    "rawInput": {"file_path": "foo.mjs"},
+                    "_meta": {"zcode": {"parentToolUseId": "zc-call_p", "toolName": "Read"}}
+                }),
+            ),
+            update(
+                6,
+                serde_json::json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "zc-call_c1",
+                    "status": "completed",
+                    "_meta": zmeta("zc-call_p"),
+                    "content": [
+                        {"type": "content", "content": {"type": "text", "text": "file body"}}
+                    ]
+                }),
+            ),
+            update(
+                7,
+                serde_json::json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "读完了。"},
+                    "_meta": zmeta("zc-call_p")
+                }),
+            ),
+            update(
+                8,
+                serde_json::json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "zc-call_p",
+                    "status": "completed",
+                    "content": [
+                        {"type": "content", "content": {"type": "text", "text": "任务完成。报告…"}}
+                    ]
+                }),
+            ),
+        ];
+        let turns = project_turns(&entries);
+        let blocks = &turns[1].blocks;
+        // No standalone card for the child, no parented prose on the main thread.
+        assert!(!blocks.iter().any(|b| matches!(
+            b,
+            ContentBlock::ToolUse { tool_use_id: Some(id), .. } if id == "zc-call_c1"
+        )));
+        assert!(!blocks.iter().any(|b| matches!(
+            b,
+            ContentBlock::Text { text } if text.contains("先读文件") || text.contains("读完了")
+        )));
+        // The Agent card keeps its own result…
+        assert!(blocks.iter().any(|b| matches!(
+            b,
+            ContentBlock::ToolResult { tool_use_id: Some(id), output_preview: Some(out), .. }
+                if id == "zc-call_p" && out.contains("任务完成")
+        )));
+        // …carrying the folded stats.
+        let stats = blocks
+            .iter()
+            .find_map(|b| match b {
+                ContentBlock::ToolResult {
+                    tool_use_id: Some(id),
+                    agent_stats,
+                    ..
+                } if id == "zc-call_p" => agent_stats.clone(),
+                _ => None,
+            })
+            .expect("agent_stats attached to the Agent card");
+        assert_eq!(
+            stats
+                .tool_calls
+                .iter()
+                .map(|c| (c.tool_name.as_str(), c.is_error))
+                .collect::<Vec<_>>(),
+            vec![("Read", false)]
+        );
+        assert!(stats.tool_calls[0]
+            .input_preview
+            .as_deref()
+            .unwrap()
+            .contains("foo.mjs"));
+        assert_eq!(stats.tool_calls[0].output_preview.as_deref(), Some("file body"));
+        // Interleaved in arrival order, the two thinking chunks coalesced.
+        assert_eq!(
+            stats
+                .timeline
+                .iter()
+                .map(|e| e.entry_type.as_str())
+                .collect::<Vec<_>>(),
+            vec!["thinking", "tool_call", "text"]
+        );
+        assert_eq!(stats.timeline[0].text.as_deref(), Some("先读文件。再列目录。"));
+        assert_eq!(stats.timeline[1].child_index, Some(0));
+        // Last parented frame t=7 − first t=3.
+        assert_eq!(stats.total_duration_ms, Some(4));
+        assert_eq!(stats.total_tool_use_count, Some(1));
+    }
+
+    #[test]
+    fn parent_link_reads_the_known_namespaces_and_empty_is_none() {
+        let link = |v: serde_json::Value| parent_link_from_meta(v.as_object());
+        assert_eq!(
+            link(serde_json::json!({"claudeCode": {"parentToolUseId": "a"}})),
+            Some("a".to_string())
+        );
+        assert_eq!(
+            link(serde_json::json!({"qoder": {"parentToolUseId": "b"}})),
+            Some("b".to_string())
+        );
+        assert_eq!(
+            link(serde_json::json!({"zcode": {"parentToolUseId": "c"}})),
+            Some("c".to_string())
+        );
+        assert_eq!(
+            link(serde_json::json!({"codebuddy.ai/parentToolCallId": "d"})),
+            Some("d".to_string())
+        );
+        assert_eq!(
+            link(serde_json::json!({"zcode": {"parentToolUseId": ""}})),
+            None
+        );
+        assert_eq!(link(serde_json::json!({"zcode": {}})), None);
+        assert_eq!(
+            link(serde_json::json!({"claudeCode": {"parentToolUseId": 7}})),
+            None
+        );
+        assert_eq!(parent_link_from_meta(None), None);
     }
 
     fn turn_end(t: u64) -> TranscriptEntry {
