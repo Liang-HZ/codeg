@@ -17773,7 +17773,8 @@ fn codebuddy_meta_marks_background(
 }
 
 /// True when a CodeBuddy thought/message `ContentChunk`'s own `_meta` marks the
-/// chunk as sub-agent output (`codebuddy.ai/isSubagent`). A precision
+/// chunk as sub-agent output (`codebuddy.ai/isSubagent`, or an Agent Teams
+/// `codebuddy.ai/memberEvent` tag). A precision
 /// supplement to the open-sub-agent window, never relied on alone: chunks the
 /// wire LINKED to their Agent call (`codebuddy.ai/parentToolCallId`, measured
 /// populated on 2.164.0) are routed by `subagent_chunk_parent_tool_use_id`
@@ -17785,9 +17786,29 @@ fn codebuddy_chunk_marks_subagent(
     if agent_type != AgentType::CodeBuddy {
         return false;
     }
-    meta.and_then(|m| m.get("codebuddy.ai/isSubagent"))
-        .and_then(|v| v.as_bool())
-        == Some(true)
+    let Some(meta) = meta else {
+        return false;
+    };
+    if meta.get("codebuddy.ai/isSubagent").and_then(|v| v.as_bool()) == Some(true) {
+        return true;
+    }
+    // Agent Teams (CLI 2.164.0): an in-process team member's own live stream —
+    // its deltas AND the committed record echoed verbatim after them — is
+    // tagged `codebuddy.ai/memberEvent = <member name>` by `AcpTeamBridge`,
+    // with NO parent link. The CLI documents the client contract for it
+    // ("客户端收到带 memberEvent 标记的事件后，应将其路由到对应成员的对话时间线，
+    // 而非主对话区" — docs/cn/cli/acp.md, 成员流式消息) and codeg has no member
+    // timeline: the same content already reaches us parented through the
+    // sub-agent bridge, filling the member's Agent capsule. Without this arm
+    // the unlinked team-bridge copy lands in the MAIN thread, where it both
+    // duplicates the member's prose (deltas + record echo) and chops the main
+    // agent's own text at every interleaved member chunk (2026-10-14). A
+    // member-tagged chunk that DOES carry a parent link stays routed — the
+    // link wins, via `should_suppress_subagent_chunk`'s
+    // `subagent_chunk_parent_tool_use_id` early return.
+    meta.get("codebuddy.ai/memberEvent")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.is_empty())
 }
 
 /// Whether a live thought/message chunk should be dropped from the top-level
@@ -17807,7 +17828,10 @@ fn codebuddy_chunk_marks_subagent(
 /// the sub-agent's chunks, never main-agent output. BACKGROUND sub-agents (which
 /// run concurrently and could interleave main-agent output) are deliberately
 /// excluded from the window by `track_subagent_window`, so `window_open` can
-/// never cause a main-agent chunk to be dropped. Gated on CodeBuddy; every other
+/// never cause a main-agent chunk to be dropped. An Agent Teams member is such
+/// a background worker: it never opens the window, and its unlinked
+/// `codebuddy.ai/memberEvent` copy is caught by the meta arm instead (see
+/// `codebuddy_chunk_marks_subagent`). Gated on CodeBuddy; every other
 /// agent always emits.
 fn should_suppress_subagent_chunk(
     agent_type: AgentType,
@@ -37093,6 +37117,61 @@ mod tests {
         }
         // Other agents never suppress, even inside a (spurious) open window.
         assert!(!should_suppress_subagent_chunk(AgentType::OpenCode, true, None));
+    }
+
+    /// Agent Teams (CLI 2.164.0, 2026-10-14): an in-process member's stream
+    /// reaches the client TWICE — once parented through the sub-agent bridge
+    /// (the Agent capsule's copy) and once tagged `codebuddy.ai/memberEvent`
+    /// with no parent link by `AcpTeamBridge`. The second copy also re-sends
+    /// each committed message record verbatim (`codebuddy.ai/memberHistoryItemId`
+    /// rides it). codeg has no member timeline, so the unlinked copy must not
+    /// enter the main conversation — it duplicated the member's prose and
+    /// chopped the main agent's own text at every interleaved member chunk.
+    #[test]
+    fn member_event_chunks_are_suppressed_unless_linked() {
+        // The unlinked member stream (and its record echo) → suppressed, even
+        // with the window closed (a member never opens it — it is a background
+        // worker, deliberately excluded from the window).
+        let member = serde_json::json!({ "codebuddy.ai/memberEvent": "impl-x" });
+        assert!(should_suppress_subagent_chunk(
+            AgentType::CodeBuddy,
+            false,
+            member.as_object()
+        ));
+        // Same for a custom CodeBuddy variant (the family gate).
+        assert!(should_suppress_subagent_chunk(
+            AgentType::Custom("codebuddy-intl"),
+            false,
+            member.as_object()
+        ));
+        // A member chunk that ALSO carries a parent link stays routed — the
+        // link wins, exactly like the other markers.
+        let linked = serde_json::json!({
+            "codebuddy.ai/memberEvent": "impl-x",
+            "codebuddy.ai/parentToolCallId": "call_agent",
+        });
+        assert!(!should_suppress_subagent_chunk(
+            AgentType::CodeBuddy,
+            false,
+            linked.as_object()
+        ));
+        assert_eq!(
+            subagent_chunk_parent_tool_use_id(AgentType::CodeBuddy, linked.as_object()),
+            Some("call_agent".to_string())
+        );
+        // Scoped to the family: another agent's identical meta cannot alias in.
+        assert!(!should_suppress_subagent_chunk(
+            AgentType::Qoder,
+            false,
+            member.as_object()
+        ));
+        // Main-thread chunks never carry the key → still emitted.
+        let main = serde_json::json!({ "codebuddy.ai/messageId": "m1" });
+        assert!(!should_suppress_subagent_chunk(
+            AgentType::CodeBuddy,
+            false,
+            main.as_object()
+        ));
     }
 
     #[test]
