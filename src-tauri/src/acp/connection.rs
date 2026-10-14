@@ -13788,6 +13788,18 @@ fn is_codebuddy_family(agent_type: AgentType) -> bool {
     }
 }
 
+/// The ZCode bridge's custom-agent ids (LOCAL, 2026-10-14). The bridge
+/// (`~/agentrelay/zcode-acp`) forwards a native sub-agent's chunks on the
+/// PARENT session with `_meta.zcode.parentToolUseId`; the user registers it
+/// as a custom ACP agent (`custom:zcode`). A `zcode-*` clone keeps working —
+/// same scoping idiom as the CodeBuddy family above.
+fn is_zcode_family(agent_type: AgentType) -> bool {
+    match agent_type {
+        AgentType::Custom(id) => id == "zcode" || id.starts_with("zcode-"),
+        _ => false,
+    }
+}
+
 /// Mirrors `parsers/opencode.rs:425-429` (and `parsers/codebuddy.rs`'s
 /// `subagent_type → "Agent"` rewrite) so streaming and reload-from-DB render the
 /// same Agent card. The SQLite-side condition is
@@ -15049,6 +15061,9 @@ fn should_suppress_subagent_chunk(
 /// * Qoder — `_meta.qoder.parentToolUseId`, emitted by a locally patched
 ///   qodercli (see `~/agentrelay/qoder-attribution-patch`). Stock 1.1.65 /
 ///   1.1.67 builds forward subagent chunks with no attribution at all.
+/// * ZCode (LOCAL, 2026-10-14) — `_meta.zcode.parentToolUseId`, emitted by
+///   the ZCode bridge (`~/agentrelay/zcode-acp`) for a native sub-agent's
+///   chunks, which it forwards on the PARENT session id (claude-acp-shaped).
 /// * CodeBuddy family — the FLAT `_meta["codebuddy.ai/parentToolCallId"]`,
 ///   present on every sub-agent thought/message chunk of the stock 2.164.0
 ///   CLI (verified on real streams; main-thread chunks never carry it).
@@ -15075,6 +15090,11 @@ fn subagent_chunk_parent_tool_use_id(
         // A locally patched qodercli (see ~/agentrelay/qoder-attribution-patch)
         // emits this on sidechain chunks and tools; stock builds carry none.
         AgentType::Qoder => "qoder",
+        // The ZCode bridge forwards a native sub-agent's chunks on the parent
+        // session with this namespace (LOCAL, 2026-10-14; see
+        // `is_zcode_family`). Scoped to the configured custom agent so no
+        // other agent's meta can alias into parented routing.
+        _ if is_zcode_family(agent_type) => "zcode",
         _ => return None,
     };
     meta?
@@ -30846,6 +30866,53 @@ mod tests {
             None
         );
         assert_eq!(subagent_chunk_parent_tool_use_id(AgentType::CodeBuddy, None), None);
+    }
+
+    #[test]
+    fn zcode_chunk_parent_reads_the_namespace_only_for_the_zcode_family() {
+        // LOCAL, 2026-10-14: the ZCode bridge (~/agentrelay/zcode-acp)
+        // forwards a native sub-agent's chunks on the PARENT session with
+        // this namespace. The user's custom agent id is "zcode".
+        let valid = serde_json::json!({
+            "zcode": { "parentToolUseId": "zc-call_p", "childSessionId": "sess_sub" }
+        });
+        for agent in [
+            AgentType::Custom("zcode"),
+            AgentType::Custom("zcode-bridge"),
+        ] {
+            assert_eq!(
+                subagent_chunk_parent_tool_use_id(agent, valid.as_object()),
+                Some("zc-call_p".to_string())
+            );
+        }
+        // The same namespace on any other agent must not alias into routing.
+        assert_eq!(
+            subagent_chunk_parent_tool_use_id(AgentType::ClaudeCode, valid.as_object()),
+            None
+        );
+        assert_eq!(
+            subagent_chunk_parent_tool_use_id(AgentType::Qoder, valid.as_object()),
+            None
+        );
+        assert_eq!(
+            subagent_chunk_parent_tool_use_id(AgentType::CodeBuddy, valid.as_object()),
+            None
+        );
+        // Empty string / absent key / absent meta → None.
+        let empty = serde_json::json!({ "zcode": { "parentToolUseId": "" } });
+        assert_eq!(
+            subagent_chunk_parent_tool_use_id(AgentType::Custom("zcode"), empty.as_object()),
+            None
+        );
+        let no_key = serde_json::json!({ "zcode": { "childSessionId": "sess_sub" } });
+        assert_eq!(
+            subagent_chunk_parent_tool_use_id(AgentType::Custom("zcode"), no_key.as_object()),
+            None
+        );
+        assert_eq!(
+            subagent_chunk_parent_tool_use_id(AgentType::Custom("zcode"), None),
+            None
+        );
     }
 
     #[test]
