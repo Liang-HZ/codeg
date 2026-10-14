@@ -1194,9 +1194,10 @@ export function buildStreamingTurnsFromLiveMessage(
         // Only capture children while the agent is still running
         positionalAgentId = isFinal ? null : block.info.tool_call_id
       } else {
-        // Extract the parent tool-call id from ACP meta. Claude Code, CodeBuddy
-        // and OpenCode all link a native sub-agent's child tool calls to the
-        // parent Agent tool call this way — just under different keys:
+        // Extract the parent tool-call id from ACP meta. Claude Code, CodeBuddy,
+        // OpenCode, Qoder and the ZCode bridge all link a native sub-agent's
+        // child tool calls to the parent Agent tool call this way — just
+        // under different keys:
         //   - Claude Code: nested `meta.claudeCode.parentToolUseId`
         //   - CodeBuddy:   flat  `meta["codebuddy.ai/parentToolCallId"]`
         //   - OpenCode 2:  flat  `meta["codeg.parentToolCallId"]`, stamped by
@@ -1204,6 +1205,9 @@ export function buildStreamingTurnsFromLiveMessage(
         //     sub-agent's calls only with the child SESSION they ran in
         //   - Qoder:       nested `meta.qoder.parentToolUseId` (emitted by a
         //                  locally patched qodercli; stock builds send none)
+        //   - ZCode:       nested `meta.zcode.parentToolUseId` (emitted by the
+        //                  local zcode-acp bridge for its native subagents;
+        //                  stock ZCode has no ACP bridge at all)
         // Reading them makes those sub-agents nest precisely (like Claude
         // Code) instead of falling back to the positional heuristic, which the
         // sub-agent's interleaved thinking blocks break. Guard each access level
@@ -1234,6 +1238,13 @@ export function buildStreamingTurnsFromLiveMessage(
             const qd = (meta as Record<string, unknown>).qoder
             if (qd && typeof qd === "object" && "parentToolUseId" in qd) {
               const pid = (qd as Record<string, unknown>).parentToolUseId
+              if (typeof pid === "string") parentId = pid
+            }
+          }
+          if (!parentId) {
+            const zc = (meta as Record<string, unknown>).zcode
+            if (zc && typeof zc === "object" && "parentToolUseId" in zc) {
+              const pid = (zc as Record<string, unknown>).parentToolUseId
               if (typeof pid === "string") parentId = pid
             }
           }
