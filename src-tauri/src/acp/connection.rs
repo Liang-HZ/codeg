@@ -15044,11 +15044,15 @@ fn codebuddy_chunk_marks_subagent(
 /// the sub-agent's chunks, never main-agent output. BACKGROUND sub-agents (which
 /// run concurrently and could interleave main-agent output) are deliberately
 /// excluded from the window by `track_subagent_window`, so `window_open` can
-/// never cause a main-agent chunk to be dropped. An Agent Teams member is such
-/// a background worker: it never opens the window, and its unlinked
-/// `codebuddy.ai/memberEvent` copy is caught by the meta arm instead (see
-/// `codebuddy_chunk_marks_subagent`). Gated on the CodeBuddy family; every
-/// other agent always emits.
+/// never cause a main-agent chunk to be dropped. An Agent Teams member's start
+/// frame carries `isBackground=false`, so `track_subagent_window` DOES open the
+/// window for it — start frame to terminal frame, only ~13-15 ms, with the main
+/// model blocked inside the `Agent` call throughout, so the invariant holds and
+/// no main-thread chunk competes with it. The member's prose/thought arrives
+/// after that window has closed and carries no parent link; the meta arm catches
+/// it instead (see `codebuddy_chunk_marks_subagent`), and the meta arm never
+/// consults `window_open`. Gated on the CodeBuddy family; every other agent
+/// always emits.
 fn should_suppress_subagent_chunk(
     agent_type: AgentType,
     window_open: bool,
@@ -30941,9 +30945,13 @@ mod tests {
     /// chopped the main agent's own text at every interleaved member chunk.
     #[test]
     fn member_event_chunks_are_suppressed_unless_linked() {
-        // The unlinked member stream (and its record echo) → suppressed, even
-        // with the window closed (a member never opens it — it is a background
-        // worker, deliberately excluded from the window).
+        // The unlinked member stream (and its record echo) → suppressed even
+        // with the window closed: the meta arm alone catches it. A member is
+        // NOT window-excluded as a background worker — its start frame carries
+        // isBackground=false, so the window does open, but it stays open only
+        // from that frame to the terminal frame (~13-15 ms, with the main model
+        // blocked inside the Agent call throughout). The member's prose/thought
+        // arrives after that close, so window state plays no role here.
         let member = serde_json::json!({ "codebuddy.ai/memberEvent": "impl-x" });
         assert!(should_suppress_subagent_chunk(
             AgentType::CodeBuddy,
