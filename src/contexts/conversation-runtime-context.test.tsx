@@ -1936,6 +1936,46 @@ describe("buildStreamingTurnsFromLiveMessage — subagent transcript routing (cl
     expect(nested).toEqual([["read"], []])
   })
 
+  it("nests a ZCode child tool call via meta.zcode.parentToolUseId", () => {
+    // The local zcode-acp bridge forwards a native sub-agent's tool cards on
+    // the PARENT session under its own namespace (claude-acp-shaped) — same
+    // contract as Qoder above, and the explicit meta must beat the positional
+    // fallback the same way.
+    const result = build([
+      agentCall("call_a"),
+      agentCall("call_b"),
+      { type: "thinking", text: "A 在想", parentToolUseId: "call_a" },
+      { type: "thinking", text: "B 在想", parentToolUseId: "call_b" },
+      {
+        type: "tool_call",
+        info: toolInfo({
+          tool_call_id: "zc-call_child",
+          title: "Read",
+          meta: {
+            zcode: { parentToolUseId: "call_a", childSessionId: "sess_sub" },
+          },
+        }),
+      },
+    ])
+    const blocks = result.turns.flatMap((t) => t.blocks)
+    // No standalone card for the child.
+    expect(
+      blocks.filter(
+        (b) => b.type === "tool_use" && b.tool_use_id === "zc-call_child"
+      )
+    ).toHaveLength(0)
+    const nested = blocks
+      .filter((b) => b.type === "tool_result")
+      .map((c) =>
+        c.type === "tool_result"
+          ? (c.agent_stats?.tool_calls ?? []).map((tc) => tc.tool_name)
+          : []
+      )
+    // A (declared first, NOT the positional favourite) owns the child; B does
+    // not — the inverse ordering would prove the positional fallback won.
+    expect(nested).toEqual([["read"], []])
+  })
+
   it("emits the carrier block for a text-only subagent (no child tools yet)", () => {
     const result = build([
       agentCall("toolu_agent"),
