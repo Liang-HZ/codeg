@@ -2870,7 +2870,14 @@ fn opencode_legacy_config_path() -> PathBuf {
     opencode_config_dir().join("config.json")
 }
 
-fn resolve_opencode_config_path() -> PathBuf {
+/// Resolve the config file OpenCode actually reads: the primary
+/// `opencode.json`, else the legacy `config.json`, else the primary path (a
+/// caller-visible answer even when neither exists).
+///
+/// `pub(crate)` for the model-visibility policy
+/// (`acp::model_visibility::compute`), which must read the SAME file OpenCode
+/// would.
+pub(crate) fn resolve_opencode_config_path() -> PathBuf {
     let primary = opencode_primary_config_path();
     if primary.exists() {
         return primary;
@@ -2884,7 +2891,9 @@ fn resolve_opencode_config_path() -> PathBuf {
     primary
 }
 
-fn opencode_auth_json_path() -> PathBuf {
+/// `pub(crate)` for the model-visibility policy, which must look at the SAME
+/// `auth.json` the credential cascade writes.
+pub(crate) fn opencode_auth_json_path() -> PathBuf {
     crate::parsers::opencode::resolve_opencode_base_dir().join("auth.json")
 }
 
@@ -6027,7 +6036,11 @@ fn account_home_dir() -> Option<PathBuf> {
 /// inherits codeg's own. `~` and the default expand against the child's home
 /// ([`pi_child_home`]). Never trimmed: pi reads the raw value (`normalizePath`
 /// expands `~` and nothing else).
-fn pi_agent_dir_for_env(runtime_env: &BTreeMap<String, String>) -> PathBuf {
+///
+/// `pub(crate)` for the model-visibility policy
+/// (`acp::model_visibility::compute`), which must read the three native files
+/// where THIS launch's pi would.
+pub(crate) fn pi_agent_dir_for_env(runtime_env: &BTreeMap<String, String>) -> PathBuf {
     pi_agent_dir_for_child(runtime_env, std::env::var_os("PI_CODING_AGENT_DIR"))
 }
 
