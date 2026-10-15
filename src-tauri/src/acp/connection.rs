@@ -2843,6 +2843,12 @@ pub async fn spawn_agent_connection(
     // Fixed by the owner at creation; codex reads it from its launch
     // environment (`apply_codex_prompt_suggestion_policy`).
     let wants_prompt_suggestions = initial_state.wants_prompt_suggestions;
+    // The model rows this launch may SHOW, taken in the same breath and from
+    // the same `agent_type` + merged env the process is spawned with. A fresh
+    // session re-computes (no hot reload — that is what makes `auth login`
+    // reach the next connect).
+    initial_state.model_availability =
+        crate::acp::model_visibility::compute(agent_type, &runtime_env);
 
     let session_state = Arc::new(RwLock::new(initial_state));
 
@@ -4608,12 +4614,13 @@ async fn emit_config_options(
     // Drop what this launch froze BEFORE mapping, so every producer of this
     // event — establishment, the answer to a set, and the agent's own
     // `config_option_update` push — is filtered by one rule.
-    let (pinned, pi_enabled_model_patterns, agent_type) = {
+    let (pinned, pi_enabled_model_patterns, agent_type, availability) = {
         let guard = state.read().await;
         (
             guard.env_pinned_config_option_ids.clone(),
             guard.pi_enabled_model_patterns.clone(),
             guard.agent_type,
+            guard.model_availability.clone(),
         )
     };
     let visible = visible_config_options(&pinned, config_options);
@@ -4621,20 +4628,13 @@ async fn emit_config_options(
         Some(patterns) => filter_pi_enabled_model_options(patterns, visible),
         None => visible,
     };
+    // …then the model-side visibility policy: which of the advertised model
+    // rows this launch can actually run (`acp::model_visibility`). Also here,
+    // before mapping, so the composer, the picker and the delegation probe all
+    // read the same filtered list — while every decision path (the wire `set`,
+    // preference replay, retirement healing) keeps the agent's raw one.
+    let visible = crate::acp::model_visibility::filter_model_options(&availability, visible);
     if update && agent_type == AgentType::Hermes {
-        // Folded against the selectors on screen under the same lock that
-        // replaces them, so a pick landing in between is not undone.
-        let native = map_session_config_options(&visible);
-        emit_with_state_built(state, emitter, |s| {
-            let config_options = match s.config_options.as_deref() {
-                Some(shown) => fold_hermes_config_options(shown, native),
-                None => native,
-            };
-            Some(AcpEvent::SessionConfigOptions { config_options })
-        })
-        .await;
-        return;
-    }
     emit_with_state(
         state,
         emitter,
@@ -46065,6 +46065,78 @@ mod tests {
         assert_eq!(
             pi_select_values(&filtered, "model"),
             vec!["openai/gpt-5", "openai/gpt-4o"]
+    #[tokio::test]
+    async fn the_emit_path_filters_the_model_select_into_state_and_event_alike() {
+        use crate::acp::model_visibility::{ModelAvailability, RestrictedAvailability};
+        use agent_client_protocol::schema::v1::SessionConfigValueId;
+
+        // Two consumers, one list: the composer renders the
+        // `SessionConfigOptions` event, while the delegation "default model"
+        // probe reads `SessionState.config_options`. This pins the design that
+        // the filtering sits at the single emit path, so both sides see the
+        // SAME filtered rows — and neither sees the raw ones.
+        let state = Arc::new(RwLock::new(SessionState::new(
+            "conn-model-filter".to_string(),
+            AgentType::OpenCode,
+            None,
+            "win".to_string(),
+            None,
+        )));
+        state.write().await.model_availability =
+            ModelAvailability::Restricted(RestrictedAvailability {
+                providers: HashSet::from(["kept".to_string()]),
+                hidden_models: HashMap::new(),
+            });
+        let mut events = state.read().await.event_stream().subscribe();
+
+        let model = SessionConfigOption::select(
+            SessionConfigId::new("model"),
+            "Model",
+            SessionConfigValueId::new("kept/current"),
+            vec![
+                SessionConfigSelectOption::new(SessionConfigValueId::new("kept/a"), "A"),
+                SessionConfigSelectOption::new(SessionConfigValueId::new("hidden/b"), "B"),
+                SessionConfigSelectOption::new(SessionConfigValueId::new("kept/current"), "Current"),
+            ],
+        )
+        .category(SessionConfigOptionCategory::Model);
+
+        emit_session_config_options_values(&state, &EventEmitter::Noop, vec![model]).await;
+
+        let envelope = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+            .await
+            .expect("an event must be emitted")
+            .expect("the event stream is alive");
+        let AcpEvent::SessionConfigOptions { config_options } = &envelope.payload else {
+            panic!(
+                "expected a SessionConfigOptions event, got {:?}",
+                envelope.payload
+            );
+        };
+        let values: Vec<String> = config_options
+            .iter()
+            .flat_map(|option| match &option.kind {
+                SessionConfigKindInfo::Select(select) => {
+                    select.options.iter().map(|row| row.value.clone()).collect()
+                }
+                SessionConfigKindInfo::Boolean(_) => Vec::new(),
+            })
+            .collect();
+        assert_eq!(
+            values,
+            vec!["kept/a".to_string(), "kept/current".to_string()],
+            "the event carries the filtered rows (current kept)"
+        );
+
+        let stored = state
+            .read()
+            .await
+            .config_options
+            .clone()
+            .expect("the emit stores the option list on the state");
+        assert_eq!(
+            stored, *config_options,
+            "the probe/state list is exactly the event's filtered list"
         );
     }
 
