@@ -26022,6 +26022,7 @@ mod tests {
                 .send(ConnectionCommand::Prompt {
                     blocks: vec![PromptInputBlock::Text { text: text.into() }],
                     user_message: None,
+                    source: None,
                 })
                 .await
                 .expect("the connection is running");
