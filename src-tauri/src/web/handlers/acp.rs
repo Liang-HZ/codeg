@@ -174,21 +174,47 @@ pub async fn acp_prompt(
             params.conversation_id,
             None,
             params.client_message_id,
+            false,
         )
         .await
-        .map_err(|e| {
-            let message = e.to_string();
-            // A concurrent send while a turn is in flight is an expected,
-            // recoverable condition (409), not a server fault (500). The
-            // frontend re-queues the draft. Other errors stay 500.
-            match e {
-                AcpError::TurnInProgress => {
-                    AppCommandError::new(AppErrorCode::TurnInProgress, message)
-                }
-                _ => AppCommandError::task_execution_failed(message),
-            }
-        })?;
+        .map_err(map_prompt_send_error)?;
     Ok(Json(()))
+}
+
+/// Stop the connection's running turn and send the body as the next one, as a
+/// single admission (the composer's / queue row's "interrupt and send now").
+/// Same request body and error mapping as [`acp_prompt`]: a `TurnInProgress`
+/// rejection means the interrupt could not be admitted (another one is still
+/// handing over, or the turn ended under it), and the frontend re-queues the
+/// draft exactly as it does for a busy send.
+pub async fn acp_prompt_interrupt(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<AcpPromptParams>,
+) -> Result<Json<()>, AppCommandError> {
+    state
+        .connection_manager
+        .prompt_interrupt(
+            &state.db,
+            &params.connection_id,
+            params.blocks,
+            params.folder_id,
+            params.conversation_id,
+            params.client_message_id,
+        )
+        .await
+        .map_err(map_prompt_send_error)?;
+    Ok(Json(()))
+}
+
+/// The prompt endpoints' shared error mapping: a concurrent send while a turn
+/// is in flight is an expected, recoverable condition (409), not a server
+/// fault (500). The frontend re-queues the draft. Other errors stay 500.
+fn map_prompt_send_error(e: AcpError) -> AppCommandError {
+    let message = e.to_string();
+    match e {
+        AcpError::TurnInProgress => AppCommandError::new(AppErrorCode::TurnInProgress, message),
+        _ => AppCommandError::task_execution_failed(message),
+    }
 }
 
 // --- Pattern A: Pure function handlers ---

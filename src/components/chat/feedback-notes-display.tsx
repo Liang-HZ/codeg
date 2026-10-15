@@ -62,6 +62,13 @@ export function FeedbackNotesDisplay({
       <div className="flex flex-col gap-0.5">
         {ordered.map((note) => {
           const delivered = note.status === "delivered"
+          // A deferred native delivery (`queued` — the adapter consumed the
+          // content but will run it after this turn) replaces the generic
+          // "received" with what actually happens. Any reported state counts:
+          // codeg writes the generic `queued` marker when the adapter reports
+          // none, and an adapter's own finer state (zcode's `fellBack` /
+          // `notRequested`) means the same deferral.
+          const queuedReceipt = delivered && Boolean(note.steer_state)
           return (
             <div
               key={note.id}
@@ -109,7 +116,11 @@ export function FeedbackNotesDisplay({
                 </>
               ) : (
                 <span className="shrink-0 text-muted-foreground">
-                  {delivered ? t("delivered") : t("pending")}
+                  {queuedReceipt
+                    ? t("steerQueuedReceipt")
+                    : delivered
+                      ? t("delivered")
+                      : t("pending")}
                 </span>
               )}
             </div>

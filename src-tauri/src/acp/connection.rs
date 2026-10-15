@@ -53,7 +53,7 @@ use crate::acp::file_system_runtime::{
 };
 use crate::acp::host_tools_policy::{HostToolsPolicy, HOST_TOOLS_ENV};
 use crate::acp::registry::{self, AgentDistribution};
-use crate::acp::session_state::SessionState;
+use crate::acp::session_state::{InsertCapability, SessionState, SteerBoundary, SteerChannel};
 use crate::acp::stderr_tail::{summarize_parser_error, StderrTail, TailScope};
 use crate::acp::terminal_runtime::{
     TerminalRuntime, TerminalRuntimeError, TerminalShellRuntimeConfig,
@@ -1178,13 +1178,20 @@ pub enum GoalControlAction {
 
 /// How the adapter disposed of a `_session/steering` message — the wire
 /// `outcome` string, parsed by [`parse_steer_outcome`]. The distinction that
-/// matters to callers is CONSUMPTION: `Injected` and `StartedNewTurn` mean the
-/// adapter took the content (record it delivered, never resend);
-/// `PromptRequired` means it did not (safe to resubmit as a normal prompt).
+/// matters to callers is CONSUMPTION: `Injected`, `Queued` and
+/// `StartedNewTurn` mean the adapter took the content (record it delivered,
+/// never resend); `PromptRequired` means it did not (safe to resubmit as a
+/// normal prompt); `Failed` means the request itself failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SteerOutcome {
     /// Pushed into the RUNNING turn's input — consumed.
     Injected,
+    /// Accepted, but deferred to run after the running turn (the adapter's own
+    /// queue — zcode's engine falls back to it under load, or when the turn
+    /// ends before the guide delivery drains). Consumed: record it delivered
+    /// and NEVER resend, but this is the adapter's DOCUMENTED behavior, not a
+    /// broken promise — no downgrade.
+    Queued,
     /// The turn settled first and the adapter honored the
     /// `idleBehavior = "promptRequired"` opt-in — NOT consumed, still
     /// host-owned. The caller reroutes it through `session/prompt`.
@@ -1194,6 +1201,44 @@ pub enum SteerOutcome {
     /// manager records it delivered, warns, and downgrades
     /// `native_steering_available` for the rest of the session.
     StartedNewTurn,
+    /// The adapter reports the request failed (zcode's engine refused it, a
+    /// persistence fault, an unanswered admission). NOT consumed: the caller
+    /// errors and keeps the draft, exactly like a protocol error would.
+    /// Declared-only, like `Queued`.
+    Failed,
+}
+
+/// The `outcome` vocabulary a connection assumes when its adapter declared
+/// none (`_meta.steering.outcomes` missing): the three historical strings.
+/// `Queued`/`Failed` are opt-in — they only parse for an adapter that
+/// advertised them (see [`parse_steer_outcome`]).
+pub const DEFAULT_STEER_OUTCOMES: [SteerOutcome; 3] = [
+    SteerOutcome::Injected,
+    SteerOutcome::PromptRequired,
+    SteerOutcome::StartedNewTurn,
+];
+
+/// A parsed `_session/steering` receipt: the outcome every caller branches on,
+/// plus the adapter's own finer delivery state when its receipt carries one
+/// (`_meta.steering.steerState` — zcode reports `"fellBack"` /
+/// `"steering"` / `"notRequested"` beside a `queued`). The state is diagnostic
+/// / display-only: whether the content was consumed is fully told by the
+/// outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SteerReceipt {
+    pub outcome: SteerOutcome,
+    /// The adapter's own delivery state, `None` when it reports none.
+    pub steer_state: Option<String>,
+}
+
+impl SteerReceipt {
+    /// A receipt carrying no adapter-specific state.
+    pub fn bare(outcome: SteerOutcome) -> Self {
+        Self {
+            outcome,
+            steer_state: None,
+        }
+    }
 }
 
 /// Commands sent from Tauri command handlers to the ACP connection loop.
@@ -1218,6 +1263,24 @@ pub enum ConnectionCommand {
         /// broadcast and the title seed only ever read `blocks`. Empty for
         /// every other prompt.
         internal_suffix: Vec<PromptInputBlock>,
+        /// [`crate::acp_transcript::TranscriptEntry::source`] for the recorded
+        /// prompt. `Some` only for system-injected content (the
+        /// delegation-result notice); the transcript's readers keep the turn
+        /// split but do not render it as a user message.
+        source: Option<String>,
+        /// Interrupt-and-send ("preempt"): the user stopped the running turn
+        /// and this prompt is what they want next. Set only by the manager's
+        /// `prompt_interrupt` path, and only when a turn was actually in flight
+        /// when it admitted the prompt (no turn → the prompt degrades to an
+        /// ordinary one and rides with `false`).
+        ///
+        /// An in-turn `preempt: true` runs the SAME sequence as a user Stop
+        /// (the shared `cancel_in_flight_turn`) and then hands its own blocks
+        /// to the turn-opening code, which starts the new turn without the
+        /// `turn_in_flight` gate ever being released in between (see
+        /// `SessionState::preempt_handover`). It is NOT the tripwire case
+        /// below: it is the one prompt legally admitted while a turn runs.
+        preempt: bool,
     },
     SetMode {
         mode_id: String,
@@ -1264,13 +1327,17 @@ pub enum ConnectionCommand {
     /// normal prompt does (text plus image attachments), mapped onto the wire
     /// with the same conversion, so a steered draft keeps its attachments.
     /// The loop does the protocol round-trip only and replies the parsed
-    /// outcome; recording the note + the `FeedbackSubmitted` broadcast happen
+    /// receipt; recording the note + the `FeedbackSubmitted` broadcast happen
     /// in the manager's cancellation-shielded task, mirroring Fork's
     /// protocol/persistence split. The idle arm replies `Err(NoActiveTurn)`
     /// so the oneshot can never hang.
     Steer {
         blocks: Vec<PromptInputBlock>,
-        reply: tokio::sync::oneshot::Sender<Result<SteerOutcome, AcpError>>,
+        reply: tokio::sync::oneshot::Sender<Result<SteerReceipt, AcpError>>,
+        /// Same as the `Prompt` arm's `source`: `Some` for the
+        /// delegation-result notice delivered as a system steer, so the
+        /// recorded steer is recognizably not user speech.
+        source: Option<String>,
     },
     /// Stop one AIR async task (`_session/async_task/stop`; claude-agent-acp
     /// 0.73+, codex-acp 1.10+ — identical params and response on both).
@@ -3568,6 +3635,25 @@ async fn drain_permissions_then_emit(
     emit_with_state(state, emitter, follow_up).await;
 }
 
+/// As [`drain_permissions_then_emit`], but the event is BUILT inside the
+/// emitted critical section (`emit_with_state_built`), so the caller can set
+/// backend-internal state that the event's own reducer reads — the preempt
+/// handover flag next to the intermediate `TurnComplete{cancelled}` is the
+/// case: set any earlier and a different writer could see it as an ordinary
+/// state field; set after and the reducer has already released the gate.
+async fn drain_permissions_then_emit_built<F>(
+    perms: &PendingPermissions,
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    build: F,
+) where
+    F: FnOnce(&mut SessionState) -> Option<AcpEvent>,
+{
+    let mut queue = perms.lock().await;
+    drain_permissions_locked(&mut queue, state, emitter).await;
+    emit_with_state_built(state, emitter, build).await;
+}
+
 /// Shared body of the two drains above. Emits the compensating
 /// `PermissionResolved` for whatever was on screen; queued cards were never
 /// published, so they need none.
@@ -3588,6 +3674,101 @@ async fn drain_permissions_locked(
             },
         )
         .await;
+    }
+}
+
+/// Everything a MID-TURN cancel does — the two callers are the user's Stop
+/// button (`ConnectionCommand::Cancel`) and the preempt handover
+/// (`ConnectionCommand::Prompt` with `preempt: true`, which stops the turn only
+/// to start the next one with its own blocks). Both stop the agent's running
+/// turn, clear whatever it still had on screen, and cascade-cancel the work it
+/// owned; the one difference is `handover`, described below.
+///
+/// `handover` ties the intermediate `TurnComplete{cancelled}` to the gate: an
+/// ordinary Stop releases `turn_in_flight` with it, a preempt handover must
+/// leave it held for the prompt that interrupted. The flag that carries that
+/// decision is set INSIDE the same critical section as the event
+/// (`drain_permissions_then_emit_built`), so a reducer running in between can
+/// never see a half-applied handover.
+#[allow(clippy::too_many_arguments)]
+async fn cancel_in_flight_turn(
+    cx: &ConnectionTo<Agent>,
+    sid: &SessionId,
+    agent_type: AgentType,
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    perms: &PendingPermissions,
+    terminal_runtime: &Arc<TerminalRuntime>,
+    tracked_terminal_tool_calls: &mut HashMap<String, TrackedTerminalToolCall>,
+    delegation_injection: Option<&DelegationInjection>,
+    conn_id: &str,
+    handover: bool,
+) {
+    // Send CancelNotification to agent to stop the current turn
+    let _ = cx.send_notification_to(Agent, CancelNotification::new(sid.clone()));
+    // Also terminate any command runtimes created for this session so
+    // cancellation does not hang on long-running terminal tools.
+    terminal_runtime
+        .release_all_for_session(sid.0.as_ref())
+        .await;
+    tracked_terminal_tool_calls.clear();
+    // Also cancel any pending permission requests (queued ones included),
+    // clearing the card that was on screen, and immediately emit TurnComplete
+    // so the frontend transitions out of "prompting" and the user can send new
+    // messages. Don't wait for the agent -- it may be slow to respond or not
+    // respond at all. One critical section for the same reason as the turn-end
+    // exits: a request admitted between the two would be published and then
+    // silently un-displayed by TurnComplete, wedging the queue.
+    let turn_complete = AcpEvent::TurnComplete {
+        session_id: sid.0.to_string(),
+        stop_reason: "cancelled".into(),
+        agent_type: agent_type.to_string(),
+    };
+    if handover {
+        // The gate hand-over happens HERE, in the event's own critical section:
+        // the preempt prompt was admitted against `turn_in_flight` and starts
+        // its turn next, so this TurnComplete must not release it.
+        drain_permissions_then_emit_built(perms, state, emitter, move |s| {
+            s.preempt_handover = true;
+            Some(turn_complete)
+        })
+        .await;
+    } else {
+        drain_permissions_then_emit(perms, state, emitter, turn_complete).await;
+    }
+    // Cascade-cancel any in-flight delegations owned by this parent connection.
+    // Idempotent with the cleanup-guard cancel_by_parent at the end of
+    // run_connection (#1: empty pending → no-op). Without this, a user-initiated
+    // cancel of a parent prompt mid-delegation would leave the child agent
+    // running indefinitely (broker no longer applies a timeout; only an MCP
+    // `notifications/cancelled` or a parent/child disconnect would otherwise
+    // tear the delegation down). Turn-scoped: the connection stays alive after a
+    // prompt cancel, so keep the parent's `consumed` tool_call memory (a re-emit
+    // must not mis-bind the next same-key delegation); the cleanup-guard
+    // teardown still clears everything when the connection finally goes away.
+    //
+    // Await inline so the fast tracker + parked-call drain is ordered before the
+    // next prompt (keeping it scoped to the just-ended turn); the broker
+    // backgrounds the slow child teardown internally, so the user-visible Cancel
+    // path doesn't wait on (potentially slow) child agent teardown. The user
+    // already saw the parent's TurnComplete above, and the broker's drain-first
+    // lock guarantees no double DelegationCompleted emit.
+    if let Some(inj) = delegation_injection {
+        inj.broker.cancel_by_parent_turn(conn_id).await;
+        // Reclaim any parked `ask_user_question` / Grok `exit_plan_mode`
+        // approval owned by this connection. Unlike `perms` (drained inline
+        // above), these registries live on the manager and are otherwise only
+        // drained on full connection teardown -- but a turn-scoped Cancel keeps
+        // the connection alive. Without this the entry lingers, and the
+        // one-pending-per-connection guard in `register_{question,plan_approval}`
+        // then silently rejects the NEXT one on this connection (its card never
+        // shows). Idempotent with the cleanup-guard drain (empty map -> no-op);
+        // the dropped sender declines the tool / replies disconnect, exactly
+        // like the permission drain above.
+        inj.questions.cancel_questions_by_parent(conn_id).await;
+        inj.plan_approvals
+            .cancel_plan_approvals_by_parent(conn_id)
+            .await;
     }
 }
 
@@ -5477,13 +5658,17 @@ fn build_grok_set_model_params(
 /// `promptRequired` idle contract; codeg only enables native steering for
 /// adapters proven to honor it AND to keep the owning prompt in flight across
 /// the steered work (claude-agent-acp 0.65.0 / #958 — see
-/// [`synthesize_native_steering`] and `registry::steering_prompt_required_min_version`),
+/// [`synthesize_insert_capability`] and `registry::steering_prompt_required_min_version`),
 /// but the caller still handles every outcome in case the proof was wrong.
+///
+/// `declared_outcomes` is the connection's advertised vocabulary (see
+/// [`parse_steer_outcome`]).
 async fn send_steer_request(
     cx: &ConnectionTo<Agent>,
     session_id: &SessionId,
     blocks: &[PromptInputBlock],
-) -> Result<SteerOutcome, AcpError> {
+    declared_outcomes: &[SteerOutcome],
+) -> Result<SteerReceipt, AcpError> {
     let params = build_steer_params(session_id.0.as_ref(), blocks);
     let untyped_req = UntypedMessage::new("_session/steering", params).map_err(|e| {
         AcpError::protocol(format!("Failed to build steering request: {e}"))
@@ -5493,7 +5678,7 @@ async fn send_steer_request(
         .block_task()
         .await
         .map_err(|e| AcpError::protocol(format!("Steering request failed: {e}")))?;
-    parse_steer_outcome(&raw)
+    parse_steer_outcome(&raw, declared_outcomes)
 }
 
 /// Build the `_session/steering` params. The prompt carries the caller's
@@ -5544,19 +5729,47 @@ async fn send_stop_async_task_request(
         .unwrap_or(false))
 }
 
-/// Parse a `_session/steering` response's top-level `outcome`. Strict on
+/// Parse a `_session/steering` response into a [`SteerReceipt`]. Strict on
 /// unknowns: a missing or unrecognized outcome is a protocol error, NOT a
 /// silent success — the caller must know whether the content was consumed
 /// before it decides between "record delivered" and "safe to resend".
-fn parse_steer_outcome(raw: &serde_json::Value) -> Result<SteerOutcome, AcpError> {
-    match raw.get("outcome").and_then(serde_json::Value::as_str) {
-        Some("injected") => Ok(SteerOutcome::Injected),
-        Some("promptRequired") => Ok(SteerOutcome::PromptRequired),
-        Some("startedNewTurn") => Ok(SteerOutcome::StartedNewTurn),
-        other => Err(AcpError::protocol(format!(
-            "unexpected _session/steering outcome: {other:?}"
-        ))),
-    }
+///
+/// `declared_outcomes` is the whitelist from the adapter's own
+/// `_meta.steering.outcomes` (the historical three when the field is absent —
+/// see `SessionState.steering_outcomes`). The historical three parse regardless
+/// — they predate the field and every adapter has always answered them.
+/// `queued` and `failed` are declared-only: codeg's removal of a note from the
+/// pull path, and its decision to error rather than record, must not be
+/// triggered by an adapter that never promised those semantics.
+fn parse_steer_outcome(
+    raw: &serde_json::Value,
+    declared_outcomes: &[SteerOutcome],
+) -> Result<SteerReceipt, AcpError> {
+    let declared = |outcome: SteerOutcome| declared_outcomes.contains(&outcome);
+    let outcome = match raw.get("outcome").and_then(serde_json::Value::as_str) {
+        Some("injected") => SteerOutcome::Injected,
+        Some("promptRequired") => SteerOutcome::PromptRequired,
+        Some("startedNewTurn") => SteerOutcome::StartedNewTurn,
+        Some("queued") if declared(SteerOutcome::Queued) => SteerOutcome::Queued,
+        Some("failed") if declared(SteerOutcome::Failed) => SteerOutcome::Failed,
+        other => {
+            return Err(AcpError::protocol(format!(
+                "unexpected _session/steering outcome: {other:?}"
+            )))
+        }
+    };
+    // The adapter's own delivery state, when it reports one
+    // (`_meta.steering.steerState` — zcode); display/diagnostic only.
+    let steer_state = raw
+        .get("_meta")
+        .and_then(|m| m.get("steering"))
+        .and_then(|s| s.get("steerState"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    Ok(SteerReceipt {
+        outcome,
+        steer_state,
+    })
 }
 
 /// On reconnect, re-apply the user's last-picked Grok model AND reasoning effort
@@ -8200,24 +8413,30 @@ async fn run_connection(
                 supports_close
             );
 
-            // Native live-feedback steering, synthesized ONCE from three gates
-            // so every consumer (the submit split, the snapshot, the frontend)
-            // reads a single authoritative bool: (1) the adapter advertises
-            // the extension (top-level `_meta`), (2) the registry says this
-            // agent type honors the `promptRequired` idle opt-in, and (3) the
-            // RUNNING binary proves it via `agent_info.version` — launch
-            // prefers a PATH-resolved install over the pinned package, so (2)
-            // alone can't vouch for the process on the other end of the pipe.
-            // The raw advertisement is deliberately NOT stored: exposing it
-            // would tempt the frontend to re-derive eligibility and show the
-            // instant channel for adapters (codex) that advertise steering but
-            // would detach a turn on the idle race.
-            let steering_advertised = init_advertises_steering(init_resp.meta.as_ref());
-            let native_steering_available = synthesize_native_steering(
+            // Native live-feedback steering, synthesized ONCE from the
+            // adapter's own descriptor + the registry policy, so every consumer
+            // (the submit split, the snapshot, the frontend) reads a single
+            // authoritative model: (1) the adapter advertises the extension and
+            // declares its `boundary` / `idle` / `outcomes` (top-level `_meta`),
+            // (2) the registry says this agent type — or the name its RUNNING
+            // adapter reports — has a policy, and (3) for the Claude policy, the
+            // running binary proves it via `agent_info.version` (launch prefers
+            // a PATH-resolved install over the pinned package, so (2) alone
+            // can't vouch for the process on the other end of the pipe). The raw
+            // advertisement is deliberately NOT stored: exposing it would tempt
+            // the frontend to re-derive eligibility and show the instant channel
+            // for adapters (codex) that advertise steering but would detach a
+            // turn on the idle race.
+            let steering_descriptor = parse_steering_descriptor(init_resp.meta.as_ref())
+                .map_err(|e| agent_client_protocol::util::internal_error(e.to_string()))?;
+            let insert_capability = synthesize_insert_capability(
                 agent_type,
-                init_resp.meta.as_ref(),
+                steering_descriptor.as_ref(),
                 init_resp.agent_info.as_ref(),
             );
+            // Transitional projection of the capability's `steer` — one
+            // computation, two projections (see the field docs).
+            let native_steering_available = insert_capability.steer.is_some();
             // Same `agent_info.version` proof, for a different shape decision:
             // which generation of codex's `request_user_input` form this
             // connection will receive.
@@ -8225,10 +8444,24 @@ async fn run_connection(
                 codex_user_input_shape(agent_type, init_resp.agent_info.as_ref());
             let steering_policy =
                 steering_policy_agent(agent_type, init_resp.agent_info.as_ref());
+            // `tier` / `method` are logged but not carried in the descriptor:
+            // nothing consumes them — the method is a constant codeg already
+            // uses (`_session/steering`), the tier is provenance — while the
+            // line is where an operator diagnosing a channel reads them.
+            let steering_meta = init_resp.meta.as_ref().and_then(|m| m.get("steering"));
             tracing::info!(
-                "[ACP][{}] steering: advertised={}, agent={:?}, agent_version={:?}, policy={}{}, native={}",
+                "[ACP][{}] steering: advertised={}, tier={:?}, method={:?}, boundary={:?}, idle={:?}, outcomes={:?}, agent={:?}, agent_version={:?}, policy={}{}, native={}",
                 agent_type,
-                steering_advertised,
+                steering_descriptor.is_some(),
+                steering_meta
+                    .and_then(|s| s.get("tier"))
+                    .and_then(serde_json::Value::as_str),
+                steering_meta
+                    .and_then(|s| s.get("method"))
+                    .and_then(serde_json::Value::as_str),
+                steering_descriptor.as_ref().map(|d| d.boundary),
+                steering_descriptor.as_ref().map(|d| d.idle),
+                steering_descriptor.as_ref().map(|d| d.outcomes.as_slice()),
                 init_resp.agent_info.as_ref().map(|i| i.name.as_str()),
                 init_resp.agent_info.as_ref().map(|i| i.version.as_str()),
                 steering_policy,
@@ -8361,6 +8594,12 @@ async fn run_connection(
                 s.native_steering_available = native_steering_available;
                 s.codex_user_input_shape = codex_user_input_shape;
                 s.neutral_goal_channel = neutral_goal_channel;
+                // The receipt vocabulary this connection's adapter declared
+                // (validated by `parse_steering_descriptor`, defaulted to the
+                // historical three when it declared none).
+                if let Some(descriptor) = steering_descriptor.as_ref() {
+                    s.steering_outcomes = descriptor.outcomes.clone();
+                }
                 // The vocabulary is decided HERE for every adapter, advertising
                 // or not — this assignment is what flips it from "unknown" to
                 // known, and a client reading the snapshot before it lands must
@@ -8388,6 +8627,14 @@ async fn run_connection(
                     s.feedback_tool_available = false;
                     s.result_tool_available = false;
                 }
+                // Assistant state, two projections of one synthesis: the
+                // capability model (steer channel + boundary) and, until it
+                // retires, the legacy bool. `pull` mirrors the companion
+                // decision taken just above, which is why it is filled here
+                // rather than in the synthesis.
+                let mut capability = insert_capability;
+                capability.pull = s.feedback_tool_available;
+                s.insert_capability = capability;
             }
 
             // Emit fork support capability
@@ -13143,7 +13390,10 @@ async fn run_conversation_loop(
     // own needs a turn to have started it, and background work cannot outlive
     // the agent process this loop's connection owns.
     let mut prompted = false;
-    loop {
+    // Labelled because the turn arm below nests its own loop (it can run a
+    // SECOND turn back to back — a preempt handover), so a bare `break` from
+    // inside it would no longer mean "end this connection".
+    'commands: loop {
         // Wait for either a user command or a session update (e.g. available_commands_update)
         let cmd = loop {
             tokio::select! {
@@ -13263,7 +13513,20 @@ async fn run_conversation_loop(
                 blocks,
                 user_message,
                 internal_suffix,
+                source,
+                preempt: _,
             }) => {
+                // One turn per iteration. The arm re-enters itself exactly once
+                // per preempt prompt: the in-turn handler runs the Cancel
+                // sequence, arms `next_prompt` with that prompt's own payload and
+                // breaks, and this arm then opens the new turn straight away —
+                // no Connected edge, no gate release, no re-queue in between.
+                // (`preempt` itself is read where it matters, in the in-turn
+                // handler; the arm-opening path is identical for both.)
+                let mut next_prompt = Some((blocks, user_message, source, internal_suffix));
+                while let Some((blocks, user_message, source, internal_suffix)) =
+                    next_prompt.take()
+                {
                 // Fingerprint the outgoing prompt for the background watcher's
                 // foreground/out-of-turn classifier BEFORE the blocks are
                 // consumed: the transcript record this prompt becomes must
@@ -13310,7 +13573,14 @@ async fn run_conversation_loop(
                     // `send_prompt_inner`), and `map_prompt_blocks` is 1:1, so an
                     // empty prompt should never reach here. If one ever did, it
                     // would carry no turn-in-flight gate, so just surface the
-                    // error and keep the idle loop alive.
+                    // error and keep the idle loop alive — and drop any preempt
+                    // admission with it, or the connection would refuse every
+                    // later interrupt with `TurnInProgress` forever (a preempt
+                    // payload is never empty from the manager, but a stranded
+                    // flag is exactly the wedge this clear exists to prevent; no
+                    // OTHER preempt can be pending here, since one pending is
+                    // what admits the next).
+                    state.write().await.preempt_pending = false;
                     emit_with_state(
                         state,
                         emitter,
@@ -13325,7 +13595,7 @@ async fn run_conversation_loop(
                         },
                     )
                     .await;
-                    continue;
+                    break;
                 }
 
                 // A prompt the gate admitted while Grok ran a turn of its own
@@ -13352,6 +13622,17 @@ async fn run_conversation_loop(
                 {
                     cancel_grok_agent_turn_asks(delegation_injection, conn_id).await;
                 }
+
+                // This is the moment the turn opens, and so the moment a
+                // preempt admission stops being "in flight": the cancel
+                // sequence it asked for is done (if there was one) and the new
+                // turn is starting on the gate it held throughout. Cleared HERE
+                // and not at command dequeue, because the cancel sequence in
+                // between is exactly the window a second interrupt must be
+                // refused in (`prompt_interrupt` answers it `TurnInProgress`,
+                // and the frontend re-queues the draft like any busy bounce).
+                // A no-op for the ordinary prompt, whose path never sets it.
+                state.write().await.preempt_pending = false;
 
                 emit_with_state(
                     state,
@@ -14149,7 +14430,13 @@ async fn run_conversation_loop(
                                     if let Some(inj) = delegation_injection {
                                         inj.questions.cancel_questions_by_parent(conn_id).await;
                                     }
-                                    let outcome = send_steer_request(&cx, &sid, &blocks).await;
+                                    let declared_outcomes = {
+                                        let s = state.read().await;
+                                        s.steering_outcomes.clone()
+                                    };
+                                    let outcome =
+                                        send_steer_request(&cx, &sid, &blocks, &declared_outcomes)
+                                            .await;
                                     // A steered message still lands in the
                                     // agent's OWN transcript: as a user record
                                     // when it runs as a turn of its own, and as
@@ -14167,16 +14454,31 @@ async fn run_conversation_loop(
                                     // renders it twice and reorders the
                                     // transcript as the upserts land.
                                     //
-                                    // `Injected` ONLY: `PromptRequired` leaves
+                                    // `Injected` / `Queued` ONLY: both mean
+                                    // the content WAS consumed — `Queued` is
+                                    // the adapter's own deferral (it runs
+                                    // after the turn), and zcode's bridge
+                                    // never echoes the user message into the
+                                    // ACP stream, so a queued steer recorded
+                                    // nowhere would be permanently absent from
+                                    // codeg's transcript, which IS a custom
+                                    // agent's history. `PromptRequired` leaves
                                     // the content unconsumed (the caller
                                     // resends it as a real prompt, which
                                     // fingerprints itself, and a stale entry
                                     // would swallow a same-text out-of-turn
-                                    // refire for the whole ledger TTL), and a
+                                    // refire for the whole ledger TTL), a
                                     // `StartedNewTurn` genuinely runs detached
                                     // — the overlay is the only place its work
-                                    // can surface at all.
-                                    if matches!(outcome, Ok(SteerOutcome::Injected)) {
+                                    // can surface at all — and a `Failed`
+                                    // consumed nothing.
+                                    if matches!(
+                                        outcome,
+                                        Ok(SteerReceipt {
+                                            outcome: SteerOutcome::Injected | SteerOutcome::Queued,
+                                            ..
+                                        })
+                                    ) {
                                         prompt_ledger.record_prompt_blocks(&blocks);
                                         // A custom agent's history is codeg's
                                         // own transcript, and only codeg knows
@@ -14209,102 +14511,26 @@ async fn run_conversation_loop(
                                     );
                                 }
                                 Some(ConnectionCommand::Cancel) => {
-                                    // Send CancelNotification to agent to stop the current turn
-                                    let _ = cx.send_notification_to(
-                                        Agent,
-                                        CancelNotification::new(sid.clone()),
-                                    );
-                                    // Also terminate any command runtimes created for this
-                                    // session so cancellation does not hang on long-running
-                                    // terminal tools.
-                                    terminal_runtime
-                                        .release_all_for_session(sid.0.as_ref())
-                                        .await;
-                                    tracked_terminal_tool_calls.clear();
-                                    // No turn end is recorded here, for ZCode
-                                    // as for every agent whose history is
-                                    // codeg's transcript: the agent's last
-                                    // frames are still on their way and land
-                                    // on the idle loop, and a turn end ahead of
-                                    // them would make the history parser read
-                                    // them as a reply of their own. This
-                                    // prompt's `zcode_turn` goes with the
-                                    // drain, so a late report never bills the
-                                    // next prompt either.
-                                    // Also cancel any pending permission requests
-                                    // (queued ones included), clearing the card
-                                    // that was on screen, and immediately emit
-                                    // TurnComplete so the frontend transitions out
-                                    // of "prompting" and the user can send new
-                                    // messages. Don't wait for the agent -- it may
-                                    // be slow to respond or not respond at all.
-                                    // One critical section for the same reason as
-                                    // the turn-end exits: a request admitted
-                                    // between the two would be published and then
-                                    // silently un-displayed by TurnComplete,
-                                    // wedging the queue.
-                                    drain_permissions_then_emit(
-                                        perms,
+                                    // Stop the turn: agent notification, terminal
+                                    // and permission drains, `TurnComplete`
+                                    // (releasing the gate), delegation cascade —
+                                    // all shared with the preempt handover, which
+                                    // runs the identical sequence and then opens
+                                    // the next turn with its own prompt.
+                                    cancel_in_flight_turn(
+                                        &cx,
+                                        &sid,
+                                        agent_type,
                                         state,
                                         emitter,
-                                        AcpEvent::TurnComplete {
-                                            session_id: sid.0.to_string(),
-                                            stop_reason: "cancelled".into(),
-                                            agent_type: agent_type.to_string(),
-                                        },
+                                        perms,
+                                        &terminal_runtime,
+                                        &mut tracked_terminal_tool_calls,
+                                        delegation_injection,
+                                        conn_id,
+                                        false,
                                     )
                                     .await;
-                                    // Cascade-cancel any in-flight delegations owned by
-                                    // this parent connection. Idempotent with the
-                                    // cleanup-guard cancel_by_parent at the end of
-                                    // run_connection (#1: empty pending → no-op).
-                                    // Without this, a user-initiated cancel of a parent
-                                    // prompt mid-delegation would leave the child agent
-                                    // running indefinitely (broker no longer applies a
-                                    // timeout; only an MCP `notifications/cancelled` or
-                                    // a parent/child disconnect would otherwise tear
-                                    // the delegation down). Turn-scoped: the
-                                    // connection stays alive after a prompt cancel,
-                                    // so keep the parent's `consumed` tool_call
-                                    // memory (a re-emit must not mis-bind the next
-                                    // same-key delegation); the cleanup-guard
-                                    // teardown still clears everything when the
-                                    // connection finally goes away.
-                                    //
-                                    // Await inline so the fast tracker +
-                                    // parked-call drain is ordered before the
-                                    // next prompt (keeping it scoped to the
-                                    // just-ended turn); the broker backgrounds
-                                    // the slow child teardown internally, so the
-                                    // user-visible Cancel path doesn't wait on
-                                    // (potentially slow) child agent teardown.
-                                    // The user already saw the parent's
-                                    // TurnComplete above, and the broker's
-                                    // drain-first lock guarantees no double
-                                    // DelegationCompleted emit.
-                                    if let Some(inj) = delegation_injection {
-                                        inj.broker.cancel_by_parent_turn(conn_id).await;
-                                        // Reclaim any parked `ask_user_question` /
-                                        // Grok `exit_plan_mode` approval owned by this
-                                        // connection. Unlike `perms` (drained inline
-                                        // above), these registries live on the manager
-                                        // and are otherwise only drained on full
-                                        // connection teardown -- but a turn-scoped
-                                        // Cancel keeps the connection alive. Without
-                                        // this the entry lingers, and the
-                                        // one-pending-per-connection guard in
-                                        // `register_{question,plan_approval}` then
-                                        // silently rejects the NEXT one on this
-                                        // connection (its card never shows). Idempotent
-                                        // with the cleanup-guard drain (empty map ->
-                                        // no-op); the dropped sender declines the tool /
-                                        // replies disconnect, exactly like the
-                                        // permission drain above.
-                                        inj.questions.cancel_questions_by_parent(conn_id).await;
-                                        inj.plan_approvals
-                                            .cancel_plan_approvals_by_parent(conn_id)
-                                            .await;
-                                    }
                                     // Keep awaiting the prompt response, in the
                                     // background: the agent still owes its
                                     // `cancelled` reply, and dropping the pending
@@ -14333,14 +14559,67 @@ async fn run_conversation_loop(
                                     disconnect_requested = true;
                                     break;
                                 }
-                                Some(ConnectionCommand::Prompt { .. }) => {
+                                Some(ConnectionCommand::Prompt {
+                                    blocks,
+                                    user_message,
+                                    internal_suffix,
+                                    source,
+                                    preempt,
+                                }) => {
+                                    if preempt {
+                                        // Interrupt-and-send: the manager admitted
+                                        // this prompt while a turn was running and
+                                        // told us to stop that turn first. Run the
+                                        // exact Cancel sequence (shared helper),
+                                        // with the gate hand-over flag set in the
+                                        // intermediate TurnComplete's own critical
+                                        // section, then hand our blocks back to the
+                                        // turn-opening code above by breaking out
+                                        // with `next_prompt` armed — the new turn
+                                        // opens without the gate ever being
+                                        // released, so no concurrent prompt can be
+                                        // admitted into the gap.
+                                        cancel_in_flight_turn(
+                                            &cx,
+                                            &sid,
+                                            agent_type,
+                                            state,
+                                            emitter,
+                                            perms,
+                                            &terminal_runtime,
+                                            &mut tracked_terminal_tool_calls,
+                                            delegation_injection,
+                                            conn_id,
+                                            true,
+                                        )
+                                        .await;
+                                        // Same reasoning as the Cancel arm: the
+                                        // cancelled turn still owes a response, so
+                                        // keep awaiting it off to the side rather
+                                        // than dropping the pending request (which
+                                        // would double-cancel) or leaving it in this
+                                        // select (it belongs to the turn that just
+                                        // ended, not the one starting now).
+                                        tokio::spawn(async move {
+                                            let _ = prompt_response.await;
+                                        });
+                                        next_prompt = Some((
+                                            blocks,
+                                            user_message,
+                                            source,
+                                            internal_suffix,
+                                        ));
+                                        break;
+                                    }
                                     // Tripwire, not a user-facing case. The
                                     // `turn_in_flight` gate in `send_prompt_inner`
                                     // rejects a second prompt BEFORE it is ever
-                                    // enqueued, so a `Prompt` reaching this mid-turn
-                                    // command handler means an ungated sender slipped
-                                    // past the gate (a broken invariant) — surface it
-                                    // at `warn` instead of letting the `_ => {}` below
+                                    // enqueued (a `preempt: true` one is the single
+                                    // exception, handled above), so an ordinary
+                                    // `Prompt` reaching this mid-turn command
+                                    // handler means an ungated sender slipped past
+                                    // the gate (a broken invariant) — surface it at
+                                    // `warn` instead of letting the `_ => {}` below
                                     // swallow it silently.
                                     tracing::warn!(
                                         connection_id = %conn_id,
@@ -14357,7 +14636,18 @@ async fn run_conversation_loop(
                     tracing::info!(
                         "[ACP] closing connection loop after disconnect; connection_id={conn_id}"
                     );
-                    break;
+                    break 'commands;
+                }
+
+                // A preempt handover armed `next_prompt`: the new turn opens on
+                // the very next iteration, with the gate still held. No
+                // Connected edge in between — the connection was never idle, and
+                // emitting one would have the frontend's queue auto-flush race a
+                // send against a turn that is already running (its bounce is
+                // handled, but the edge would also repaint a status the user
+                // never saw).
+                if next_prompt.is_some() {
+                    continue;
                 }
 
                 emit_with_state(
@@ -14368,6 +14658,7 @@ async fn run_conversation_loop(
                     },
                 )
                 .await;
+                }
             }
             Some(ConnectionCommand::RespondPermission {
                 request_id,
@@ -16758,19 +17049,134 @@ fn hoist_request_permission_meta(
     meta.entry("permission").or_insert_with(|| permission.clone());
 }
 
-/// True when an `initialize` response advertises the ACP steering extension —
-/// the TOP-LEVEL `_meta.steering.supported` flag, a sibling of
+/// The adapter's self-description of its `_session/steering` extension, out of
+/// an `initialize` response's TOP-LEVEL `_meta.steering` — a sibling of
 /// `agentCapabilities` (NOT `agentCapabilities._meta`, which belongs to other
-/// conventions such as the ACP runtime's symposium capability ext). Both claude-agent-acp
-/// (0.61+) and codex-acp (1.1.6+) advertise here; whether codeg actually
-/// steers natively additionally requires the
-/// `registry::steering_prompt_required_min_version` policy plus the runtime
-/// version proof (see the synthesis in `run_connection`).
-fn init_advertises_steering(meta: Option<&serde_json::Map<String, serde_json::Value>>) -> bool {
-    meta.and_then(|m| m.get("steering"))
-        .and_then(|s| s.get("supported"))
+/// conventions such as the ACP runtime's symposium capability ext). Built by
+/// [`parse_steering_descriptor`]; `supported` is the presence gate (an
+/// unsupported block yields `None`), so it is not carried here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SteeringDescriptor {
+    /// When an accepted insert takes effect (`_meta.steering.boundary`).
+    pub boundary: SteerBoundary,
+    /// How the adapter answers a steer that raced the turn end
+    /// (`_meta.steering.idle`).
+    pub idle: SteerIdle,
+    /// The `outcome` vocabulary the adapter may answer with, validated against
+    /// [`KNOWN_STEER_OUTCOMES`] at handshake time (see [`parse_steer_outcome`]
+    /// for how the list gates the runtime parse). Defaults to
+    /// [`DEFAULT_STEER_OUTCOMES`] when the field is absent.
+    pub outcomes: Vec<SteerOutcome>,
+}
+
+/// What an adapter does when a steer arrives as the turn settles
+/// (`_meta.steering.idle`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SteerIdle {
+    /// Honors the `idleBehavior = "promptRequired"` opt-in: hands the content
+    /// back unconsumed. The opt-in codeg's native push channel requires.
+    PromptRequired,
+    /// The historical default of both official adapters: starts a detached
+    /// turn nobody asked for. Conservative default — never native.
+    #[default]
+    StartedNewTurn,
+}
+
+/// Every `outcome` string codeg understands, for validating an adapter's
+/// `_meta.steering.outcomes` declaration at handshake time. A declaration
+/// carrying anything else is a protocol error: the list is the whitelist the
+/// per-receipt parse runs against (see [`parse_steer_outcome`]), so an
+/// unrecognized entry would otherwise be discovered only mid-turn, with the
+/// user's message already in flight.
+pub const KNOWN_STEER_OUTCOMES: [(&str, SteerOutcome); 5] = [
+    ("injected", SteerOutcome::Injected),
+    ("queued", SteerOutcome::Queued),
+    ("promptRequired", SteerOutcome::PromptRequired),
+    ("startedNewTurn", SteerOutcome::StartedNewTurn),
+    ("failed", SteerOutcome::Failed),
+];
+
+fn steer_outcome_from_name(name: &str) -> Option<SteerOutcome> {
+    KNOWN_STEER_OUTCOMES
+        .iter()
+        .find(|(known, _)| *known == name)
+        .map(|(_, outcome)| *outcome)
+}
+
+/// Parse an `initialize` response's top-level `_meta.steering` into the
+/// adapter's steering descriptor. `Ok(None)` when the extension is not
+/// advertised (no `steering` object, or `supported` missing / not the boolean
+/// `true`) — exactly the old `init_advertises_steering == false`.
+///
+/// Strictness is layered on what codeg CONSUMES:
+/// * `outcomes` is the whitelist the per-receipt parse runs against, so an
+///   entry codeg cannot interpret is a protocol error HERE, at the handshake,
+///   rather than mid-turn with a user message already sent.
+/// * `boundary` / `idle` are advisory hints (UI copy, opt-in choice). A future
+///   value is not worth killing the connection over, so it takes the
+///   conservative default with a warning — the initialize payload is a
+///   forward-compatibility surface.
+fn parse_steering_descriptor(
+    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Result<Option<SteeringDescriptor>, AcpError> {
+    let Some(steering) = meta
+        .and_then(|m| m.get("steering"))
+        .and_then(serde_json::Value::as_object)
+    else {
+        return Ok(None);
+    };
+    if steering
+        .get("supported")
         .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
+        != Some(true)
+    {
+        return Ok(None);
+    }
+    let boundary = match steering.get("boundary").and_then(serde_json::Value::as_str) {
+        None | Some("step") => SteerBoundary::Step,
+        Some("immediate") => SteerBoundary::Immediate,
+        Some("turnEnd") => SteerBoundary::TurnEnd,
+        Some(other) => {
+            tracing::warn!("[ACP] unknown _meta.steering.boundary {other:?}; assuming \"step\"");
+            SteerBoundary::Step
+        }
+    };
+    let idle = match steering.get("idle").and_then(serde_json::Value::as_str) {
+        None | Some("startedNewTurn") => SteerIdle::StartedNewTurn,
+        Some("promptRequired") => SteerIdle::PromptRequired,
+        Some(other) => {
+            tracing::warn!(
+                "[ACP] unknown _meta.steering.idle {other:?}; assuming \"startedNewTurn\""
+            );
+            SteerIdle::StartedNewTurn
+        }
+    };
+    let outcomes = match steering.get("outcomes") {
+        None => DEFAULT_STEER_OUTCOMES.to_vec(),
+        Some(raw) => {
+            let entries = raw.as_array().ok_or_else(|| {
+                AcpError::protocol(format!("_meta.steering.outcomes is not an array: {raw:?}"))
+            })?;
+            let mut parsed = Vec::with_capacity(entries.len());
+            for entry in entries {
+                let name = entry.as_str().ok_or_else(|| {
+                    AcpError::protocol(format!(
+                        "_meta.steering.outcomes entry is not a string: {entry:?}"
+                    ))
+                })?;
+                let outcome = steer_outcome_from_name(name).ok_or_else(|| {
+                    AcpError::protocol(format!("unknown _meta.steering.outcomes entry: {name:?}"))
+                })?;
+                parsed.push(outcome);
+            }
+            parsed
+        }
+    };
+    Ok(Some(SteeringDescriptor {
+        boundary,
+        idle,
+        outcomes,
+    }))
 }
 
 /// Whether the `initialize` response advertises the provider-neutral goal
@@ -17129,22 +17535,95 @@ fn steering_version_ok(agent_info: Option<&agent_client_protocol::schema::v1::Im
     agent_info.is_some_and(|info| version_at_least(&info.version, min))
 }
 
-/// Synthesize `SessionState.native_steering_available` from an `initialize`
-/// response: extension advertised (top-level `_meta`) AND registry policy says
-/// this agent honors `promptRequired` AND the running binary's
-/// `agent_info.version` proves it. Pure so the full gate matrix is unit-tested;
-/// `run_connection` calls it once and everything downstream reads the stored
-/// bool.
-fn synthesize_native_steering(
+/// Synthesize a connection's [`InsertCapability`] from its `initialize`
+/// response: the adapter's own descriptor plus the registry policy for its
+/// agent type / reported name. Pure so the full gate matrix is unit-tested;
+/// `run_connection` calls it once, stores the result on the session state, and
+/// `native_steering_available` is assigned as `capability.steer.is_some()` (one
+/// computation, two projections, kept in step until the legacy bool retires).
+///
+/// `pull` is NOT decided here — it mirrors the `check_user_feedback` tool,
+/// which the companion injection decides after this runs; the caller fills it.
+///
+/// Policy, in order:
+/// 1. Claude Code (built-in, or a custom agent whose RUNNING adapter reports
+///    [`registry::CLAUDE_AGENT_ACP_PACKAGE`] — see [`steering_policy_agent`])
+///    follows the registry version floor. The floor is a policy about a
+///    PROTOCOL, not about the label: a second Claude account registered as a
+///    custom npx agent must not fall through to the custom branch and silently
+///    lose the native channel it had.
+/// 2. Another custom agent whose adapter reports itself as
+///    [`registry::ADVERTISED_STEERING_AGENTS`] (zcode-acp) is admitted on its
+///    descriptor's compliance: it must opt into the `promptRequired` idle
+///    contract, which is the property codeg's turn-scoped runtime depends on.
+///    The name is a policy selector, not a security boundary — a custom agent
+///    IS an arbitrary local program, so a forged name is no harder than forged
+///    behavior.
+/// 3. A custom agent with no usable `agent_info` fails closed with a warning
+///    (same philosophy as [`steering_version_ok`]): without a name there is no
+///    policy to apply, and guessing one would hand a stranger the channel.
+///
+/// Everything else keeps `steer: None` — the message queue and the pull
+/// channel remain.
+fn synthesize_insert_capability(
     agent_type: AgentType,
-    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+    descriptor: Option<&SteeringDescriptor>,
     agent_info: Option<&agent_client_protocol::schema::v1::Implementation>,
-) -> bool {
-    init_advertises_steering(meta)
-        && registry::steering_prompt_required_min_version(steering_policy_agent(
-            agent_type, agent_info,
-        ))
-        .is_some_and(|min| steering_version_ok(agent_info, min))
+) -> InsertCapability {
+    let steer = synthesize_steer_channel(agent_type, descriptor, agent_info);
+    InsertCapability { steer, pull: false }
+}
+
+fn synthesize_steer_channel(
+    agent_type: AgentType,
+    descriptor: Option<&SteeringDescriptor>,
+    agent_info: Option<&agent_client_protocol::schema::v1::Implementation>,
+) -> Option<SteerChannel> {
+    // The whole channel is gated on the advertisement: an adapter that does not
+    // advertise `_meta.steering` has no descriptor at all.
+    let descriptor = descriptor?;
+    match steering_policy_agent(agent_type, agent_info) {
+        // Gate 1 — registry version floor (the historical three-gate synthesis:
+        // advertisement + policy + the running binary's version proof).
+        AgentType::ClaudeCode => {
+            registry::steering_prompt_required_min_version(AgentType::ClaudeCode)
+                .filter(|min| steering_version_ok(agent_info, min))
+                .map(|_| SteerChannel {
+                    boundary: descriptor.boundary,
+                })
+        }
+        AgentType::Custom(_) => {
+            let name = agent_info.map(|info| info.name.as_str());
+            match name {
+                Some(name) if registry::ADVERTISED_STEERING_AGENTS.contains(&name) => {
+                    // Gate 2 — descriptor compliance: only an adapter that
+                    // honors the idle opt-in can be steered without the
+                    // detached-turn risk.
+                    (descriptor.idle == SteerIdle::PromptRequired).then_some(SteerChannel {
+                        boundary: descriptor.boundary,
+                    })
+                }
+                Some(name) => {
+                    tracing::warn!(
+                        "[ACP][{agent_type}] steering advertised but adapter {name:?} has no \
+                         codeg policy; keeping the pull/queue channels"
+                    );
+                    None
+                }
+                // Gate 3 — fail closed without a name to match a policy on.
+                None => {
+                    tracing::warn!(
+                        "[ACP][{agent_type}] steering advertised but the adapter reported no \
+                         agentInfo; keeping the pull/queue channels"
+                    );
+                    None
+                }
+            }
+        }
+        // Every other built-in: no native policy yet (codex advertises
+        // steering but would detach a turn on the idle race).
+        _ => None,
+    }
 }
 
 /// Whose steering policy a connection follows. A custom agent whose running
@@ -23367,23 +23846,339 @@ mod tests {
     // (reuses the shared `meta_map` test helper defined above)
 
     #[test]
-    fn init_advertises_steering_reads_the_top_level_meta_flag() {
-        let on = meta_map(serde_json::json!({"steering": {"supported": true}}));
-        assert!(init_advertises_steering(Some(&on)));
-
-        let off = meta_map(serde_json::json!({"steering": {"supported": false}}));
-        assert!(!init_advertises_steering(Some(&off)));
-
-        // Wrong nesting (e.g. another convention's namespace) must not count.
-        let nested = meta_map(
-            serde_json::json!({"symposium": {"steering": {"supported": true}}}),
+    fn parse_steering_descriptor_reads_the_top_level_meta_block() {
+        // A full declaration (zcode-acp's): every consumed field is honored.
+        let full = meta_map(serde_json::json!({"steering": {
+            "supported": true,
+            "method": "_session/steering",
+            "tier": "extension",
+            "boundary": "immediate",
+            "idle": "promptRequired",
+            "settlesOwnerTurn": false,
+            "outcomes": ["injected", "queued", "promptRequired", "startedNewTurn", "failed"],
+        }}));
+        let d = parse_steering_descriptor(Some(&full)).unwrap().unwrap();
+        assert_eq!(d.boundary, SteerBoundary::Immediate);
+        assert_eq!(d.idle, SteerIdle::PromptRequired);
+        assert_eq!(
+            d.outcomes,
+            vec![
+                SteerOutcome::Injected,
+                SteerOutcome::Queued,
+                SteerOutcome::PromptRequired,
+                SteerOutcome::StartedNewTurn,
+                SteerOutcome::Failed,
+            ]
         );
-        assert!(!init_advertises_steering(Some(&nested)));
 
-        // Non-bool / absent → false.
-        let stringly = meta_map(serde_json::json!({"steering": {"supported": "true"}}));
-        assert!(!init_advertises_steering(Some(&stringly)));
-        assert!(!init_advertises_steering(None));
+        // The historical advertisement (claude-agent-acp 0.61+ / codex-acp):
+        // only `supported`, everything else takes its conservative default —
+        // `step` for the UI copy, and the idle behavior both official adapters
+        // actually have.
+        let bare = meta_map(serde_json::json!({"steering": {"supported": true}}));
+        let d = parse_steering_descriptor(Some(&bare)).unwrap().unwrap();
+        assert_eq!(d.boundary, SteerBoundary::Step);
+        assert_eq!(d.idle, SteerIdle::StartedNewTurn);
+        assert_eq!(d.outcomes, DEFAULT_STEER_OUTCOMES.to_vec());
+
+        // Unknown ADVISORY values take their conservative defaults with a
+        // warning rather than an error: the initialize payload is a
+        // forward-compatibility surface, and a hint codeg can't read is not
+        // worth killing the connection over.
+        let future = meta_map(serde_json::json!({"steering": {
+            "supported": true,
+            "boundary": "drain",
+            "idle": "waitForClient",
+        }}));
+        let d = parse_steering_descriptor(Some(&future)).unwrap().unwrap();
+        assert_eq!(d.boundary, SteerBoundary::Step);
+        assert_eq!(d.idle, SteerIdle::StartedNewTurn);
+
+        // Not advertised: missing block / `false` / non-bool all yield `None` —
+        // the old `init_advertises_steering` bool gate, arm for arm.
+        for value in [
+            serde_json::json!({}),
+            serde_json::json!({"steering": {"supported": false}}),
+            serde_json::json!({"steering": {"supported": "true"}}),
+            // Wrong nesting (e.g. another convention's namespace) must not count.
+            serde_json::json!({"symposium": {"steering": {"supported": true}}}),
+        ] {
+            let meta = meta_map(value);
+            assert!(parse_steering_descriptor(Some(&meta)).unwrap().is_none());
+        }
+        assert!(parse_steering_descriptor(None).unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_steering_descriptor_rejects_an_outcome_vocabulary_it_cannot_parse() {
+        // `outcomes` is the whitelist the per-receipt parse runs against, so an
+        // entry codeg cannot interpret must fail HERE, at the handshake —
+        // discovering it mid-turn would mean erroring after the user's message
+        // was already handed to the adapter.
+        for outcomes in [
+            serde_json::json!(["injected", "warpSpeed"]),
+            serde_json::json!(["injected", 1]),
+            serde_json::json!("injected"),
+        ] {
+            let meta = meta_map(
+                serde_json::json!({"steering": {"supported": true, "outcomes": outcomes}}),
+            );
+            assert!(
+                parse_steering_descriptor(Some(&meta)).is_err(),
+                "must reject: {outcomes:?}"
+            );
+        }
+    }
+
+    /// The `outcome` vocabulary is layered on what was DECLARED: the historical
+    /// three parse for every adapter, `queued`/`failed` only for one that
+    /// advertised them, and nothing else ever.
+    #[test]
+    fn parse_steer_outcome_gates_the_new_vocabulary_on_the_declaration() {
+        let queued = serde_json::json!({"outcome": "queued"});
+        let failed = serde_json::json!({"outcome": "failed"});
+        let historical = DEFAULT_STEER_OUTCOMES.to_vec();
+        let declared = vec![
+            SteerOutcome::Injected,
+            SteerOutcome::Queued,
+            SteerOutcome::PromptRequired,
+            SteerOutcome::StartedNewTurn,
+            SteerOutcome::Failed,
+        ];
+
+        // Historical three: always parse, declared or not.
+        for (wire, expected) in [
+            (
+                serde_json::json!({"outcome": "injected"}),
+                SteerOutcome::Injected,
+            ),
+            (
+                serde_json::json!({"outcome": "promptRequired", "reason": "noRunningTurn"}),
+                SteerOutcome::PromptRequired,
+            ),
+            (
+                serde_json::json!({"outcome": "startedNewTurn"}),
+                SteerOutcome::StartedNewTurn,
+            ),
+        ] {
+            assert_eq!(
+                parse_steer_outcome(&wire, &historical).unwrap().outcome,
+                expected
+            );
+            assert_eq!(
+                parse_steer_outcome(&wire, &declared).unwrap().outcome,
+                expected
+            );
+        }
+
+        // `queued` / `failed` only for an adapter that promised them.
+        assert_eq!(
+            parse_steer_outcome(&queued, &declared).unwrap().outcome,
+            SteerOutcome::Queued
+        );
+        assert!(parse_steer_outcome(&queued, &historical).is_err());
+        assert!(parse_steer_outcome(&failed, &historical).is_err());
+        assert_eq!(
+            parse_steer_outcome(&failed, &declared).unwrap().outcome,
+            SteerOutcome::Failed
+        );
+
+        // Unknown or missing outcome is a protocol error, not a silent
+        // success — the caller must know whether the content was consumed.
+        for wire in [
+            serde_json::json!({"outcome": "warpSpeed"}),
+            serde_json::json!({}),
+            serde_json::json!({"outcome": 1}),
+        ] {
+            assert!(parse_steer_outcome(&wire, &declared).is_err(), "{wire:?}");
+        }
+
+        // The adapter's own finer state rides along when it reports one
+        // (zcode's `_meta.steering.steerState`), and is absent otherwise.
+        let with_state = serde_json::json!({
+            "outcome": "queued",
+            "_meta": {"steering": {"delivery": "queue", "steerState": "fellBack"}}
+        });
+        let receipt = parse_steer_outcome(&with_state, &declared).unwrap();
+        assert_eq!(receipt.steer_state.as_deref(), Some("fellBack"));
+        assert_eq!(
+            parse_steer_outcome(&queued, &declared).unwrap().steer_state,
+            None
+        );
+    }
+
+    #[test]
+    fn synthesize_insert_capability_requires_all_three_claude_gates() {
+        use agent_client_protocol::schema::v1::Implementation;
+        let advertised = meta_map(serde_json::json!({"steering": {"supported": true}}));
+        let descriptor = parse_steering_descriptor(Some(&advertised)).unwrap();
+        let proven = Implementation::new("claude-agent-acp", "0.65.0");
+        let stale = Implementation::new("claude-agent-acp", "0.64.1");
+        let cap = |agent_type, descriptor, agent_info| {
+            synthesize_insert_capability(agent_type, descriptor, agent_info)
+        };
+
+        // All three gates → the steer channel, carrying the declared boundary.
+        assert_eq!(
+            cap(AgentType::ClaudeCode, descriptor.as_ref(), Some(&proven)).steer,
+            Some(SteerChannel {
+                boundary: SteerBoundary::Step
+            })
+        );
+        // Registry policy gate: codex advertises steering but has no
+        // promptRequired minimum — never native, whatever it reports.
+        assert_eq!(
+            cap(AgentType::Codex, descriptor.as_ref(), Some(&proven)).steer,
+            None
+        );
+        // Runtime proof gate: 0.64.1 advertises steering identically but still
+        // settles the owning prompt on a mid-generation `injected` (#934, fixed
+        // in 0.65.0 by #958). Launch prefers a PATH-resolved install over the
+        // pinned package, so this arm is what keeps such a user on the pull
+        // channel — as does a missing `agent_info`.
+        assert_eq!(
+            cap(AgentType::ClaudeCode, descriptor.as_ref(), Some(&stale)).steer,
+            None
+        );
+        assert_eq!(
+            cap(AgentType::ClaudeCode, descriptor.as_ref(), None).steer,
+            None
+        );
+        // Advertisement gate.
+        assert_eq!(cap(AgentType::ClaudeCode, None, Some(&proven)).steer, None);
+    }
+
+    /// #892: a custom entry running claude-agent-acp (a second Claude account,
+    /// say) follows the Claude Code policy — the remap runs BEFORE the custom
+    /// branch, so it can never fall through to the whitelist branch and lose a
+    /// channel it had. The advertisement and the version floor still gate it.
+    #[test]
+    fn a_custom_agent_running_claude_agent_acp_steers_natively() {
+        use agent_client_protocol::schema::v1::Implementation;
+        let advertised = meta_map(serde_json::json!({"steering": {"supported": true}}));
+        let descriptor = parse_steering_descriptor(Some(&advertised)).unwrap();
+        let claude = Implementation::new(registry::CLAUDE_AGENT_ACP_PACKAGE, "0.85.1");
+        let claude_stale = Implementation::new(registry::CLAUDE_AGENT_ACP_PACKAGE, "0.64.1");
+        let custom = AgentType::Custom("claude-code-2");
+
+        assert!(
+            synthesize_insert_capability(custom, descriptor.as_ref(), Some(&claude))
+                .steer
+                .is_some()
+        );
+        assert_eq!(
+            steering_policy_agent(custom, Some(&claude)),
+            AgentType::ClaudeCode
+        );
+        // The floor still holds, and so do the advertisement and the proof.
+        assert_eq!(
+            synthesize_insert_capability(custom, descriptor.as_ref(), Some(&claude_stale)).steer,
+            None
+        );
+        assert_eq!(
+            synthesize_insert_capability(custom, descriptor.as_ref(), None).steer,
+            None
+        );
+        assert_eq!(
+            synthesize_insert_capability(custom, None, Some(&claude)).steer,
+            None
+        );
+        // Only the exact name: another adapter, or a look-alike without the
+        // scope, keeps the pull channel.
+        for name in [
+            "acme-acp",
+            "claude-agent-acp",
+            "@agentclientprotocol/claude-agent-acp-fork",
+        ] {
+            let other = Implementation::new(name, "0.85.1");
+            assert_eq!(
+                synthesize_insert_capability(custom, descriptor.as_ref(), Some(&other)).steer,
+                None,
+                "{name}"
+            );
+            assert_eq!(
+                steering_policy_agent(custom, Some(&other)),
+                custom,
+                "{name}"
+            );
+        }
+        // A built-in type is never remapped by what its adapter reports.
+        assert_eq!(
+            synthesize_insert_capability(AgentType::Codex, descriptor.as_ref(), Some(&claude))
+                .steer,
+            None
+        );
+        assert_eq!(
+            steering_policy_agent(AgentType::Codex, Some(&claude)),
+            AgentType::Codex
+        );
+    }
+
+    /// P2: zcode-acp is admitted on its own descriptor — the whitelist selects
+    /// the policy, the descriptor's `idle` proves the property the policy
+    /// exists for, and the declared `boundary` rides into the capability.
+    #[test]
+    fn zcode_acp_is_admitted_by_name_on_a_compliant_descriptor() {
+        use agent_client_protocol::schema::v1::Implementation;
+        let zcode = Implementation::new("zcode-acp", "0.9.1");
+        let custom = AgentType::Custom("zcode");
+        let compliant = meta_map(serde_json::json!({"steering": {
+            "supported": true,
+            "boundary": "step",
+            "idle": "promptRequired",
+            "outcomes": ["injected", "queued", "promptRequired", "startedNewTurn", "failed"],
+        }}));
+        let compliant = parse_steering_descriptor(Some(&compliant)).unwrap();
+
+        assert_eq!(
+            synthesize_insert_capability(custom, compliant.as_ref(), Some(&zcode)).steer,
+            Some(SteerChannel {
+                boundary: SteerBoundary::Step
+            })
+        );
+
+        // An immediate/turnEnd boundary is carried through — the copy is the
+        // only thing it changes.
+        let immediate = meta_map(serde_json::json!({
+            "steering": {"supported": true, "boundary": "turnEnd", "idle": "promptRequired"},
+        }));
+        let immediate = parse_steering_descriptor(Some(&immediate)).unwrap();
+        assert_eq!(
+            synthesize_insert_capability(custom, immediate.as_ref(), Some(&zcode)).steer,
+            Some(SteerChannel {
+                boundary: SteerBoundary::TurnEnd
+            })
+        );
+
+        // Descriptor compliance gate: an adapter that does not honor the idle
+        // opt-in may not be steered (its turn-end race detaches a turn).
+        let non_compliant = meta_map(serde_json::json!({
+            "steering": {"supported": true, "idle": "startedNewTurn"},
+        }));
+        let non_compliant = parse_steering_descriptor(Some(&non_compliant)).unwrap();
+        assert_eq!(
+            synthesize_insert_capability(custom, non_compliant.as_ref(), Some(&zcode)).steer,
+            None
+        );
+
+        // A built-in's own policy is never remapped by a matching name.
+        assert_eq!(
+            synthesize_insert_capability(AgentType::Gemini, compliant.as_ref(), Some(&zcode)).steer,
+            None
+        );
+
+        // Any other custom name keeps the pull/queue channels, and a custom
+        // agent that reported NO name fails closed — there is no policy to
+        // match, and guessing one would hand a stranger the channel.
+        let other = Implementation::new("some-other-acp", "1.0.0");
+        assert_eq!(
+            synthesize_insert_capability(custom, compliant.as_ref(), Some(&other)).steer,
+            None
+        );
+        assert_eq!(
+            synthesize_insert_capability(custom, compliant.as_ref(), None).steer,
+            None
+        );
     }
 
     /// claude-agent-acp 0.92.0's `initialize` answer, as its own scenario harness
@@ -24722,90 +25517,28 @@ mod tests {
         );
     }
 
-    #[test]
-    fn synthesize_native_steering_requires_all_three_gates() {
-        use agent_client_protocol::schema::v1::Implementation;
-        let advertised = meta_map(serde_json::json!({"steering": {"supported": true}}));
-        let proven = Implementation::new("claude-agent-acp", "0.65.0");
-        let stale = Implementation::new("claude-agent-acp", "0.64.1");
-
-        // All three gates → native.
-        assert!(synthesize_native_steering(
-            AgentType::ClaudeCode,
-            Some(&advertised),
-            Some(&proven)
-        ));
-        // Registry policy gate: codex advertises steering but has no
-        // promptRequired minimum — never native, whatever it reports.
-        assert!(!synthesize_native_steering(
-            AgentType::Codex,
-            Some(&advertised),
-            Some(&proven)
-        ));
-        // Runtime proof gate: 0.64.1 advertises steering identically but still
-        // settles the owning prompt on a mid-generation `injected` (#934, fixed
-        // in 0.65.0 by #958). Launch prefers a PATH-resolved install over the
-        // pinned package, so this arm is what keeps such a user on the pull
-        // channel — as does a missing `agent_info`.
-        assert!(!synthesize_native_steering(
-            AgentType::ClaudeCode,
-            Some(&advertised),
-            Some(&stale)
-        ));
-        assert!(!synthesize_native_steering(
-            AgentType::ClaudeCode,
-            Some(&advertised),
-            None
-        ));
-        // Advertisement gate.
-        assert!(!synthesize_native_steering(
-            AgentType::ClaudeCode,
-            None,
-            Some(&proven)
-        ));
-    }
-
     /// #892: a custom entry running claude-agent-acp (a second Claude account,
     /// say) follows the Claude Code policy, picked by the name its running
-    /// adapter reports; the advertisement and the version floor gate it as
-    /// they gate the built-in agent.
+    /// adapter reports. (The synthesis matrix lives in
+    /// `a_custom_agent_running_claude_agent_acp_steers_natively`.)
     #[test]
-    fn a_custom_agent_running_claude_agent_acp_steers_natively() {
+    fn steering_policy_agent_remaps_only_an_exact_claude_agent_acp_name() {
         use agent_client_protocol::schema::v1::Implementation;
-        let advertised = meta_map(serde_json::json!({"steering": {"supported": true}}));
         let claude = Implementation::new(registry::CLAUDE_AGENT_ACP_PACKAGE, "0.85.1");
-        let claude_stale = Implementation::new(registry::CLAUDE_AGENT_ACP_PACKAGE, "0.64.1");
         let custom = AgentType::Custom("claude-code-2");
 
-        assert!(synthesize_native_steering(
-            custom,
-            Some(&advertised),
-            Some(&claude)
-        ));
         assert_eq!(
             steering_policy_agent(custom, Some(&claude)),
             AgentType::ClaudeCode
         );
-        // The floor still holds, and so do the advertisement and the proof.
-        assert!(!synthesize_native_steering(
-            custom,
-            Some(&advertised),
-            Some(&claude_stale)
-        ));
-        assert!(!synthesize_native_steering(custom, None, Some(&claude)));
-        assert!(!synthesize_native_steering(custom, Some(&advertised), None));
         // Only the exact name: another adapter, or a look-alike without the
-        // scope, keeps the pull channel.
+        // scope, keeps its own (absent) policy.
         for name in [
             "acme-acp",
             "claude-agent-acp",
             "@agentclientprotocol/claude-agent-acp-fork",
         ] {
             let other = Implementation::new(name, "0.85.1");
-            assert!(
-                !synthesize_native_steering(custom, Some(&advertised), Some(&other)),
-                "{name}"
-            );
             assert_eq!(
                 steering_policy_agent(custom, Some(&other)),
                 custom,
@@ -24813,11 +25546,6 @@ mod tests {
             );
         }
         // A built-in type is never remapped by what its adapter reports.
-        assert!(!synthesize_native_steering(
-            AgentType::Codex,
-            Some(&advertised),
-            Some(&claude)
-        ));
         assert_eq!(
             steering_policy_agent(AgentType::Codex, Some(&claude)),
             AgentType::Codex
@@ -24872,30 +25600,6 @@ mod tests {
         assert_eq!(params["prompt"][1]["data"], "aGk=");
         assert_eq!(params["prompt"][1]["mimeType"], "image/png");
         assert_eq!(params["_meta"]["steering"]["idleBehavior"], "promptRequired");
-    }
-
-    #[test]
-    fn parse_steer_outcome_maps_the_wire_strings_and_rejects_unknowns() {
-        assert_eq!(
-            parse_steer_outcome(&serde_json::json!({"outcome": "injected"})).unwrap(),
-            SteerOutcome::Injected
-        );
-        assert_eq!(
-            parse_steer_outcome(
-                &serde_json::json!({"outcome": "promptRequired", "reason": "noRunningTurn"})
-            )
-            .unwrap(),
-            SteerOutcome::PromptRequired
-        );
-        assert_eq!(
-            parse_steer_outcome(&serde_json::json!({"outcome": "startedNewTurn"})).unwrap(),
-            SteerOutcome::StartedNewTurn
-        );
-        // Unknown or missing outcome is a protocol error, not a silent
-        // success — the caller must know whether the content was consumed.
-        assert!(parse_steer_outcome(&serde_json::json!({"outcome": "queued"})).is_err());
-        assert!(parse_steer_outcome(&serde_json::json!({})).is_err());
-        assert!(parse_steer_outcome(&serde_json::json!({"outcome": 1})).is_err());
     }
 
     #[test]
@@ -38285,6 +38989,8 @@ mod tests {
                     blocks: vec![PromptInputBlock::Text { text: text.into() }],
                     user_message: None,
                     internal_suffix: Vec::new(),
+                    source: None,
+                    preempt: false,
                 })
                 .await
                 .expect("the loop is running");
@@ -39450,6 +40156,8 @@ mod tests {
                     blocks: vec![PromptInputBlock::Text { text: text.into() }],
                     user_message: None,
                     internal_suffix: Vec::new(),
+                    source: None,
+                    preempt: false,
                 })
                 .await
                 .expect("the loop is running");
@@ -39464,7 +40172,7 @@ mod tests {
             .await;
         }
 
-        async fn steer(&self, text: &str) -> Result<SteerOutcome, AcpError> {
+        async fn steer(&self, text: &str) -> Result<SteerReceipt, AcpError> {
             let (reply, outcome) = oneshot::channel();
             self.cmd_tx
                 .send(ConnectionCommand::Steer {
@@ -39535,7 +40243,10 @@ mod tests {
         claude.open_turn("ask me which database to use").await;
 
         let outcome = claude.steer("never mind, keep SQLite").await;
-        assert!(matches!(outcome, Ok(SteerOutcome::Injected)), "{outcome:?}");
+        assert!(
+            matches!(outcome, Ok(ref r) if r.outcome == SteerOutcome::Injected),
+            "{outcome:?}"
+        );
         assert_eq!(
             *claude.sweeps_at_steer.lock().unwrap(),
             vec![1],
@@ -40087,6 +40798,8 @@ mod tests {
                     }],
                     user_message: None,
                     internal_suffix: Vec::new(),
+                    source: None,
+                    preempt: false,
                 })
                 .await
                 .expect("the loop is running");
@@ -40560,8 +41273,13 @@ mod tests {
     // the IDLE loop with no `session/prompt` around it. Driven over the real
     // runtime with the scripted-agent plumbing of the Grok loop tests above.
 
-    /// The custom agent these loop tests drive. Deliberately unregistered:
-    /// nothing on the recording path looks the id up.
+    /// The custom agent the interrupt loop tests drive. Deliberately
+    /// unregistered: nothing on the recording path looks the id up.
+    ///
+    /// The transcript-reading tests below start their loops with unique ids
+    /// instead: a writer not pinned to their `CODEG_HOME` resolves the root
+    /// per write, so a shared agent directory would mix its records into the
+    /// file being read.
     const IDLE_PROBE_AGENT: &str = "idle-probe";
 
     fn custom_update(update: serde_json::Value) -> GrokFrame {
@@ -40631,13 +41349,14 @@ mod tests {
     }
 
     impl CustomLoop {
-        async fn start(turns: Vec<Vec<GrokFrame>>) -> Self {
-            let agent_type = AgentType::custom(IDLE_PROBE_AGENT).expect("a valid custom id");
+        async fn start(agent_id: &str, turns: Vec<Vec<GrokFrame>>) -> Self {
+            let agent_type = AgentType::custom(agent_id).expect("a valid custom id");
             Self::start_for(agent_type, turns).await
         }
 
         async fn start_for(agent_type: AgentType, turns: Vec<Vec<GrokFrame>>) -> Self {
             use agent_client_protocol::schema::v1::PromptResponse;
+
             let turns = Arc::new(std::sync::Mutex::new(VecDeque::from(turns)));
             let respond = Arc::new(tokio::sync::Notify::new());
             let agent_respond = Arc::clone(&respond);
@@ -40782,6 +41501,8 @@ mod tests {
                     }],
                     user_message: None,
                     internal_suffix: Vec::new(),
+                    source: None,
+                    preempt: false,
                 })
                 .await
                 .expect("the loop is running");
@@ -40806,7 +41527,7 @@ mod tests {
         }
 
         /// Steer the running turn the way `submit_feedback_native` does.
-        async fn steer(&self, text: &str) -> Result<SteerOutcome, AcpError> {
+        async fn steer(&self, text: &str) -> Result<SteerReceipt, AcpError> {
             let (reply, outcome) = oneshot::channel();
             self.cmd_tx
                 .send(ConnectionCommand::Steer {
@@ -41280,7 +42001,8 @@ mod tests {
         // The recorder resolves its root from the process-global `CODEG_HOME`;
         // temp_env serializes this against every other test that pins it.
         let turns = temp_env::async_with_vars([("CODEG_HOME", Some(home_str.as_str()))], async {
-            let mut lp = CustomLoop::start(vec![
+            let agent_id = "idle-probe-history";
+            let mut lp = CustomLoop::start(agent_id, vec![
                 vec![
                     custom_update(serde_json::json!({
                         "sessionUpdate": "tool_call",
@@ -41322,7 +42044,7 @@ mod tests {
             // history.
             lp.run_turn("thanks", "You're welcome.").await;
             lp.shutdown().await;
-            recorded_custom_turns().await
+            recorded_custom_turns(agent_id).await
         })
         .await;
 
@@ -41346,13 +42068,13 @@ mod tests {
     /// after the session's records lands only once they have. Waiting for that
     /// one with room for a stalled CI runner — the loop's own wait on its turn
     /// end gives up after 2s — is what lets the read see the whole file.
-    async fn recorded_custom_turns() -> Vec<crate::models::message::MessageTurn> {
+    async fn recorded_custom_turns(agent_id: &str) -> Vec<crate::models::message::MessageTurn> {
         use crate::parsers::AgentParser as _;
 
         let root = crate::paths::codeg_acp_transcripts_root();
         let barrier = crate::acp_transcript::record_entry_in(
             &root,
-            IDLE_PROBE_AGENT,
+            agent_id,
             "writer-barrier",
             crate::acp_transcript::EntryKind::TurnEnd,
             serde_json::json!({"stopReason": "end_turn"}),
@@ -41363,7 +42085,7 @@ mod tests {
             .expect("the barrier record landed");
 
         crate::parsers::acp_native::AcpNativeParser::new_in(
-            AgentType::custom(IDLE_PROBE_AGENT).expect("a valid custom id"),
+            AgentType::custom(agent_id).expect("a valid custom id"),
             root,
         )
         .get_conversation("s1")
@@ -41384,7 +42106,8 @@ mod tests {
         let home_str = home.path().to_string_lossy().into_owned();
         let (turns, transcript) =
             temp_env::async_with_vars([("CODEG_HOME", Some(home_str.as_str()))], async {
-                let mut lp = CustomLoop::start(vec![vec![
+                let agent_id = "idle-probe-steer";
+                let mut lp = CustomLoop::start(agent_id, vec![vec![
                     custom_update(serde_json::json!({
                         "sessionUpdate": "tool_call",
                         "toolCallId": "job-1",
@@ -41405,16 +42128,16 @@ mod tests {
                 lp.open_turn("build the page", "Building the page.").await;
                 assert!(matches!(
                     lp.steer("not taken in").await,
-                    Ok(SteerOutcome::PromptRequired)
+                    Ok(r) if r.outcome == SteerOutcome::PromptRequired
                 ));
                 assert!(matches!(
                     lp.steer("detached").await,
-                    Ok(SteerOutcome::StartedNewTurn)
+                    Ok(r) if r.outcome == SteerOutcome::StartedNewTurn
                 ));
                 assert!(lp.steer("garbled").await.is_err());
                 assert!(matches!(
                     lp.steer("make it blue").await,
-                    Ok(SteerOutcome::Injected)
+                    Ok(r) if r.outcome == SteerOutcome::Injected
                 ));
                 lp.agent_sends(vec![
                     custom_update(serde_json::json!({
@@ -41429,10 +42152,10 @@ mod tests {
                 lp.close_turn().await;
                 lp.shutdown().await;
 
-                let turns = recorded_custom_turns().await;
+                let turns = recorded_custom_turns(agent_id).await;
                 let transcript = std::fs::read_to_string(
                     crate::paths::codeg_acp_transcripts_root()
-                        .join(IDLE_PROBE_AGENT)
+                        .join(agent_id)
                         .join("s1.jsonl"),
                 )
                 .expect("the transcript file");
@@ -42443,5 +43166,472 @@ mod trae_handshake_tests {
                 "{agent_type}"
             );
         }
+    }
+
+    /// N3: a `queued` steer is CONSUMED (the adapter will run it after the
+    /// running turn), and zcode's bridge never echoes the user message into the
+    /// ACP stream — so the loop must record it exactly like an injection, or
+    /// the message would be permanently absent from a custom agent's history
+    /// (which IS codeg's transcript). `promptRequired` — the unconsumed arm,
+    /// covered above — stays unrecorded.
+    #[tokio::test]
+    async fn a_queued_steer_a_custom_agent_accepted_is_recorded_too() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let home_str = home.path().to_string_lossy().into_owned();
+        let (turns, transcript) =
+            temp_env::async_with_vars([("CODEG_HOME", Some(home_str.as_str()))], async {
+                let agent_id = "idle-probe-queued-steer";
+                let mut lp =
+                    CustomLoop::start(agent_id, vec![vec![custom_text("Building the page.")]])
+                        .await;
+                // What zcode advertises at initialize: the extended vocabulary.
+                lp.state.write().await.steering_outcomes = vec![
+                    SteerOutcome::Injected,
+                    SteerOutcome::Queued,
+                    SteerOutcome::PromptRequired,
+                    SteerOutcome::StartedNewTurn,
+                    SteerOutcome::Failed,
+                ];
+                lp.steer_outcomes.lock().unwrap().extend([
+                    serde_json::json!({
+                        "outcome": "queued",
+                        "_meta": {"steering": {"delivery": "queue", "steerState": "fellBack"}}
+                    }),
+                ]);
+
+                lp.open_turn("build the page", "Building the page.").await;
+                let receipt = lp.steer("run this after the turn").await.unwrap();
+                assert_eq!(receipt.outcome, SteerOutcome::Queued);
+                assert_eq!(receipt.steer_state.as_deref(), Some("fellBack"));
+                lp.agent_sends(vec![custom_text("Page built.")]);
+                lp.until_text("Page built.").await;
+                lp.close_turn().await;
+                lp.shutdown().await;
+
+                let turns = recorded_custom_turns(agent_id).await;
+                let transcript = std::fs::read_to_string(
+                    crate::paths::codeg_acp_transcripts_root()
+                        .join(agent_id)
+                        .join("s1.jsonl"),
+                )
+                .expect("the transcript file");
+                (turns, transcript)
+            })
+            .await;
+
+        // The queued message is a user turn of its own in the rebuilt history,
+        // exactly where the live view drew it.
+        assert_eq!(
+            turn_shape(&turns),
+            vec![
+                r#"User: text "build the page""#,
+                r#"Assistant: text "Building the page.""#,
+                r#"User: text "run this after the turn""#,
+                r#"Assistant: text "Page built.""#,
+            ]
+        );
+        let steers: Vec<serde_json::Value> = transcript
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|entry| entry.get("s") == Some(&serde_json::Value::Bool(true)))
+            .collect();
+        assert_eq!(steers.len(), 1, "{transcript}");
+        assert_eq!(steers[0]["k"], "prompt");
+        assert_eq!(
+            steers[0]["p"],
+            serde_json::json!([{"type": "text", "text": "run this after the turn"}])
+        );
+    }
+
+    // ── Interrupt-and-send at the loop level (P3) ───────────────────────────
+    //
+    // The admission side (the `turn_in_flight` gate, the `preempt_pending`
+    // single-flight, the linked path's side effects) is covered by the manager
+    // tests. What only the real loop can prove is the wire order the handover
+    // produces: the cancel reaching the agent STRICTLY before the interrupting
+    // prompt's own blocks, the new turn opening on the gate the cancelled one
+    // held (no `Connected` edge in between for the frontend's queue flush to
+    // race), and a second interrupt against that new turn running the same
+    // sequence again.
+
+    /// The text of a prompt's blocks, for the echo the scripted agent answers
+    /// with. The fixture's prompts are single text blocks by construction.
+    fn preempt_prompt_text(blocks: &[ContentBlock]) -> String {
+        blocks
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("|")
+    }
+
+    /// `run_conversation_loop` for the interrupt tests. Every `session/prompt`
+    /// the agent receives is recorded with its blocks (text), answered with one
+    /// scripted frame ("reply to …"), and its response HELD until the test
+    /// releases it — so the turn stays open across the whole interrupt. Every
+    /// `session/cancel` is recorded on the same ledger, which makes the wire
+    /// order ("cancel before the new prompt") directly assertable. Gated holds
+    /// are released oldest-first by [`PreemptLoop::release_next`].
+    struct PreemptLoop {
+        state: Arc<RwLock<SessionState>>,
+        cmd_tx: mpsc::Sender<ConnectionCommand>,
+        events: tokio::sync::broadcast::Receiver<Arc<crate::acp::types::EventEnvelope>>,
+        /// Every event the loop emitted so far, in order.
+        seen: Vec<AcpEvent>,
+        /// What the agent received, in arrival order: `prompt:<text>` / `cancel`.
+        received: Arc<std::sync::Mutex<Vec<String>>>,
+        /// One releaser per held prompt response, oldest first.
+        holds: Arc<std::sync::Mutex<VecDeque<oneshot::Sender<()>>>>,
+        client: tokio::task::JoinHandle<()>,
+        agent: tokio::task::JoinHandle<()>,
+    }
+
+    impl PreemptLoop {
+        async fn start() -> Self {
+            use agent_client_protocol::schema::v1::PromptResponse;
+
+            let agent_type = AgentType::custom(IDLE_PROBE_AGENT).expect("a valid custom id");
+            let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let holds = Arc::new(std::sync::Mutex::new(VecDeque::new()));
+            let agent_received_prompt = Arc::clone(&received);
+            let agent_received_cancel = Arc::clone(&received);
+            let agent_holds = Arc::clone(&holds);
+            let (client_end, agent_end) = agent_client_protocol::Channel::duplex();
+
+            let agent = tokio::spawn(async move {
+                let _ = Agent
+                    .builder()
+                    .on_receive_request(
+                        async |_req: NewSessionRequest,
+                               responder: Responder<NewSessionResponse>,
+                               _cx: ConnectionTo<Client>| {
+                            responder.respond(NewSessionResponse::new(SessionId::new("s1")))
+                        },
+                        on_receive_request!(),
+                    )
+                    .on_receive_request(
+                        async move |req: PromptRequest,
+                                    responder: Responder<PromptResponse>,
+                                    cx: ConnectionTo<Client>| {
+                            let text = preempt_prompt_text(&req.prompt);
+                            agent_received_prompt
+                                .lock()
+                                .unwrap()
+                                .push(format!("prompt:{text}"));
+                            // Register the releaser BEFORE streaming, so a test
+                            // that sees the frame can release immediately.
+                            let (release, released) = oneshot::channel::<()>();
+                            agent_holds.lock().unwrap().push_back(release);
+                            send_grok_frames(&cx, &[custom_text(&format!("reply to {text}"))])?;
+                            // Off the handler, so the held response doesn't hold
+                            // up the agent's other incoming messages — the
+                            // cancel that the interrupt sends while this turn is
+                            // still open has to be read.
+                            tokio::spawn(async move {
+                                let _ = released.await;
+                                responder.respond(PromptResponse::new(StopReason::EndTurn))
+                            });
+                            Ok(())
+                        },
+                        on_receive_request!(),
+                    )
+                    .on_receive_notification(
+                        async move |_cancel: CancelNotification, _cx: ConnectionTo<Client>| {
+                            agent_received_cancel.lock().unwrap().push("cancel".into());
+                            Ok(())
+                        },
+                        on_receive_notification!(),
+                    )
+                    .connect_with(agent_end, async |_cx: ConnectionTo<Client>| {
+                        std::future::pending::<Result<(), agent_client_protocol::Error>>().await
+                    })
+                    .await;
+            });
+
+            let state = Arc::new(RwLock::new(SessionState::new(
+                "conn-preempt".to_string(),
+                agent_type,
+                None,
+                "win".to_string(),
+                None,
+            )));
+            let events = state.read().await.event_stream().subscribe();
+            let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+            let loop_state = Arc::clone(&state);
+            let client = tokio::spawn(async move {
+                let _ = Client
+                    .builder()
+                    .connect_with(client_end, async move |cx: ConnectionTo<Agent>| {
+                        let raw = cx
+                            .send_request_to(
+                                Agent,
+                                UntypedMessage::new("session/new", NewSessionRequest::new("/tmp"))?,
+                            )
+                            .block_task()
+                            .await?;
+                        let response: NewSessionResponse = serde_json::from_value(raw)
+                            .map_err(agent_client_protocol::Error::into_internal_error)?;
+                        let mut session = AgentSession::attach(&cx, response)?;
+                        let perms = PendingPermissions::default();
+                        let ledger = background_watch::PromptLedger::shared();
+                        let stderr_tail = Arc::new(StderrTail::new());
+                        run_conversation_loop(
+                            &mut session,
+                            "conn-preempt",
+                            &EventEmitter::Noop,
+                            &loop_state,
+                            agent_type,
+                            &perms,
+                            &mut cmd_rx,
+                            Arc::new(TerminalRuntime::with_base_env(BTreeMap::new())),
+                            "/tmp",
+                            false,
+                            &ledger,
+                            None,
+                            &stderr_tail,
+                        )
+                        .await?;
+                        Ok(())
+                    })
+                    .await;
+            });
+
+            Self {
+                state,
+                cmd_tx,
+                events,
+                seen: Vec::new(),
+                received,
+                holds,
+                client,
+                agent,
+            }
+        }
+
+        /// What the agent has received so far, in order.
+        fn received(&self) -> Vec<String> {
+            self.received.lock().unwrap().clone()
+        }
+
+        /// Send one `ConnectionCommand::Prompt` the way the manager does. The
+        /// gate is the test's own setup: an ordinary prompt is admitted with
+        /// `turn_in_flight` already held (as `send_prompt_inner` leaves it).
+        async fn send_prompt(&self, text: &str, preempt: bool) {
+            self.cmd_tx
+                .send(ConnectionCommand::Prompt {
+                    blocks: vec![PromptInputBlock::Text { text: text.into() }],
+                    user_message: None,
+                    source: None,
+                    preempt,
+                })
+                .await
+                .expect("the loop is running");
+        }
+
+        /// Claim the hand-over the way `prompt_interrupt` does, inside the
+        /// state lock that decides the prompt is an interrupt. Refuses to
+        /// overwrite an existing claim: a second interrupt in that window is
+        /// what the manager answers `TurnInProgress`, so the loop must never
+        /// see one.
+        async fn claim_preempt(&self) {
+            let mut s = self.state.write().await;
+            assert!(
+                !s.preempt_pending,
+                "the manager refuses a second interrupt instead of overwriting the claim"
+            );
+            s.preempt_pending = true;
+        }
+
+        /// Release the oldest held prompt response — the test releases the
+        /// turns in the order the agent received them.
+        async fn release_next(&self) {
+            let deadline = std::time::Duration::from_secs(10);
+            let release = tokio::time::timeout(deadline, async {
+                loop {
+                    if let Some(release) = self.holds.lock().unwrap().pop_front() {
+                        break release;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("a held prompt response to release");
+            release.send(()).expect("the responder is waiting");
+        }
+
+        async fn until_text(&mut self, text: &str) -> usize {
+            self.until("the reply", |e| {
+                matches!(e, AcpEvent::ContentDelta { text: delta, .. } if delta == text)
+            })
+            .await
+        }
+
+        /// Record events until one matches, and return its index in `seen`.
+        async fn until(&mut self, what: &str, matches: impl Fn(&AcpEvent) -> bool) -> usize {
+            let deadline = std::time::Duration::from_secs(10);
+            loop {
+                let envelope = tokio::time::timeout(deadline, self.events.recv())
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!("timed out waiting for {what}; saw {:#?}", self.seen)
+                    })
+                    .expect("event stream");
+                self.seen.push(envelope.payload.clone());
+                if matches(&envelope.payload) {
+                    return self.seen.len() - 1;
+                }
+            }
+        }
+
+        /// The index of the first already-seen `TurnComplete` carrying
+        /// `stop_reason`.
+        fn seen_turn_complete(&self, stop_reason: &str) -> Option<usize> {
+            self.seen.iter().position(|e| {
+                matches!(e, AcpEvent::TurnComplete { stop_reason: reason, .. } if reason == stop_reason)
+            })
+        }
+
+        async fn shutdown(self) {
+            let _ = self.cmd_tx.send(ConnectionCommand::Disconnect).await;
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), self.client).await;
+            self.agent.abort();
+        }
+    }
+
+    /// M2/I1/I2: an interrupt-and-send is ONE admission. The running turn is
+    /// stopped first — the agent sees `session/cancel` strictly before the
+    /// interrupting prompt's own blocks, which go out exactly once — and the
+    /// new turn opens on the very gate the cancelled turn held: the
+    /// intermediate `TurnComplete{cancelled}` consumes the hand-over without
+    /// releasing `turn_in_flight`, the admission is settled at the turn
+    /// opening, and no `Connected` edge lands between the two turns (the
+    /// frontend's queue auto-flush races a send against that edge).
+    #[tokio::test]
+    async fn a_mid_turn_preempt_cancels_first_then_opens_the_new_turn() {
+        let mut lp = PreemptLoop::start().await;
+
+        // Turn A, admitted by the manager as any prompt: the gate already held.
+        lp.state.write().await.turn_in_flight = true;
+        lp.send_prompt("first", false).await;
+        lp.until_text("reply to first").await;
+
+        // The interrupt: exactly what `prompt_interrupt` admits.
+        lp.claim_preempt().await;
+        lp.send_prompt("actually this", true).await;
+        lp.until_text("reply to actually this").await;
+
+        // The agent's view: cancel first, then the interrupt's own blocks —
+        // once, and no second concurrent prompt behind them.
+        assert_eq!(
+            lp.received(),
+            vec!["prompt:first", "cancel", "prompt:actually this"],
+            "cancel strictly before the interrupting prompt's own blocks, sent once"
+        );
+
+        // The gate hand-over, visible in the state the manager's next admission
+        // reads: held for the new turn, hand-over consumed by the intermediate
+        // TurnComplete, admission settled at the turn opening.
+        {
+            let s = lp.state.read().await;
+            assert!(
+                s.turn_in_flight,
+                "the new turn owns the gate the cancelled one held"
+            );
+            assert!(
+                !s.preempt_handover,
+                "consumed by the intermediate TurnComplete"
+            );
+            assert!(!s.preempt_pending, "settled at the turn opening");
+        }
+        // The loop went straight from the cancel into the new turn — no status
+        // repaint between them.
+        let cancel_at = lp
+            .seen_turn_complete("cancelled")
+            .expect("the intermediate TurnComplete{cancelled}");
+        assert!(
+            !lp.seen[cancel_at + 1..]
+                .iter()
+                .any(|e| matches!(
+                    e,
+                    AcpEvent::StatusChanged {
+                        status: ConnectionStatus::Connected
+                    }
+                )),
+            "no Connected edge between the interrupted turn and its successor; saw {:#?}",
+            lp.seen
+        );
+
+        // Wind the interrupted turn's held response and the new turn's down.
+        lp.release_next().await;
+        lp.release_next().await;
+        lp.until("the new turn's end", |e| {
+            matches!(e, AcpEvent::TurnComplete { stop_reason, .. } if stop_reason == "end_turn")
+        })
+        .await;
+        assert!(
+            !lp.state.read().await.turn_in_flight,
+            "the new turn's own completion releases the gate"
+        );
+        lp.shutdown().await;
+    }
+
+    /// I5: an interrupt that lands while the PREVIOUS interrupt's new turn is
+    /// still running is legal. That turn is an ordinary running turn as far as
+    /// the hand-over is concerned — its predecessor's `preempt_handover` was
+    /// consumed and its admission settled at its opening — so the same
+    /// cancel-then-prompt sequence runs again, every prompt reaches the agent
+    /// exactly once, and only the last turn's own completion releases the gate.
+    #[tokio::test]
+    async fn a_preempt_during_the_new_turn_is_legal() {
+        let mut lp = PreemptLoop::start().await;
+
+        lp.state.write().await.turn_in_flight = true;
+        lp.send_prompt("first", false).await;
+        lp.until_text("reply to first").await;
+
+        lp.claim_preempt().await;
+        lp.send_prompt("second", true).await;
+        lp.until_text("reply to second").await;
+        assert_eq!(lp.received(), vec!["prompt:first", "cancel", "prompt:second"]);
+
+        // The turn the first interrupt opened is a turn like any other: the
+        // second interrupt is admitted against it and runs the same sequence.
+        lp.claim_preempt().await;
+        lp.send_prompt("third", true).await;
+        lp.until_text("reply to third").await;
+        assert_eq!(
+            lp.received(),
+            vec![
+                "prompt:first",
+                "cancel",
+                "prompt:second",
+                "cancel",
+                "prompt:third"
+            ]
+        );
+        {
+            let s = lp.state.read().await;
+            assert!(
+                s.turn_in_flight && !s.preempt_handover && !s.preempt_pending,
+                "the newest turn owns the gate, with no hand-over left behind"
+            );
+        }
+
+        // Wind every held response down, oldest first, and let the last turn
+        // end: its own completion releases the gate.
+        lp.release_next().await;
+        lp.release_next().await;
+        lp.release_next().await;
+        lp.until("the last turn's end", |e| {
+            matches!(e, AcpEvent::TurnComplete { stop_reason, .. } if stop_reason == "end_turn")
+        })
+        .await;
+        assert!(
+            !lp.state.read().await.turn_in_flight,
+            "the last turn's own completion releases the gate"
+        );
+        lp.shutdown().await;
     }
 }

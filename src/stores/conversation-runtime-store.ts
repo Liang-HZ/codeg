@@ -259,6 +259,16 @@ export interface ConversationRuntimeSession {
   batchBoundaryIndex: number | null
   batchBoundaryPrefixHash: string | null
 
+  // Assistant turns of THIS batch that `localTurns` no longer holds because a
+  // `preserveLive` detail refetch proved their persisted twins are covered by
+  // that same detail (see `retireCoveredLocalTurns`). The sync window still
+  // starts at `batchBoundaryIndex`, so its parse leads with those retired
+  // twins; without dropping them from the alignment, they would tail-align
+  // onto the surviving local turns — folding a retired reply's stats into the
+  // first kept one and withholding `source_turn_id` from all of them. Reset
+  // with the boundary whenever a fresh batch capture runs.
+  batchRetiredAssistantCount: number
+
   // A reverse-infinite-scroll page request is in flight (drives the loader
   // row and the single-flight guard).
   loadingOlderTurns: boolean
@@ -528,6 +538,7 @@ function createEmptySession(
     historyAssistantBaseline: null,
     batchBoundaryIndex: null,
     batchBoundaryPrefixHash: null,
+    batchRetiredAssistantCount: 0,
     loadingOlderTurns: false,
     olderTurnsPrependEpoch: 0,
     pendingOutOfTurnContent: false,
@@ -562,10 +573,14 @@ function createEmptySession(
 //   null when `detail` is a legacy full response (no fingerprint to extend)
 //   or the extension failed (unparseable timestamp) — the windowed sync gate
 //   then refuses to patch rather than guess.
+// `retiredCount` rides along so the retirement ledger resets exactly when the
+// boundary does: a fresh capture means `detail` is current settled history, so
+// the batch has no retired turns yet (see `batchRetiredAssistantCount`).
 interface BatchStartCapture {
   baseline: number | null
   boundaryIndex: number | null
   boundaryHash: string | null
+  retiredCount: number
 }
 
 /**
@@ -598,6 +613,99 @@ function retireCoveredBackgroundTurns(
   return retained.length === backgroundTurns.length ? backgroundTurns : retained
 }
 
+/**
+ * Retire the `localTurns` copies a `preserveLive` detail refetch proves are
+ * already persisted.
+ *
+ * `preserveLive` deliberately keeps the local buffers so the fetch can't
+ * clobber an in-flight or just-promoted reply — but once the fetched
+ * transcript has caught up, holding a covered copy doubles it: the persisted
+ * twin arrives under the parser's id while the local copy keeps its
+ * live-/client-side name, and `dedupeTimeline` (role + id) cannot collapse two
+ * id namespaces. That is the "previous round restated verbatim" incident
+ * (clicking the pill → refetchDetail(preserveLive) → the previous round
+ * rendered twice).
+ *
+ * Retire ONLY with a correspondence proof; anything unproven stays visible —
+ * a duplicate is recoverable, a hidden message is not. Two proofs, both
+ * available for `AcpNativeParser` data (`transcript_watermark` is None there,
+ * so the overlay watermark rule never runs for it):
+ *
+ * - ASSISTANT: `source_turn_id` (the parser's own name for this reply,
+ *   backfilled by the post-turn reparse) resolves to an assistant turn in this
+ *   detail whose `completed_at` still matches. That id is `AcpNativeParser`'s
+ *   `acp-N`, assigned in transcript traversal order over an append-only record
+ *   — the same parse this detail just ran, so a hit is the same reply. The
+ *   `completed_at` leg covers the other half: a parser that RENUMBERS after a
+ *   transcript rewrite (compaction) could resolve the stale name onto a
+ *   different reply, and the reparse recorded this instant from that very
+ *   record in the same patch, so a mismatch means "not provably the same" and
+ *   keeps the duplicate.
+ * - USER: the local turn immediately before a retired assistant, when the
+ *   persisted turn immediately before that assistant's twin carries the same
+ *   FULL content key (`userTurnContentKey` — text verbatim, full image data).
+ *   The assistant link supplies the position; the content compare is what
+ *   makes hiding the user copy safe when the same text was sent twice.
+ *
+ * Assistant retirement stops at the first assistant without a proof (the
+ * count-only alignment in `syncTurnMetadata` describes a prefix — see
+ * `batchRetiredAssistantCount`); a covered turn behind an unproven one stays a
+ * visible duplicate. Returns the input array identity when nothing retires.
+ */
+function retireCoveredLocalTurns(
+  localTurns: MessageTurn[],
+  detail: DbConversationDetail
+): { turns: MessageTurn[]; retiredAssistantCount: number } {
+  const detailIndexById = new Map<string, number>()
+  detail.turns.forEach((turn, index) => {
+    if (!detailIndexById.has(turn.id)) detailIndexById.set(turn.id, index)
+  })
+  const twinIndex = (turn: MessageTurn): number | undefined => {
+    // `completed_at` is load-bearing (see the doc above), and a turn the
+    // reparse never stamped has no second leg — leave it unproven.
+    if (turn.source_turn_id == null || turn.completed_at == null)
+      return undefined
+    const index = detailIndexById.get(turn.source_turn_id)
+    if (index === undefined) return undefined
+    const twin = detail.turns[index]
+    if (twin.role !== "assistant" || twin.completed_at !== turn.completed_at) {
+      return undefined
+    }
+    return index
+  }
+
+  const retired = new Set<number>()
+  let retiredAssistantCount = 0
+  let assistantProofBroken = false
+  for (let i = 0; i < localTurns.length; i++) {
+    const turn = localTurns[i]
+    if (turn.role !== "assistant" || assistantProofBroken) continue
+    const index = twinIndex(turn)
+    if (index === undefined) {
+      assistantProofBroken = true
+      continue
+    }
+    retired.add(i)
+    retiredAssistantCount += 1
+    const userTurn = i > 0 ? localTurns[i - 1] : undefined
+    const persistedUser = index > 0 ? detail.turns[index - 1] : undefined
+    if (
+      userTurn?.role === "user" &&
+      persistedUser?.role === "user" &&
+      userTurnContentKey(userTurn) === userTurnContentKey(persistedUser)
+    ) {
+      retired.add(i - 1)
+    }
+  }
+
+  if (retiredAssistantCount === 0)
+    return { turns: localTurns, retiredAssistantCount }
+  return {
+    turns: localTurns.filter((_, i) => !retired.has(i)),
+    retiredAssistantCount,
+  }
+}
+
 function batchStartCapture(
   current: ConversationRuntimeSession,
   promptId: string
@@ -607,6 +715,7 @@ function batchStartCapture(
       baseline: current.historyAssistantBaseline,
       boundaryIndex: current.batchBoundaryIndex,
       boundaryHash: current.batchBoundaryPrefixHash,
+      retiredCount: current.batchRetiredAssistantCount,
     }
   }
   const detail = current.detail
@@ -656,7 +765,12 @@ function captureAt(
     seedHash === null
       ? null
       : extendPrefixFingerprint(seedHash, turns.slice(0, boundaryRel))
-  return { baseline, boundaryIndex: offset + boundaryRel, boundaryHash }
+  return {
+    baseline,
+    boundaryIndex: offset + boundaryRel,
+    boundaryHash,
+    retiredCount: 0,
+  }
 }
 
 /**
@@ -2250,6 +2364,18 @@ function reducer(
         action.detail.uncovered_prefix_max_ts ?? null
       )
 
+      // …and retire LOCAL copies this same detail proves are persisted (see
+      // `retireCoveredLocalTurns`). Only on the buffers-kept paths: they are
+      // the ones that can hold a covered copy beside its persisted twin; every
+      // other path already replaces `localTurns` outright. The retired count
+      // is carried on the session so the batch's later metadata sync drops the
+      // retired twins from its alignment (`batchRetiredAssistantCount`).
+      const retirement = keepAllLiveBuffers
+        ? retireCoveredLocalTurns(current.localTurns, action.detail)
+        : null
+      const retiredLocalTurns = retirement?.turns ?? current.localTurns
+      const retiredAssistantCount = retirement?.retiredAssistantCount ?? 0
+
       const nextSession: ConversationRuntimeSession = {
         ...current,
         detail: action.detail,
@@ -2266,15 +2392,22 @@ function reducer(
         backgroundTurns: nextBackgroundTurns,
         ...(isActivelyInteracting
           ? keepAllLiveBuffers
-            ? {}
+            ? retiredAssistantCount > 0
+              ? {
+                  localTurns: retiredLocalTurns,
+                  batchRetiredAssistantCount:
+                    current.batchRetiredAssistantCount + retiredAssistantCount,
+                }
+              : {}
             : { localTurns: [] }
           : { localTurns: [], optimisticTurns: [], liveMessage: null }),
         // Applied AFTER the blanket rules above so a fork's targeted removal
         // survives `preserveLive` (which is what a fork asks for: keep
-        // everything except the turns it just invalidated).
+        // everything except the turns it just invalidated) — and so it
+        // composes with a retirement rather than overwriting it.
         ...(dropIds
           ? {
-              localTurns: current.localTurns.filter((t) => !dropIds.has(t.id)),
+              localTurns: retiredLocalTurns.filter((t) => !dropIds.has(t.id)),
               optimisticTurns: current.optimisticTurns.filter(
                 (t) => !dropIds.has(t.id)
               ),
@@ -2697,6 +2830,7 @@ function reducer(
           historyAssistantBaseline: capture.baseline,
           batchBoundaryIndex: capture.boundaryIndex,
           batchBoundaryPrefixHash: capture.boundaryHash,
+          batchRetiredAssistantCount: capture.retiredCount,
         }
       })
 
@@ -2735,13 +2869,15 @@ function reducer(
       const captureOnly = (): ConversationRuntimeState =>
         capture.baseline === current.historyAssistantBaseline &&
         capture.boundaryIndex === current.batchBoundaryIndex &&
-        capture.boundaryHash === current.batchBoundaryPrefixHash
+        capture.boundaryHash === current.batchBoundaryPrefixHash &&
+        capture.retiredCount === current.batchRetiredAssistantCount
           ? state
           : updateSessionInState(state, action.conversationId, (s) => ({
               ...s,
               historyAssistantBaseline: capture.baseline,
               batchBoundaryIndex: capture.boundaryIndex,
               batchBoundaryPrefixHash: capture.boundaryHash,
+              batchRetiredAssistantCount: capture.retiredCount,
             }))
       // EXACT-id dedup (not a heuristic): the sender's OWN optimistic turn
       // shares this id — the UI threaded its optimistic turn id to the backend,
@@ -2824,6 +2960,7 @@ function reducer(
         historyAssistantBaseline: capture.baseline,
         batchBoundaryIndex: capture.boundaryIndex,
         batchBoundaryPrefixHash: capture.boundaryHash,
+        batchRetiredAssistantCount: capture.retiredCount,
       }))
     }
 
@@ -2941,6 +3078,13 @@ function reducer(
         batchBoundaryIndex: from.batchBoundaryIndex ?? to.batchBoundaryIndex,
         batchBoundaryPrefixHash:
           from.batchBoundaryPrefixHash ?? to.batchBoundaryPrefixHash,
+        // The retired ledger rides WITH the boundary it describes: whichever
+        // side's boundary survives above is the one whose retired twins the
+        // sync window's parse leads with.
+        batchRetiredAssistantCount:
+          from.batchBoundaryIndex != null
+            ? from.batchRetiredAssistantCount
+            : to.batchRetiredAssistantCount,
         // OR, like the other "something is still outstanding" flags above: the
         // draft key is the one the panel arms, but neither side's unrendered
         // content stops being unrendered because the row got a real id, and
@@ -4767,15 +4911,17 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
             //
             // WINDOWED response: the fingerprint gate decides. The window was
             // requested at the batch boundary, so on a verified prefix the
-            // count is simply 0 (the whole window is this session's — the
-            // same semantics as the adopt path). A mismatch — boundary hash
-            // absent (captured under a legacy detail), offset not honored,
-            // or the prefix rewritten by compaction between capture and sync
-            // — means count-based alignment could pin WRONG metadata onto
-            // local turns, and first-write-wins would make that permanent.
-            // Metadata absence is recoverable; a mis-patch is not. So skip
-            // the turn patches entirely (session stats are still safe: they
-            // describe the full transcript regardless of the window).
+            // whole window is this session's — the count is only whatever
+            // earlier refetches retired from `localTurns` (their persisted
+            // twins still lead the window; see `batchRetiredAssistantCount`).
+            // A mismatch — boundary hash absent (captured under a legacy
+            // detail), offset not honored, or the prefix rewritten by
+            // compaction between capture and sync — means count-based
+            // alignment could pin WRONG metadata onto local turns, and
+            // first-write-wins would make that permanent. Metadata absence is
+            // recoverable; a mis-patch is not. So skip the turn patches
+            // entirely (session stats are still safe: they describe the full
+            // transcript regardless of the window).
             //
             // LEGACY response (old server, or no boundary was captured): the
             // full parse, cut below.

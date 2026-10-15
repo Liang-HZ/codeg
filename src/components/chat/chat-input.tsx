@@ -11,6 +11,7 @@ import type {
   PromptInputBlock,
   SessionConfigOptionInfo,
   SessionModeInfo,
+  SteerBoundary,
   AvailableCommandInfo,
 } from "@/lib/types"
 import type { QueuedMessage } from "@/hooks/use-message-queue"
@@ -61,6 +62,11 @@ interface ChatInputProps {
    *  Threaded straight through; present only while a turn is in flight and
    *  the session has a working channel. */
   onQueueSteer?: (id: string) => Promise<void> | void
+  /** Stop the running turn and send one queued item as the next one (see
+   *  `MessageQueueDisplayProps.onInterruptItem`). Threaded straight through;
+   *  present on EVERY session while a turn is in flight — interrupting needs
+   *  no live-feedback channel. */
+  onQueueInterrupt?: (id: string) => Promise<void> | void
   editingItemId?: string | null
   editingDraftText?: string | null
   editingDraftBlocks?: PromptInputBlock[] | null
@@ -81,6 +87,16 @@ interface ChatInputProps {
   /** Which channel `onSteer` rides (`useSessionFeedback().channel`); picks
    *  the composer's honest copy. See `MessageInput`. */
   steerChannel?: "native" | "pull"
+  /** When a native insert takes effect (`useSessionFeedback().insertBoundary`);
+   *  picks the honesty of the copy. See `MessageInput`. */
+  steerBoundary?: SteerBoundary | null
+  /** Stop the running turn and send the draft as the next one (see
+   *  `MessageInputProps.onInterruptSend`). Threaded straight through; NOT
+   *  gated on the live-feedback channel. */
+  onInterruptSend?: (blocks: PromptInputBlock[]) => Promise<void>
+  /** Whether an interrupt-and-send is in flight (`useSessionFeedback()
+   *  .interrupting`). See `MessageInput`. */
+  interrupting?: boolean
   onAddFeedback?: () => void
   feedbackAddDisabled?: boolean
   /**
@@ -133,6 +149,7 @@ export const ChatInput = memo(function ChatInput({
   onQueueEdit,
   onQueueDelete,
   onQueueSteer,
+  onQueueInterrupt,
   editingItemId,
   editingDraftText,
   editingDraftBlocks,
@@ -141,6 +158,9 @@ export const ChatInput = memo(function ChatInput({
   onCancelQueueEdit,
   onSteer,
   steerChannel,
+  steerBoundary,
+  onInterruptSend,
+  interrupting,
   onAddFeedback,
   feedbackAddDisabled,
   allowOfflineCompose = false,
@@ -201,6 +221,7 @@ export const ChatInput = memo(function ChatInput({
             editingItemId={editingItemId ?? null}
             onSteerItem={onQueueSteer}
             steerChannel={steerChannel}
+            onInterruptItem={onQueueInterrupt}
           />
         )}
       <MessageInput
@@ -241,6 +262,9 @@ export const ChatInput = memo(function ChatInput({
         onCancelQueueEdit={onCancelQueueEdit}
         onSteer={onSteer}
         steerChannel={steerChannel}
+        steerBoundary={steerBoundary}
+        onInterruptSend={onInterruptSend}
+        interrupting={interrupting}
         onAddFeedback={onAddFeedback}
         feedbackAddDisabled={feedbackAddDisabled}
         injectContent={injectContent}

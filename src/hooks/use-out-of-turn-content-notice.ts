@@ -9,6 +9,7 @@ import {
 import {
   isOutOfTurnContentEvent,
   isUnrenderedAgentTurnContent,
+  isWithinCancelGrace,
 } from "@/lib/background-agent"
 import type { EventEnvelope } from "@/lib/types"
 import { useConversationRuntimeActions } from "@/stores/conversation-runtime-store"
@@ -59,6 +60,22 @@ export function useOutOfTurnContentNotice(
         if (
           !isUnrenderedAgentTurnContent(
             connectionStore.getConnection(contextKey)
+          )
+        ) {
+          return
+        }
+        // …and neither is the tail of a just-cancelled turn "background
+        // activity". Cancel settles the turn immediately (the backend does not
+        // wait for the agent), so the cancelled turn's last frames land in the
+        // connected window and the check above reads them as the agent working
+        // on its own (2026-10-14 incident, conv 84: a thinking chunk 24ms after
+        // the cancel). The window ends at the next prompting turn or after
+        // `CANCEL_TAIL_GRACE_MS`, whichever comes first.
+        if (
+          isWithinCancelGrace(
+            connectionStore.getConnection(contextKey)?.cancelGraceUntil ??
+              null,
+            Date.now()
           )
         ) {
           return

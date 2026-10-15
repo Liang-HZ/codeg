@@ -591,6 +591,7 @@ impl AutomationEngine {
                 Some(conversation_id),
                 None,
                 None,
+                false,
             )
             .await
         {

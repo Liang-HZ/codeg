@@ -39,6 +39,7 @@ function seedSession(sessionStats: SessionStats) {
           historyAssistantBaseline: null,
           batchBoundaryIndex: null,
           batchBoundaryPrefixHash: null,
+          batchRetiredAssistantCount: 0,
           loadingOlderTurns: false,
           olderTurnsPrependEpoch: 0,
           pendingOutOfTurnContent: false,

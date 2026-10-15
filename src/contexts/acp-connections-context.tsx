@@ -44,6 +44,7 @@ import {
   isConnectionBusy,
   isConnectionGoneError,
 } from "@/lib/connection-teardown"
+import { CANCEL_TAIL_GRACE_MS } from "@/lib/background-agent"
 import {
   getConversationIdByExternalIdFromStore,
   useConversationRuntimeStore,
@@ -514,6 +515,17 @@ export interface ConnectionState {
    */
   cancelledTurn: CancelledTurnReports | null
   /**
+   * Client-local deadline (epoch ms) of the grace window a cancelled turn's
+   * trailing wire frames may still arrive in. Cancel does not wait for the
+   * agent: `TurnComplete{stop_reason:"cancelled"}` is emitted immediately and
+   * the agent's last frames land after the status flipped back to connected,
+   * where the out-of-turn guard drops them. The pill effect reads this to keep
+   * those drops from lighting the "background activity" notice; it is cleared
+   * by the next `prompting` turn, whichever comes first. See
+   * `CANCEL_TAIL_GRACE_MS`.
+   */
+  cancelGraceUntil: number | null
+  /**
    * Client-local: the user dismissed (X) the stale banner for the CURRENT
    * drift. Hides the banner without touching the underlying `configStale`
    * state. Reset to `false` whenever a fresh `session_config_stale` arrives (a
@@ -612,6 +624,16 @@ type Action =
       type: "SET_BACKGROUND_OUTSTANDING"
       contextKey: string
       outstanding: number
+    }
+  | {
+      // The backend's Cancel path emits `TurnComplete{stop_reason:"cancelled"}`
+      // immediately, without waiting for the agent, so the wire may still carry
+      // the cancelled turn's trailing frames past the status flip back to
+      // connected. Records the grace deadline the pill effect consults — see
+      // `ConnectionState.cancelGraceUntil`.
+      type: "TURN_CANCELLED"
+      contextKey: string
+      graceUntil: number
     }
   | StreamingAction
   | { type: "STREAM_BATCH"; actions: StreamingAction[] }
@@ -1916,6 +1938,7 @@ function connectionsReducer(
         outOfTurnToolCalls: null,
         hasPrompted: false,
         cancelledTurn: null,
+        cancelGraceUntil: null,
       })
       return next
     }
@@ -1981,6 +2004,7 @@ function connectionsReducer(
         outOfTurnToolCalls: null,
         hasPrompted: false,
         cancelledTurn: null,
+        cancelGraceUntil: null,
       })
       return next
     }
@@ -2246,6 +2270,10 @@ function connectionsReducer(
         // The predicted prompt was for this prompt's place, so it is spent
         // whatever the user sent (the backend clears its copy the same way).
         updated.promptSuggestion = null
+        // A new prompt definitively ends the cancelled turn's tail window
+        // (the "or the next prompting, whichever comes first" half — the
+        // deadline itself is the other half; see `cancelGraceUntil`).
+        updated.cancelGraceUntil = null
       } else if (conn.status === "prompting") {
         // Prompt cycle ended: clear in-flight Claude API retry banner.
         updated.claudeApiRetry = null
@@ -2285,6 +2313,17 @@ function connectionsReducer(
       next.set(action.contextKey, {
         ...conn,
         backgroundOutstanding: action.outstanding,
+      })
+      return next
+    }
+
+    case "TURN_CANCELLED": {
+      const conn = state.get(action.contextKey)
+      if (!conn) return state
+      const next = new Map(state)
+      next.set(action.contextKey, {
+        ...conn,
+        cancelGraceUntil: action.graceUntil,
       })
       return next
     }
@@ -5792,6 +5831,19 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
               type: "SETTLE_SESSION_FAILURES",
               contextKey,
               scope: "warnings",
+            })
+          }
+          // A cancelled turn settles here WITHOUT waiting for the agent (the
+          // backend's Cancel path emits this event immediately), so the agent's
+          // remaining frames land in the connected window and the out-of-turn
+          // guard drops them. Record the grace deadline so the pill effect
+          // doesn't read that tail as background activity — see
+          // `CANCEL_TAIL_GRACE_MS` for the calibration.
+          if (e.stop_reason === "cancelled") {
+            dispatch({
+              type: "TURN_CANCELLED",
+              contextKey,
+              graceUntil: Date.now() + CANCEL_TAIL_GRACE_MS,
             })
           }
           dispatch({

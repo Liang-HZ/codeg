@@ -23,6 +23,11 @@ import {
   IDLE_SWEEP_INTERVAL_MS,
 } from "@/lib/constants"
 import { DelegationProvider } from "@/contexts/delegation-context"
+import {
+  CANCEL_TAIL_GRACE_MS,
+  isOutOfTurnContentEvent,
+  isWithinCancelGrace,
+} from "@/lib/background-agent"
 import { parsePermissionToolCall } from "@/lib/permission-request"
 import { subscribe } from "@/lib/platform"
 import { saveConfigPreference } from "@/lib/selector-prefs-storage"
@@ -1038,6 +1043,92 @@ describe("AcpConnectionsProvider AIR session-failure lifecycle", () => {
       stop_reason: "end_turn",
     })
     expect(failuresNow()).toMatchObject({ notice: true, err: false })
+  })
+})
+
+// P0 (insert-mid-turn §5.1): a cancelled turn settles IMMEDIATELY — the
+// backend does not wait for the agent — so the interrupted turn's last wire
+// frames land after the status flipped back to connected, where the
+// out-of-turn guard drops them. Without the grace record, the pill effect read
+// that tail as background activity (2026-10-14 incident: a thinking chunk
+// 24ms after the cancel). These pin the connection-side half of that
+// contract: the deadline is recorded on a cancelled exit, cleared by the next
+// prompt, and the shared predicate agrees at the frame timings from the
+// incident.
+describe("AcpConnectionsProvider cancelled-turn tail grace", () => {
+  async function connectOwner(): Promise<AttachHandlers> {
+    h.acpFindConnectionForConversation.mockResolvedValue(null)
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 42)
+    })
+    return latestAttachHandlers()
+  }
+
+  function prompting(handlers: AttachHandlers, seq: number) {
+    emitAcpEvent(handlers, {
+      seq,
+      connection_id: "spawned-conn",
+      type: "status_changed",
+      status: "prompting",
+    })
+  }
+
+  function turnComplete(handlers: AttachHandlers, seq: number, reason: string) {
+    emitAcpEvent(handlers, {
+      seq,
+      connection_id: "spawned-conn",
+      type: "turn_complete",
+      session_id: "sess-1",
+      stop_reason: reason,
+    })
+  }
+
+  it("keeps the pill dark for the tail, and lifts the window at the next prompt", async () => {
+    const handlers = await connectOwner()
+    prompting(handlers, 1)
+    const beforeCancel = Date.now()
+    turnComplete(handlers, 2, "cancelled")
+    const afterCancel = Date.now()
+    const graceUntil = h.store!.getConnection(TAB)?.cancelGraceUntil
+    expect(graceUntil).not.toBeNull()
+    expect(graceUntil!).toBeGreaterThanOrEqual(
+      beforeCancel + CANCEL_TAIL_GRACE_MS
+    )
+    expect(graceUntil!).toBeLessThanOrEqual(afterCancel + CANCEL_TAIL_GRACE_MS)
+
+    // Every pill-material frame kind at 24ms after the cancel (the incident's
+    // timing) falls inside the window: the effect's grace check suppresses
+    // the pill, while the frames themselves stay `isOutOfTurnContentEvent`
+    // material — a shorter window or a dropped record would re-light it.
+    for (const frame of [
+      { type: "content_delta", text: "the interrupted turn's last prose" },
+      { type: "thinking", text: "the 24ms-after chunk" },
+      { type: "tool_call" },
+    ]) {
+      expect(isOutOfTurnContentEvent(frame)).toBe(true)
+      expect(isWithinCancelGrace(graceUntil!, afterCancel + 24)).toBe(true)
+    }
+
+    // Past the window (9s after, beyond zcode's ≤6s hard-stop settle) the
+    // grace no longer suppresses: a frame there is real background activity
+    // and the pill arms as before.
+    expect(isWithinCancelGrace(graceUntil!, afterCancel + 9_000)).toBe(false)
+
+    // The next prompt ends the window early — the cleared state is what the
+    // pill effect reads, so a subsequent turn's out-of-turn frames behave
+    // exactly as they did before the fix.
+    prompting(handlers, 3)
+    const next = h.store!.getConnection(TAB)?.cancelGraceUntil
+    expect(next).toBeNull()
+    expect(isWithinCancelGrace(next ?? null, afterCancel + 9_000)).toBe(false)
+  })
+
+  it("records no window for a clean end_turn", async () => {
+    const handlers = await connectOwner()
+    prompting(handlers, 1)
+    turnComplete(handlers, 2, "end_turn")
+    expect(h.store!.getConnection(TAB)?.cancelGraceUntil).toBeNull()
   })
 })
 

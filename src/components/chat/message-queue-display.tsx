@@ -2,8 +2,18 @@
 
 import { useCallback, useRef, useState, type PointerEvent } from "react"
 import { Reorder, useDragControls } from "motion/react"
-import { Clock, GripVertical, Pencil, X, Zap } from "lucide-react"
+import { Clock, GripVertical, OctagonX, Pencil, X, Zap } from "lucide-react"
 import { useTranslations } from "next-intl"
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog"
 import { cn } from "@/lib/utils"
 import { draftRidesBlocks } from "@/lib/prompt-draft"
 import type { QueuedMessage } from "@/hooks/use-message-queue"
@@ -26,6 +36,14 @@ interface MessageQueueDisplayProps {
    *  mirroring the composer's split-button (`Zap` = instant insert,
    *  `Clock` = note the agent reads on its next check). */
   steerChannel?: "native" | "pull"
+  /**
+   * Stop the running turn and send THIS row as the next one ("interrupt and
+   * send now"). Present while a turn is in flight, on EVERY session — the
+   * action is a plain `session/cancel` + `session/prompt`, not a live-feedback
+   * insert, so it needs no steer channel. Confirmed destructively before it
+   * runs; the host removes the row on success and reports failures.
+   */
+  onInterruptItem?: (id: string) => Promise<void> | void
 }
 
 interface QueueItemProps {
@@ -40,6 +58,11 @@ interface QueueItemProps {
    *  disabled for the duration, so two rows can't race the one channel. */
   steering: boolean
   onSteerStart: (id: string) => Promise<void>
+  onInterruptItem?: (id: string) => Promise<void> | void
+  /** Whether an interrupt from ANY row is in flight (same single-flight
+   *  discipline as {@link steering}). */
+  interrupting: boolean
+  onInterruptStart: (id: string) => void
 }
 
 function QueueItem({
@@ -52,6 +75,9 @@ function QueueItem({
   steerChannel,
   steering,
   onSteerStart,
+  onInterruptItem,
+  interrupting,
+  onInterruptStart,
 }: QueueItemProps) {
   const t = useTranslations("Folder.chat.messageQueue")
   const dragControls = useDragControls()
@@ -70,6 +96,11 @@ function QueueItem({
     Boolean(onSteerItem) &&
     !isEditing &&
     (steerChannel === "native" || !draftRidesBlocks(item.draft))
+  // The interrupt has neither restriction: it rides the ordinary prompt wire
+  // (blocks included) and a cancelled turn takes the row's place, so an
+  // attachment is delivered whole. The row under edit is the one case that
+  // still cannot — same pre-edit-draft reason as the insert.
+  const canInterrupt = Boolean(onInterruptItem) && !isEditing
 
   const startDrag = useCallback(
     (event: PointerEvent<HTMLButtonElement>) => {
@@ -109,7 +140,7 @@ function QueueItem({
         <button
           type="button"
           onClick={() => void onSteerStart(item.id)}
-          disabled={steering}
+          disabled={steering || interrupting}
           className="shrink-0 rounded-sm p-0.5 hover:bg-muted-foreground/15 text-muted-foreground disabled:opacity-50"
           title={t(
             steerChannel === "pull" ? "steerItemAsNote" : "steerItemNow"
@@ -120,6 +151,17 @@ function QueueItem({
           ) : (
             <Zap className="h-2.5 w-2.5" />
           )}
+        </button>
+      )}
+      {canInterrupt && (
+        <button
+          type="button"
+          onClick={() => onInterruptStart(item.id)}
+          disabled={steering || interrupting}
+          className="shrink-0 rounded-sm p-0.5 hover:bg-destructive/15 text-destructive disabled:opacity-50"
+          title={t("interruptItem")}
+        >
+          <OctagonX className="h-2.5 w-2.5" />
         </button>
       )}
       <button
@@ -150,7 +192,9 @@ export function MessageQueueDisplay({
   editingItemId,
   onSteerItem,
   steerChannel = "pull",
+  onInterruptItem,
 }: MessageQueueDisplayProps) {
+  const t = useTranslations("Folder.chat.messageQueue")
   // The id whose insert is in flight. A per-row `steering` would let a
   // concurrent click on another row race the same channel; one shared id
   // both disables the clicked row and (via `steeringId !== null`) the others
@@ -161,6 +205,19 @@ export function MessageQueueDisplay({
   // the disabled buttons is still refused: the state above only drives
   // rendering and lags a commit.
   const steeringIdRef = useRef<string | null>(null)
+  // Same single-flight discipline for the interrupt: the destructive action
+  // runs one at a time, and both action buttons of every row are disabled
+  // while either is settling.
+  const [interruptingId, setInterruptingId] = useState<string | null>(null)
+  const interruptingIdRef = useRef<string | null>(null)
+  // The row whose interrupt confirmation is open. The click itself never
+  // sends — the dialog's action does (see the composer's own confirmation).
+  const [pendingInterruptId, setPendingInterruptId] = useState<string | null>(
+    null
+  )
+  const pendingItem = pendingInterruptId
+    ? queue.find((item) => item.id === pendingInterruptId)
+    : undefined
 
   const handleSteerStart = useCallback(
     async (id: string) => {
@@ -175,6 +232,21 @@ export function MessageQueueDisplay({
       }
     },
     [onSteerItem]
+  )
+
+  const handleInterruptStart = useCallback(
+    async (id: string) => {
+      if (!onInterruptItem || interruptingIdRef.current !== null) return
+      interruptingIdRef.current = id
+      setInterruptingId(id)
+      try {
+        await onInterruptItem(id)
+      } finally {
+        interruptingIdRef.current = null
+        setInterruptingId(null)
+      }
+    },
+    [onInterruptItem]
   )
 
   if (queue.length === 0) return null
@@ -200,9 +272,47 @@ export function MessageQueueDisplay({
             steerChannel={steerChannel}
             steering={steeringId !== null}
             onSteerStart={handleSteerStart}
+            onInterruptItem={onInterruptItem}
+            interrupting={interruptingId !== null}
+            onInterruptStart={setPendingInterruptId}
           />
         ))}
       </Reorder.Group>
+      {/* Destructive confirmation for the row's interrupt: it aborts whatever
+          the agent is doing, so a stray click on a tiny icon never fires it
+          directly. The row is named by its position, matching the list. */}
+      <AlertDialog
+        open={pendingInterruptId !== null}
+        onOpenChange={(open) => {
+          if (!open) setPendingInterruptId(null)
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {t("interruptItemConfirmTitle")}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {pendingItem ? `#${queue.indexOf(pendingItem) + 1} ` : ""}
+              {t("interruptItemHint")}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t("cancel")}</AlertDialogCancel>
+            <AlertDialogAction
+              variant="destructive"
+              onClick={(event) => {
+                event.preventDefault()
+                const id = pendingInterruptId
+                setPendingInterruptId(null)
+                if (id) void handleInterruptStart(id)
+              }}
+            >
+              {t("interruptItem")}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   )
 }

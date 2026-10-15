@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest"
 import {
   BACKGROUND_TASK_MARKER,
+  CANCEL_TAIL_GRACE_MS,
   hasTranscriptOverlay,
   isAsyncLaunchAckText,
   isOutOfTurnContentEvent,
   isUnrenderedAgentTurnContent,
+  isWithinCancelGrace,
   parseBackgroundTaskMarker,
 } from "@/lib/background-agent"
 
@@ -221,5 +223,31 @@ describe("isUnrenderedAgentTurnContent", () => {
 
   it("flags nothing for a connection the store no longer holds", () => {
     expect(isUnrenderedAgentTurnContent(undefined)).toBe(false)
+  })
+})
+
+describe("isWithinCancelGrace", () => {
+  it("covers a cancelled turn's trailing frames right after the cancel", () => {
+    // The incident's shape: TurnComplete{cancelled} at T, the interrupted
+    // turn's last thinking chunk 24ms later — inside the window, so the pill
+    // effect must not arm.
+    const cancelledAt = 1_700_000_000_000
+    const graceUntil = cancelledAt + CANCEL_TAIL_GRACE_MS
+    expect(isWithinCancelGrace(graceUntil, cancelledAt + 24)).toBe(true)
+  })
+
+  it("expires at the deadline — late frames are background activity again", () => {
+    const cancelledAt = 1_700_000_000_000
+    const graceUntil = cancelledAt + CANCEL_TAIL_GRACE_MS
+    // 9s after the cancel (past zcode's ≤6s hard-stop settle and the ~5.4s
+    // resume replay): the pill must arm on the first content frame.
+    expect(isWithinCancelGrace(graceUntil, cancelledAt + 9_000)).toBe(false)
+    // Boundary is exclusive: at exactly the deadline the window is over.
+    expect(isWithinCancelGrace(graceUntil, graceUntil)).toBe(false)
+    expect(isWithinCancelGrace(graceUntil, graceUntil - 1)).toBe(true)
+  })
+
+  it("is inert with no cancelled turn on the connection", () => {
+    expect(isWithinCancelGrace(null, 1_700_000_000_000)).toBe(false)
   })
 })

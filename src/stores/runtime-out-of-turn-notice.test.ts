@@ -88,6 +88,7 @@ function emptySession(conversationId: number): ConversationRuntimeSession {
     historyAssistantBaseline: null,
     batchBoundaryIndex: null,
     batchBoundaryPrefixHash: null,
+    batchRetiredAssistantCount: 0,
     loadingOlderTurns: false,
     olderTurnsPrependEpoch: 0,
     pendingOutOfTurnContent: false,

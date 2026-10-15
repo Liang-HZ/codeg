@@ -529,6 +529,43 @@ describe("ConversationDetailPanel send-path hardening", () => {
     expect(steerHandler).not.toContain("appendOptimisticTurn(")
   })
 
+  it("returns an interrupt-bounced queue flush to the queue FRONT (N1)", () => {
+    // The interrupt's intermediate TurnComplete{cancelled} flips this client
+    // back to "connected" (the frontend synthesizes the status on every turn
+    // end), so the queue auto-flush fires while the backend still holds the
+    // turn gate for the interrupt's new turn. The send bounces with
+    // TurnInProgress, and the draft MUST return to the FRONT: it was the queue
+    // head, the user's interrupt must not reorder it behind later drafts
+    // (`mqEnqueue` would), and dropping it would lose the message. It goes out
+    // when the new turn ends.
+    const flushCall = source.indexOf("handleSendRef.current(")
+    expect(flushCall).toBeGreaterThan(-1)
+    // The flush's send has to identify itself, or the bounce cannot route.
+    expect(source.slice(flushCall, flushCall + 400)).toContain(
+      "{ fromQueueFlush: true }"
+    )
+
+    const onBusyAt = source.indexOf("const onTurnInProgress = () => {")
+    expect(onBusyAt).toBeGreaterThan(-1)
+    const onBusy = source.slice(
+      onBusyAt,
+      source.indexOf("const onSendFailed", onBusyAt)
+    )
+    // The bounce stamps the flush backoff FIRST, so the re-queued head cannot
+    // spin a retry per round-trip against the still-held gate…
+    const bounceAt = onBusy.indexOf("lastFlushBounceAtRef.current = Date.now()")
+    const branchAt = onBusy.indexOf("if (fromQueueFlush)")
+    expect(bounceAt).toBeGreaterThan(-1)
+    expect(bounceAt).toBeLessThan(branchAt)
+    // …then routes by origin: the flush's draft goes back to the FRONT, a
+    // direct send's to the tail.
+    const requeueAt = onBusy.indexOf("mqRequeueFront(draft,")
+    const enqueueAt = onBusy.indexOf("mqEnqueue(draft,")
+    expect(branchAt).toBeGreaterThan(-1)
+    expect(requeueAt).toBeGreaterThan(branchAt)
+    expect(enqueueAt).toBeGreaterThan(requeueAt)
+  })
+
   it("disables the welcome composer while connected-but-not-ready", () => {
     // The composer reads a downgraded status so its send affordance is disabled
     // during the transient mismatch window instead of inviting a rejected send.

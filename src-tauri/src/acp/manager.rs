@@ -1145,12 +1145,22 @@ impl ConnectionManager {
     /// `send_prompt_linked` acquire the lock externally and then call
     /// this. Re-entering through `send_prompt` from `send_prompt_linked`
     /// while holding the lock would deadlock, hence the split.
+    ///
+    /// `preempt` marks an interrupt-and-send (`prompt_interrupt`): the prompt
+    /// was ADMITTED against a running turn on purpose, so it must pass this
+    /// gate rather than be rejected by it, and it must leave the gate held —
+    /// the turn it interrupts releases it only when the new turn ends.
+    /// `SessionState::preempt_pending` guards the handover itself: whoever
+    /// finds it clear claims it here (same critical section as the decision),
+    /// and whoever finds it set is a second interrupt to refuse.
     async fn send_prompt_inner(
         &self,
         conn_id: &str,
         mut blocks: Vec<PromptInputBlock>,
         user_message: Option<(String, Vec<crate::acp::UserMessageBlock>)>,
         internal_suffix: Vec<PromptInputBlock>,
+        source: Option<String>,
+        preempt: bool,
     ) -> Result<(), AcpError> {
         // Reject an empty prompt BEFORE touching the concurrency gate. An empty
         // prompt produces no turn — and thus no `TurnComplete` to clear the gate
@@ -1193,25 +1203,63 @@ impl ConnectionManager {
             .reserve()
             .await
             .map_err(|_| AcpError::ProcessExited)?;
+        // Whether the command goes out as an interrupt. False when the caller
+        // asked for one but there is no turn to interrupt: the click lost its
+        // race with the turn ending, so the prompt is an ordinary one (the
+        // reopen below has that full rationale).
+        let mut as_interrupt = false;
         {
             let mut s = state_arc.write().await;
-            if s.turn_in_flight {
-                // Names the gate, not just the outcome: the linked path checks
-                // the same flag once before its side effects and again here, and
-                // the two lines share a module target with no file/line in the
-                // default format — identical text would be unattributable.
-                tracing::debug!(
-                    connection_id = %conn_id,
-                    "[ACP] prompt rejected at the send gate: a turn is already in flight"
-                );
-                return Err(AcpError::TurnInProgress);
+            if preempt {
+                // Second interrupt while the first one's handover is still in
+                // flight (from admission to the new turn opening): the cancel
+                // sequence is not re-entrant, and the first one already ends
+                // with a fresh turn these blocks would have to race. Refused
+                // like any other busy bounce — the frontend re-queues it.
+                if s.preempt_pending {
+                    tracing::debug!(
+                        connection_id = %conn_id,
+                        "[ACP] interrupt rejected at the send gate: another interrupt is already in flight"
+                    );
+                    return Err(AcpError::TurnInProgress);
+                }
+                if s.turn_in_flight {
+                    // Claim the handover. The gate stays TRUE across the whole
+                    // sequence (cancel → handover → new turn); the loop's
+                    // intermediate `TurnComplete{cancelled}` sees
+                    // `preempt_handover` and leaves it alone.
+                    s.preempt_pending = true;
+                    as_interrupt = true;
+                }
+                // No turn in flight → fall through to the plain admission
+                // below: the user's click raced the turn's natural end, and
+                // "interrupt" has nothing left to interrupt. Degrading is the
+                // honest reading (they asked for this message to go now), and
+                // it is also the only sound one — a prompt marked `preempt`
+                // with no turn behind it would have the loop run the Cancel
+                // sequence on a settled turn.
             }
-            s.turn_in_flight = true;
+            if !as_interrupt {
+                if s.turn_in_flight {
+                    // Names the gate, not just the outcome: the linked path checks
+                    // the same flag once before its side effects and again here, and
+                    // the two lines share a module target with no file/line in the
+                    // default format — identical text would be unattributable.
+                    tracing::debug!(
+                        connection_id = %conn_id,
+                        "[ACP] prompt rejected at the send gate: a turn is already in flight"
+                    );
+                    return Err(AcpError::TurnInProgress);
+                }
+                s.turn_in_flight = true;
+            }
         }
         permit.send(ConnectionCommand::Prompt {
             blocks,
             user_message,
             internal_suffix,
+            source,
+            preempt: as_interrupt,
         });
         Ok(())
     }
@@ -1237,7 +1285,7 @@ impl ConnectionManager {
     ) -> Result<(), AcpError> {
         let prompt_lock = self.clone_prompt_lock(conn_id).await?;
         let _guard = prompt_lock.lock_owned().await;
-        self.send_prompt_inner(conn_id, blocks, None, Vec::new())
+        self.send_prompt_inner(conn_id, blocks, None, Vec::new(), None, false)
             .await
     }
 
@@ -1276,6 +1324,7 @@ impl ConnectionManager {
             conversation_id,
             delegation,
             None,
+            false,
         )
         .await
     }
@@ -1288,6 +1337,13 @@ impl ConnectionManager {
     /// than a heuristic — and an unrelated optimistic turn on another client
     /// never suppresses a different sender's prompt. `None` falls back to a
     /// connection-scoped id for non-UI senders.
+    ///
+    /// `preempt` is interrupt-and-send; see [`Self::prompt_interrupt`], which is
+    /// the only production caller that sets it. It relaxes this path's two
+    /// busy checks (the pre-admission one below and the send gate) into the
+    /// handover the interrupt needs, and nothing else: linking, the InProgress
+    /// flip, the `UserMessage` broadcast and the busy-rollback all behave
+    /// exactly as for an ordinary prompt.
     #[allow(clippy::too_many_arguments)]
     pub async fn send_prompt_linked_with_message_id(
         &self,
@@ -1298,6 +1354,7 @@ impl ConnectionManager {
         conversation_id: Option<i32>,
         delegation: Option<crate::acp::delegation::spawner::DelegationLink>,
         client_message_id: Option<String>,
+        preempt: bool,
     ) -> Result<Option<i32>, AcpError> {
         self.send_prompt_linked_full(
             db,
@@ -1308,6 +1365,7 @@ impl ConnectionManager {
             delegation,
             client_message_id,
             Vec::new(),
+            preempt,
         )
         .await
     }
@@ -1337,6 +1395,7 @@ impl ConnectionManager {
             delegation,
             None,
             internal_suffix,
+            false,
         )
         .await
     }
@@ -1352,6 +1411,7 @@ impl ConnectionManager {
         delegation: Option<crate::acp::delegation::spawner::DelegationLink>,
         client_message_id: Option<String>,
         internal_suffix: Vec<PromptInputBlock>,
+        preempt: bool,
     ) -> Result<Option<i32>, AcpError> {
         // Reject an empty prompt up front, BEFORE any side effects: linking /
         // creating the conversation row, flipping it to InProgress, or emitting
@@ -1402,14 +1462,18 @@ impl ConnectionManager {
         // Snapshot what we need from the connection map under one short lock.
         // The conversation-linked check happens INSIDE the prompt lock so
         // any racing send sees a consistent post-link state.
-        let (state_arc, emitter, agent_type, already_linked, turn_in_flight) = {
+        let (state_arc, emitter, agent_type, already_linked, turn_in_flight, preempt_pending) = {
             let connections = self.connections.lock().await;
             let conn = connections
                 .get(conn_id)
                 .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?;
-            let (already, in_flight) = {
+            let (already, in_flight, pending) = {
                 let s = conn.state.read().await;
-                (s.conversation_id.is_some(), s.turn_in_flight)
+                (
+                    s.conversation_id.is_some(),
+                    s.turn_in_flight,
+                    s.preempt_pending,
+                )
             };
             (
                 conn.state.clone(),
@@ -1417,6 +1481,7 @@ impl ConnectionManager {
                 conn.agent_type,
                 already,
                 in_flight,
+                pending,
             )
         };
 
@@ -1428,7 +1493,25 @@ impl ConnectionManager {
         // ever clears it) — keeps a rejected prompt from flipping the row to
         // InProgress or broadcasting a phantom user message. The frontend turns
         // this rejection into a queued message above the input box.
-        if turn_in_flight {
+        //
+        // An interrupt (`preempt`) is the one prompt admitted THROUGH a running
+        // turn — that is what it is for — so it passes this check and is
+        // vouched for by the send gate instead. It still may not overtake
+        // another interrupt's handover (the cancel sequence is not
+        // re-entrant); that is refused here too, before any side effect, so the
+        // second click leaves no InProgress flip or phantom user message
+        // behind. Nothing is CLAIMED here: the handover is taken in the send
+        // gate's critical section, which is also where a prompt that lost its
+        // race with the turn ending degrades to an ordinary one.
+        if preempt {
+            if preempt_pending {
+                tracing::debug!(
+                    connection_id = %conn_id,
+                    "[ACP] interrupt rejected before admission: another interrupt is already in flight"
+                );
+                return Err(AcpError::TurnInProgress);
+            }
+        } else if turn_in_flight {
             // Distinct from `send_prompt_inner`'s send-gate line so a log reader
             // can tell which of the two checks bounced the prompt.
             tracing::debug!(
@@ -1753,6 +1836,21 @@ impl ConnectionManager {
             None
         };
 
+        // A delegation-result notice (the push channel's wake-up turn) is
+        // codeg's own side channel telling this parent agent that a sub-agent
+        // finished — system content, never user speech. It is recorded with a
+        // source marker so transcript readers keep the turn split but do not
+        // render it as a user message (`acp_transcript::SOURCE_DELEGATION_RESULT`),
+        // and it is NEVER broadcast as `AcpEvent::UserMessage` — the live view
+        // must not show it either. Recognized by the message id the delegation
+        // sink mints; the id namespace is codeg's own (see `delivery.rs`).
+        let notice_source = client_message_id
+            .as_deref()
+            .filter(|id| {
+                id.starts_with(crate::acp::delegation::delivery::NOTICE_MESSAGE_ID_PREFIX)
+            })
+            .map(|_| crate::acp_transcript::SOURCE_DELEGATION_RESULT.to_string());
+
         // Project the user's prompt blocks for the cross-client viewer
         // broadcast BEFORE `send_prompt_inner` consumes `blocks`, and hand the
         // payload to the connection loop (via `ConnectionCommand::Prompt`) so it
@@ -1761,11 +1859,15 @@ impl ConnectionManager {
         // that it only fires for a prompt actually processed (a failed enqueue
         // delivers no command, so nothing strands a `pending_user_message`).
         // Gated on `delegation.is_none()` (children surface kickoff text
-        // separately) and a bound conversation row (a sidebar-visible turn). The
+        // separately), a bound conversation row (a sidebar-visible turn), and
+        // not being a system notice. The
         // `message_id` prefers the sender's client-supplied id (exact echo
         // dedup), falling back to a connection-scoped id for non-UI senders.
         let user_message: Option<(String, Vec<crate::acp::UserMessageBlock>)> =
-            if delegation.is_none() && conversation_id_for_status.is_some() {
+            if delegation.is_none()
+                && conversation_id_for_status.is_some()
+                && notice_source.is_none()
+            {
                 let user_blocks = crate::acp::user_blocks_from_prompt(&blocks);
                 if user_blocks.is_empty() {
                     None
@@ -1799,7 +1901,7 @@ impl ConnectionManager {
         // lifecycle subscriber's PendingReview write also never fires and the
         // row would be stuck until a follow-up `send_prompt_linked` re-flipped it.
         match self
-            .send_prompt_inner(conn_id, blocks, user_message, internal_suffix)
+            .send_prompt_inner(conn_id, blocks, user_message, internal_suffix, notice_source, preempt)
             .await
         {
             Ok(()) => {
@@ -1876,6 +1978,50 @@ impl ConnectionManager {
                 Err(send_err)
             }
         }
+    }
+
+    /// Interrupt the connection's running turn and send `blocks` as the next
+    /// one — "Stop, then send" as ONE atomic admission, the P3 of the
+    /// mid-turn-insert plan.
+    ///
+    /// The point is the hand-over: the prompt is admitted against the running
+    /// turn (it is the only send allowed past the busy gate), the connection
+    /// loop stops that turn exactly as the Stop button does, and the new turn
+    /// opens on the SAME `turn_in_flight` reservation — no window in which a
+    /// third prompt can be admitted, and no second round-trip in which the
+    /// user's own message could be lost to the gate (which is what the manual
+    /// Stop + send sequence used to risk).
+    ///
+    /// Routing, linking and error semantics are the ordinary prompt's: the
+    /// linked path creates or adopts the conversation row, broadcasts the
+    /// optimistic user message, and flips the recipient row's status; a failure
+    /// rolls the row back exactly as a normal send failure does. Two answers
+    /// differ from a normal prompt only in name:
+    /// * `TurnInProgress` also covers "another interrupt's hand-over is still
+    ///   in flight" — the frontend re-queues the draft like any other busy
+    ///   bounce.
+    /// * The turn that gets interrupted ends with a `TurnComplete{cancelled}`,
+    ///   which the frontend sees as the turn it was showing ending normally.
+    pub async fn prompt_interrupt(
+        &self,
+        db: &AppDatabase,
+        conn_id: &str,
+        blocks: Vec<PromptInputBlock>,
+        folder_id: Option<i32>,
+        conversation_id: Option<i32>,
+        client_message_id: Option<String>,
+    ) -> Result<Option<i32>, AcpError> {
+        self.send_prompt_linked_with_message_id(
+            db,
+            conn_id,
+            blocks,
+            folder_id,
+            conversation_id,
+            None,
+            client_message_id,
+            true,
+        )
+        .await
     }
 
     pub async fn set_mode(&self, conn_id: &str, mode_id: String) -> Result<(), AcpError> {
@@ -3595,12 +3741,25 @@ impl ConnectionManager {
                 let steer = reply_rx.await.map_err(|_| {
                     AcpError::protocol("Steer reply channel closed".to_string())
                 })??;
-                match steer {
+                let outcome = steer.outcome;
+                // How the UI should read this note's delivery: a deferred
+                // (`queued`) insert says so out loud (see the field docs). The
+                // adapter's own state when it reported one, else the generic
+                // marker. Set only for `Queued` — an injection needs no caption.
+                let steer_state = matches!(outcome, SteerOutcome::Queued)
+                    .then(|| steer.steer_state.clone().unwrap_or_else(|| "queued".into()));
+                match outcome {
                     // Honored opt-in: the content was NOT consumed and is
                     // still host-owned. Surface the frontend's existing
                     // turn-end fallback (resubmit as a normal prompt).
                     SteerOutcome::PromptRequired => return Err(AcpError::NoActiveTurn),
                     SteerOutcome::Injected => {}
+                    // Accepted but deferred to run after the running turn
+                    // (the adapter's own queue). Consumed like an injection —
+                    // record it delivered, NEVER resend — and unlike
+                    // `StartedNewTurn` this is the adapter's documented
+                    // behavior, not a broken promise: no downgrade.
+                    SteerOutcome::Queued => {}
                     SteerOutcome::StartedNewTurn => {
                         // The adapter ignored the opt-in and detached a turn
                         // (stale binary lying about its version?). The content
@@ -3613,7 +3772,18 @@ impl ConnectionManager {
                              (conn={conn_id_for_task}); downgrading native steering for \
                              this session"
                         );
-                        state.write().await.native_steering_available = false;
+                        let mut s = state.write().await;
+                        s.native_steering_available = false;
+                        // Same downgrade in the capability model the frontend
+                        // reads: leaving the steer channel up would keep
+                        // offering an insert this adapter just proved it can't
+                        // honor.
+                        s.insert_capability.steer = None;
+                    }
+                    SteerOutcome::Failed => {
+                        return Err(AcpError::protocol(
+                            "_session/steering reported failed".to_string(),
+                        ))
                     }
                 }
                 let item = FeedbackItem::new_delivered(
@@ -3621,6 +3791,7 @@ impl ConnectionManager {
                     text,
                     created_at,
                     record_blocks,
+                    steer_state,
                 );
                 // Ungated on purpose — see the invariant on this fn's doc.
                 emit_with_state(
@@ -3649,6 +3820,94 @@ impl ConnectionManager {
             Err(join_err) => Err(AcpError::protocol(format!(
                 "steer task did not complete: {join_err}"
             ))),
+        }
+    }
+
+    /// Deliver a system notice into a running turn over native
+    /// `_session/steering` — the delegation-result push's mid-turn delivery,
+    /// used when the parent is busy and its adapter proved native steering.
+    ///
+    /// Deliberately NOT [`Self::submit_feedback_native`]: that path exists for
+    /// user feedback and records a `FeedbackItem` + broadcasts
+    /// `FeedbackSubmitted`, which the UI shows as a note from the user. A
+    /// delegation notice is neither — its only trace is the transcript's steer
+    /// entry, recorded with
+    /// [`crate::acp_transcript::SOURCE_DELEGATION_RESULT`] so transcript
+    /// readers keep the turn split without rendering it as a user message
+    /// (exactly like the notice-turn path).
+    ///
+    /// Errors are the delivery queue's fallback, not user-facing:
+    /// `NoActiveTurn` when the turn settled first or the adapter left the
+    /// payload unconsumed (retry as a notice turn), and a protocol error when
+    /// the adapter does not do native steering at all.
+    pub async fn steer_notice(
+        &self,
+        conn_id: &str,
+        blocks: Vec<PromptInputBlock>,
+    ) -> Result<(), AcpError> {
+        if blocks.is_empty() {
+            return Err(AcpError::protocol(
+                "steer must contain at least one content block".to_string(),
+            ));
+        }
+        let (state, cmd_tx) = {
+            let connections = self.connections.lock().await;
+            let conn = connections
+                .get(conn_id)
+                .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.to_string()))?;
+            (conn.state.clone(), conn.cmd_tx.clone())
+        };
+        {
+            let s = state.read().await;
+            if !s.native_steering_available {
+                return Err(AcpError::protocol(
+                    "native steering not available on this connection".to_string(),
+                ));
+            }
+            // Cheap pre-flight; the loop's idle arm is the authoritative
+            // `NoActiveTurn` (a turn can settle between this read and the
+            // enqueue — that outcome lands below).
+            if !s.turn_in_flight {
+                return Err(AcpError::NoActiveTurn);
+            }
+        }
+        let (reply, outcome) = tokio::sync::oneshot::channel();
+        cmd_tx
+            .send(ConnectionCommand::Steer {
+                blocks,
+                reply,
+                source: Some(crate::acp_transcript::SOURCE_DELEGATION_RESULT.to_string()),
+            })
+            .await
+            .map_err(|_| AcpError::ProcessExited)?;
+        match outcome.await {
+            Ok(Ok(receipt)) => match receipt.outcome {
+                SteerOutcome::Injected | SteerOutcome::Queued => Ok(()),
+                // Left unconsumed: the caller's queue fallback reroutes it — as a
+                // notice turn, since the turn that would have taken it is over.
+                SteerOutcome::PromptRequired => Err(AcpError::NoActiveTurn),
+                SteerOutcome::StartedNewTurn => {
+                    // The adapter ignored the `promptRequired` opt-in and ran the
+                    // notice as a detached turn of its own — delivered, but the
+                    // same downgrade the feedback path applies so later notices
+                    // stop paying for the round-trip.
+                    let mut s = state.write().await;
+                    s.native_steering_available = false;
+                    // Keep the capability model in step (see the feedback path).
+                    s.insert_capability.steer = None;
+                    tracing::warn!(
+                        connection_id = %conn_id,
+                        "[ACP] _session/steering returned StartedNewTurn for a delegation \
+                         notice; downgrading native steering for this session"
+                    );
+                    Ok(())
+                }
+                SteerOutcome::Failed => Err(AcpError::protocol(
+                    "_session/steering reported failed for a delegation notice".to_string(),
+                )),
+            },
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(AcpError::ProcessExited),
         }
     }
 
@@ -4687,7 +4946,8 @@ fn report_agent_chosen_values(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acp::connection::AgentConnection;
+    use crate::acp::connection::{AgentConnection, SteerReceipt};
+    use crate::acp::session_state::{SteerBoundary, SteerChannel};
 
     /// A select option holding `current`; its value list plays no part here.
     fn probe_option(id: &str, current: &str) -> crate::acp::types::SessionConfigOptionInfo {
@@ -5714,6 +5974,26 @@ mod tests {
         }]
     }
 
+    /// Every `Prompt` command in the channel as `(preempt, user-message id)`,
+    /// drained. The preempt twin of `drain_prompt_user_messages`: the interrupt
+    /// tests need the flag the loop branches on, not just the payload.
+    fn drain_prompt_commands(
+        cmd_rx: &mut mpsc::Receiver<crate::acp::connection::ConnectionCommand>,
+    ) -> Vec<(bool, Option<String>)> {
+        let mut out = Vec::new();
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            if let crate::acp::connection::ConnectionCommand::Prompt {
+                user_message,
+                preempt,
+                ..
+            } = cmd
+            {
+                out.push((preempt, user_message.map(|(id, _)| id)));
+            }
+        }
+        out
+    }
+
     /// Insert a connection with a LIVE command receiver so `send_prompt_inner`'s
     /// enqueue SUCCEEDS (the UserMessage broadcast is deferred until after a
     /// successful enqueue). Returns the receiver — keep it in scope for the
@@ -6159,6 +6439,7 @@ mod tests {
             None,
             None,
             Some("optimistic-route".into()),
+            false,
         )
         .await
         .unwrap();
@@ -6346,6 +6627,7 @@ mod tests {
             None,
             None,
             Some("optimistic-reserved".into()),
+            false,
         )
         .await
         .expect("an invisible control character must not block the send");
@@ -6703,6 +6985,329 @@ mod tests {
         );
     }
 
+    /// The interrupt's admission: it passes the busy gate ON PURPOSE and claims
+    /// the hand-over (`preempt_pending`), and the command the loop receives is
+    /// marked `preempt` — the only signal that says "stop the running turn
+    /// first". The gate stays held, because the hand-over is what carries it to
+    /// the new turn.
+    #[tokio::test]
+    async fn prompt_interrupt_claims_the_handover_and_marks_the_prompt() {
+        use crate::db::test_helpers;
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/int-claim").await;
+        let mgr = ConnectionManager::new();
+        let conn_id = "conn-int-claim";
+        let mut cmd_rx = insert_live_connection(
+            &mgr,
+            conn_id,
+            AgentType::ClaudeCode,
+            Some(PathBuf::from("/tmp/int-claim")),
+        )
+        .await;
+        // A turn is running: the state an interrupt is admitted against.
+        mgr.get_state(conn_id).await.unwrap().write().await.turn_in_flight = true;
+
+        let sent = mgr
+            .prompt_interrupt(
+                &db,
+                conn_id,
+                vec![PromptInputBlock::Text {
+                    text: "actually, do this".into(),
+                }],
+                Some(folder_id),
+                None,
+                Some("optimistic-int-1".into()),
+            )
+            .await;
+        assert!(
+            sent.is_ok(),
+            "an interrupt must be admitted THROUGH the running turn, got {sent:?}"
+        );
+
+        {
+            let state = mgr.get_state(conn_id).await.unwrap();
+            let s = state.read().await;
+            assert!(
+                s.turn_in_flight,
+                "the hand-over keeps the gate held for the new turn"
+            );
+            assert!(
+                s.preempt_pending,
+                "the interrupt owns the hand-over until the loop opens its turn"
+            );
+        }
+
+        let prompts = drain_prompt_commands(&mut cmd_rx);
+        assert_eq!(
+            prompts,
+            vec![(true, Some("optimistic-int-1".to_string()))],
+            "exactly one preempt-marked prompt, carrying the sender's optimistic id"
+        );
+    }
+
+    /// I2: a second interrupt while the first one's hand-over is still in flight
+    /// is refused with `TurnInProgress` (the frontend re-queues the draft like
+    /// any busy bounce) — the cancel sequence is not re-entrant, and the first
+    /// one already ends by opening a fresh turn. Nothing of the first claim is
+    /// disturbed and no second prompt reaches the loop.
+    #[tokio::test]
+    async fn a_second_interrupt_is_refused_while_one_is_pending() {
+        use crate::db::test_helpers;
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/int-twice").await;
+        let mgr = ConnectionManager::new();
+        let conn_id = "conn-int-twice";
+        let mut cmd_rx = insert_live_connection(
+            &mgr,
+            conn_id,
+            AgentType::ClaudeCode,
+            Some(PathBuf::from("/tmp/int-twice")),
+        )
+        .await;
+        mgr.get_state(conn_id).await.unwrap().write().await.turn_in_flight = true;
+
+        let first = mgr
+            .prompt_interrupt(&db, conn_id, one_text_block(), Some(folder_id), None, None)
+            .await;
+        assert!(first.is_ok(), "first interrupt admitted: {first:?}");
+
+        let second = mgr
+            .prompt_interrupt(&db, conn_id, one_text_block(), Some(folder_id), None, None)
+            .await;
+        assert!(
+            matches!(second, Err(AcpError::TurnInProgress)),
+            "the second interrupt must bounce, got {second:?}"
+        );
+
+        {
+            let state = mgr.get_state(conn_id).await.unwrap();
+            let s = state.read().await;
+            assert!(s.turn_in_flight && s.preempt_pending, "claim untouched");
+        }
+        assert_eq!(
+            drain_prompt_commands(&mut cmd_rx).len(),
+            1,
+            "the refused interrupt enqueues nothing"
+        );
+    }
+
+    /// I4: the click raced the turn's natural end — there is nothing left to
+    /// interrupt, so the send degrades to an ordinary prompt. It takes the gate
+    /// like any send and goes out with `preempt: false`; leaving the flag on
+    /// would have the loop run the cancel sequence against a settled turn.
+    #[tokio::test]
+    async fn an_interrupt_with_no_turn_in_flight_degrades_to_a_plain_prompt() {
+        use crate::db::test_helpers;
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/int-idle").await;
+        let mgr = ConnectionManager::new();
+        let conn_id = "conn-int-idle";
+        let mut cmd_rx = insert_live_connection(
+            &mgr,
+            conn_id,
+            AgentType::ClaudeCode,
+            Some(PathBuf::from("/tmp/int-idle")),
+        )
+        .await;
+        // No turn in flight (it ended between the click and the admission).
+
+        let sent = mgr
+            .prompt_interrupt(
+                &db,
+                conn_id,
+                one_text_block(),
+                Some(folder_id),
+                None,
+                None,
+            )
+            .await;
+        assert!(sent.is_ok(), "the degraded send is accepted: {sent:?}");
+
+        {
+            let state = mgr.get_state(conn_id).await.unwrap();
+            let s = state.read().await;
+            assert!(
+                s.turn_in_flight,
+                "the degraded prompt takes the gate like any ordinary send"
+            );
+            assert!(
+                !s.preempt_pending,
+                "no hand-over is left pending on a turn that no longer exists"
+            );
+        }
+        // The linked path broadcasts the prompt as a user message (the row was
+        // just created), so only the flag is asserted: one prompt, and it must
+        // NOT be marked preempt — there is no turn for the loop to cancel.
+        let commands = drain_prompt_commands(&mut cmd_rx);
+        assert_eq!(commands.len(), 1, "exactly one prompt reaches the loop");
+        assert!(
+            !commands[0].0,
+            "the degraded prompt must NOT be marked preempt"
+        );
+    }
+
+    /// I3: a failed enqueue leaves no claim behind. The hand-over is taken only
+    /// AFTER the channel reserved capacity, so a dead process cannot strand
+    /// `preempt_pending` and refuse every later interrupt forever.
+    #[tokio::test]
+    async fn an_interrupt_that_cannot_enqueue_leaves_no_pending_handover() {
+        use crate::db::test_helpers;
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/int-dead").await;
+        let mgr = ConnectionManager::new();
+        let conn_id = "conn-int-dead";
+        // The receiver is dropped by this helper: every enqueue fails with
+        // ProcessExited (see its doc). The folder lets the linked path get past
+        // its row creation to the reserve that fails.
+        insert_fake_connection(
+            &mgr,
+            conn_id,
+            AgentType::ClaudeCode,
+            Some(PathBuf::from("/tmp/int-dead")),
+            EventEmitter::Noop,
+        )
+        .await;
+        mgr.get_state(conn_id).await.unwrap().write().await.turn_in_flight = true;
+
+        let sent = mgr
+            .prompt_interrupt(
+                &db,
+                conn_id,
+                one_text_block(),
+                Some(folder_id),
+                None,
+                None,
+            )
+            .await;
+        assert!(
+            matches!(sent, Err(AcpError::ProcessExited)),
+            "a dead process must surface as ProcessExited, got {sent:?}"
+        );
+        assert!(
+            !mgr.get_state(conn_id)
+                .await
+                .unwrap()
+                .read()
+                .await
+                .preempt_pending,
+            "a failed enqueue must not leave the hand-over claimed"
+        );
+    }
+
+    /// I2's other half: the refusal happens BEFORE any side effect. A connection
+    /// with no conversation row yet must not mint one for an interrupt that is
+    /// about to be bounced — the row would be an empty conversation nobody
+    /// asked for, and the next attempt would have to explain it away.
+    #[tokio::test]
+    async fn a_refused_interrupt_mints_no_conversation_row() {
+        use crate::db::test_helpers;
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/int-norow").await;
+        let mgr = ConnectionManager::new();
+        let conn_id = "conn-int-norow";
+        let _cmd_rx = insert_live_connection(
+            &mgr,
+            conn_id,
+            AgentType::ClaudeCode,
+            Some(PathBuf::from("/tmp/int-norow")),
+        )
+        .await;
+        {
+            let state = mgr.get_state(conn_id).await.unwrap();
+            let mut s = state.write().await;
+            s.turn_in_flight = true;
+            s.preempt_pending = true; // another interrupt is mid-hand-over
+        }
+        let rows_before = count_conversation_rows(&db).await;
+
+        let refused = mgr
+            .prompt_interrupt(
+                &db,
+                conn_id,
+                one_text_block(),
+                Some(folder_id),
+                None,
+                None,
+            )
+            .await;
+        assert!(
+            matches!(refused, Err(AcpError::TurnInProgress)),
+            "must bounce, got {refused:?}"
+        );
+        assert_eq!(
+            count_conversation_rows(&db).await,
+            rows_before,
+            "a refused interrupt must not create a conversation row"
+        );
+        assert!(
+            mgr.get_state(conn_id)
+                .await
+                .unwrap()
+                .read()
+                .await
+                .conversation_id
+                .is_none(),
+            "…nor link the connection to one"
+        );
+    }
+
+    /// The interrupt is the ONE prompt admitted THROUGH a running turn: it
+    /// takes the hand-over (`preempt_pending`), leaves the gate held for the
+    /// turn it will start, and goes out marked `preempt` — the only way the
+    /// loop can know to run the Cancel sequence first.
+    #[tokio::test]
+    async fn prompt_interrupt_claims_the_handover_and_sends_the_flag() {
+        use crate::db::test_helpers;
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/int-claim").await;
+        let mgr = ConnectionManager::new();
+        let conn_id = "conn-int-claim";
+        let mut cmd_rx = insert_live_connection(
+            &mgr,
+            conn_id,
+            AgentType::ClaudeCode,
+            Some(PathBuf::from("/tmp/int-claim")),
+        )
+        .await;
+        // A turn is running: the state every interrupt is admitted against.
+        mgr.get_state(conn_id).await.unwrap().write().await.turn_in_flight = true;
+
+        let sent = mgr
+            .prompt_interrupt(
+                &db,
+                conn_id,
+                one_text_block(),
+                Some(folder_id),
+                None,
+                Some("optimistic-int".into()),
+            )
+            .await;
+        assert!(
+            sent.is_ok(),
+            "an interrupt is admitted against a running turn: {sent:?}"
+        );
+
+        {
+            let state = mgr.get_state(conn_id).await.unwrap();
+            let s = state.read().await;
+            assert!(
+                s.turn_in_flight,
+                "the hand-over keeps the gate held until the new turn ends"
+            );
+            assert!(
+                s.preempt_pending,
+                "the interrupt owns the hand-over until the loop opens its turn"
+            );
+        }
+
+        let commands = drain_prompt_commands(&mut cmd_rx);
+        assert_eq!(
+            commands,
+            vec![(true, Some("optimistic-int".to_string()))],
+            "exactly one prompt, marked preempt, carrying the sender's message id"
+        );
+    }
+
     #[tokio::test]
     async fn send_prompt_linked_rejects_empty_prompt_without_wedging_gate() {
         // An empty prompt is rejected BEFORE any side effects: it must NOT
@@ -7018,6 +7623,8 @@ mod tests {
                 }],
                 user_message: None,
                 internal_suffix: Vec::new(),
+                source: None,
+                preempt: false,
             })
             .await
             .unwrap();
@@ -7031,6 +7638,8 @@ mod tests {
             }],
             None,
             Vec::new(),
+            None,
+            false,
         );
         let res = tokio::time::timeout(std::time::Duration::from_millis(50), fut).await;
         assert!(
@@ -7074,6 +7683,7 @@ mod tests {
             None,
             None,
             Some("optimistic-abc".to_string()),
+            false,
         )
         .await
         .expect("send");
@@ -9723,6 +10333,9 @@ mod tests {
         let state = mgr.get_state(conn_id).await.unwrap();
         let mut s = state.write().await;
         s.native_steering_available = true;
+        s.insert_capability.steer = Some(SteerChannel {
+            boundary: SteerBoundary::Step,
+        });
         s.turn_in_flight = true;
     }
 
@@ -9734,9 +10347,30 @@ mod tests {
     ) -> tokio::task::JoinHandle<Vec<PromptInputBlock>> {
         tokio::spawn(async move {
             match rx.recv().await {
-                Some(ConnectionCommand::Steer { blocks, reply }) => {
-                    let _ = reply.send(outcome);
+                Some(ConnectionCommand::Steer { blocks, reply, .. }) => {
+                    let _ = reply.send(outcome.map(SteerReceipt::bare));
                     blocks
+                }
+                _ => panic!("expected a Steer command"),
+            }
+        })
+    }
+
+    /// [`answer_steer`] that also reports the command's `source` payload, for
+    /// tests asserting how a steer was classified (a notice vs user feedback).
+    fn answer_steer_with_source(
+        mut rx: tokio::sync::mpsc::Receiver<ConnectionCommand>,
+        outcome: Result<SteerOutcome, AcpError>,
+    ) -> tokio::task::JoinHandle<(Vec<PromptInputBlock>, Option<String>)> {
+        tokio::spawn(async move {
+            match rx.recv().await {
+                Some(ConnectionCommand::Steer {
+                    blocks,
+                    reply,
+                    source,
+                }) => {
+                    let _ = reply.send(outcome.map(SteerReceipt::bare));
+                    (blocks, source)
                 }
                 _ => panic!("expected a Steer command"),
             }
@@ -9760,7 +10394,7 @@ mod tests {
             for _ in 0..n {
                 match rx.recv().await {
                     Some(ConnectionCommand::Steer { reply, .. }) => {
-                        let _ = reply.send(Ok(outcome));
+                        let _ = reply.send(Ok(SteerReceipt::bare(outcome)));
                     }
                     _ => panic!("expected a Steer command"),
                 }
@@ -9791,7 +10425,7 @@ mod tests {
                 Some(ConnectionCommand::Steer { reply, .. }) => {
                     let seen_by_agent = chrono::Utc::now();
                     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                    let _ = reply.send(Ok(SteerOutcome::Injected));
+                    let _ = reply.send(Ok(SteerReceipt::bare(SteerOutcome::Injected)));
                     seen_by_agent
                 }
                 _ => panic!("expected a Steer command"),
@@ -10177,10 +10811,20 @@ mod tests {
         assert_eq!(item.status, FeedbackStatus::Delivered);
         let _ = fake_loop.await;
         let state = mgr.get_state("c1").await.unwrap();
-        assert!(
-            !state.read().await.native_steering_available,
-            "startedNewTurn must downgrade native steering for the session"
-        );
+        {
+            let s = state.read().await;
+            assert!(
+                !s.native_steering_available,
+                "startedNewTurn must downgrade native steering for the session"
+            );
+            // ...in BOTH projections: the capability the frontend's insert
+            // affordance reads must shrink with the legacy bool, or the UI
+            // would keep offering an insert this adapter just refused to honor.
+            assert!(
+                s.insert_capability.steer.is_none(),
+                "the capability's steer channel must be cleared with the legacy bool"
+            );
+        }
 
         // The NEXT note rides the pull path: lands Pending, no Steer command
         // (the loop receiver was consumed above — a native attempt would fail
@@ -10190,6 +10834,78 @@ mod tests {
         let pending = mgr.read_pending_feedback("c1").await;
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].text, "note two");
+    }
+
+    /// zcode's `queued`: the adapter accepted the content but will run it after
+    /// the current turn. That is CONSUMED — recorded delivered, never resent,
+    /// nothing pending for the pull tool — but it is the adapter's documented
+    /// deferral, so unlike `startedNewTurn` it must NOT downgrade the channel,
+    /// and the note carries the deferred state the UI captions.
+    #[tokio::test]
+    async fn native_submit_queued_records_delivered_with_state_and_keeps_native() {
+        let mgr = ConnectionManager::new();
+        let rx = mgr
+            .insert_test_connection_live("c1", AgentType::Custom("zcode"), None, EventEmitter::Noop)
+            .await;
+        mark_native_steering_ready(&mgr, "c1").await;
+        set_feedback_tool_available(&mgr, "c1").await;
+        let fake_loop = answer_steer(rx, Ok(SteerOutcome::Queued));
+
+        let item = mgr
+            .submit_feedback("c1", "  after the turn  ".into(), None)
+            .await
+            .unwrap();
+        assert_eq!(item.status, FeedbackStatus::Delivered);
+        assert_eq!(item.text, "after the turn");
+        // No adapter-reported state → the generic marker.
+        assert_eq!(item.steer_state.as_deref(), Some("queued"));
+        let _ = fake_loop.await;
+
+        let state = mgr.get_state("c1").await.unwrap();
+        {
+            let s = state.read().await;
+            assert_eq!(s.feedback.len(), 1);
+            assert_eq!(s.feedback[0].status, FeedbackStatus::Delivered);
+            assert!(
+                s.native_steering_available,
+                "queued is a documented deferral, not a broken promise"
+            );
+            assert!(s.insert_capability.steer.is_some());
+        }
+        // Delivered from birth → the pull tool can never hand the same text out
+        // again (the no-double-delivery invariant).
+        assert!(mgr.read_pending_feedback("c1").await.is_empty());
+    }
+
+    /// The adapter's own finer state (`_meta.steering.steerState` — zcode's
+    /// `fellBack` / `notRequested`) is what the note records when it reports
+    /// one; the UI only needs "not a plain injection".
+    #[tokio::test]
+    async fn native_submit_records_the_adapters_own_steer_state_when_reported() {
+        let mgr = ConnectionManager::new();
+        let mut rx = mgr
+            .insert_test_connection_live("c1", AgentType::Custom("zcode"), None, EventEmitter::Noop)
+            .await;
+        mark_native_steering_ready(&mgr, "c1").await;
+        let fake_loop = tokio::spawn(async move {
+            match rx.recv().await {
+                Some(ConnectionCommand::Steer { reply, .. }) => {
+                    let _ = reply.send(Ok(SteerReceipt {
+                        outcome: SteerOutcome::Queued,
+                        steer_state: Some("fellBack".into()),
+                    }));
+                }
+                _ => panic!("expected a Steer command"),
+            }
+        });
+
+        let item = mgr
+            .submit_feedback("c1", "note".into(), None)
+            .await
+            .unwrap();
+        assert_eq!(item.status, FeedbackStatus::Delivered);
+        assert_eq!(item.steer_state.as_deref(), Some("fellBack"));
+        let _ = fake_loop.await;
     }
 
     #[tokio::test]
@@ -10212,7 +10928,7 @@ mod tests {
                 Some(ConnectionCommand::Steer { reply, .. }) => {
                     // The turn settles BETWEEN the injection and the reply.
                     state_for_loop.write().await.turn_in_flight = false;
-                    let _ = reply.send(Ok(SteerOutcome::Injected));
+                    let _ = reply.send(Ok(SteerReceipt::bare(SteerOutcome::Injected)));
                 }
                 _ => panic!("expected a Steer command"),
             }
@@ -10250,7 +10966,7 @@ mod tests {
         let fake_loop = tokio::spawn(async move {
             if let Some(ConnectionCommand::Steer { reply, .. }) = rx.recv().await {
                 go_rx.await.ok(); // withhold the outcome until the caller is gone
-                let _ = reply.send(Ok(SteerOutcome::Injected));
+                let _ = reply.send(Ok(SteerReceipt::bare(SteerOutcome::Injected)));
             }
             rx // keep the receiver alive
         });

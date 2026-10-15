@@ -14,6 +14,7 @@ import type {
   AsyncTaskRecord,
   SessionFailureRecord,
   SessionModeInfo,
+  SteerBoundary,
   AvailableCommandInfo,
   RemoteControlInfo,
 } from "@/lib/types"
@@ -133,6 +134,10 @@ interface ConversationShellProps {
    *  live-feedback channel; threaded straight through to the composer's
    *  queue list. See `ChatInputProps.onQueueSteer`. */
   onQueueSteer?: (id: string) => Promise<void> | void
+  /** Stop the running turn and send one queued item as the next one; threaded
+   *  straight through to the composer's queue list. See
+   *  `ChatInputProps.onQueueInterrupt`. */
+  onQueueInterrupt?: (id: string) => Promise<void> | void
   editingItemId?: string | null
   editingDraftText?: string | null
   editingDraftBlocks?: PromptInputBlock[] | null
@@ -151,6 +156,16 @@ interface ConversationShellProps {
   /** Which channel `onSteer` rides (picks the composer's honest copy);
    *  threaded straight through. See `MessageInput`. */
   steerChannel?: "native" | "pull"
+  /** When a native insert takes effect (picks the honesty of the copy);
+   *  threaded straight through. See `MessageInput`. */
+  steerBoundary?: SteerBoundary | null
+  /** Stop the running turn and send the draft as the next one; threaded
+   *  straight through to the composer. See
+   *  `MessageInputProps.onInterruptSend`. */
+  onInterruptSend?: (blocks: PromptInputBlock[]) => Promise<void>
+  /** Whether an interrupt-and-send is in flight; threaded straight through.
+   *  See `MessageInput`. */
+  interrupting?: boolean
   /** Optional banner pinned to the top of the panel, above the message area
    *  (e.g. the "restart to apply" config-stale banner). Renders nothing when
    *  omitted. */
@@ -220,6 +235,7 @@ export function ConversationShell({
   onQueueEdit,
   onQueueDelete,
   onQueueSteer,
+  onQueueInterrupt,
   editingItemId,
   editingDraftText,
   editingDraftBlocks,
@@ -228,6 +244,9 @@ export function ConversationShell({
   onCancelQueueEdit,
   onSteer,
   steerChannel,
+  steerBoundary,
+  onInterruptSend,
+  interrupting,
   topBanner,
   injectContent,
   onInjectConsumed,
@@ -348,6 +367,7 @@ export function ConversationShell({
               onQueueEdit={onQueueEdit}
               onQueueDelete={onQueueDelete}
               onQueueSteer={onQueueSteer}
+              onQueueInterrupt={onQueueInterrupt}
               editingItemId={editingItemId}
               editingDraftText={editingDraftText}
               editingDraftBlocks={editingDraftBlocks}
@@ -356,6 +376,9 @@ export function ConversationShell({
               onCancelQueueEdit={onCancelQueueEdit}
               onSteer={onSteer}
               steerChannel={steerChannel}
+              steerBoundary={steerBoundary}
+              onInterruptSend={onInterruptSend}
+              interrupting={interrupting}
               onAddFeedback={onAddFeedback}
               feedbackAddDisabled={feedbackAddDisabled}
               injectContent={injectContent}

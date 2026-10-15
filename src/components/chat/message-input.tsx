@@ -5,6 +5,16 @@ import { useTranslations } from "next-intl"
 import { isImeCompositionKey } from "@/lib/ime-composition"
 import { Button } from "@/components/ui/button"
 import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog"
+import {
   BookOpenText,
   Check,
   ChevronUp,
@@ -12,6 +22,7 @@ import {
   Clock,
   Copy,
   MessageSquareText,
+  OctagonX,
   Scissors,
   Send,
   Square,
@@ -56,6 +67,7 @@ import type {
   PromptInputBlock,
   SessionConfigOptionInfo,
   SessionModeInfo,
+  SteerBoundary,
 } from "@/lib/types"
 import {
   ATTACH_FILE_TO_SESSION_EVENT,
@@ -249,6 +261,25 @@ interface MessageInputProps {
    *  rather than claiming an insert that never happened (same reason
    *  `FeedbackDialog.channel` defaults to `pull`). */
   steerChannel?: "native" | "pull"
+  /** When a native insert takes effect (`useSessionFeedback().insertBoundary`).
+   *  Picks the honest promise for the mid-turn action: `immediate` → takes
+   *  effect at once, `step` → at the next step, `turnEnd` → accepted and run
+   *  after this turn (the queued receipt's wording). Omitted/null keeps the
+   *  generic insert copy — a caller with no boundary to report must not promise
+   *  one. Ignored on pull sessions (`steerChannel` picks that arm). */
+  steerBoundary?: SteerBoundary | null
+  /** Stop the running turn and send this draft as the next one ("interrupt and
+   *  send now"). Deliberately NOT gated on the live-feedback channel: it is a
+   *  plain `session/cancel` + `session/prompt`, so every agent supports it,
+   *  and the entry stays available on sessions with no `onSteer`. Confirmed
+   *  destructively (it aborts work in progress) before it is called. Awaited:
+   *  resolve = admitted (clear the draft); reject = not admitted, the draft is
+   *  kept and the failure reported. */
+  onInterruptSend?: (blocks: PromptInputBlock[]) => Promise<void>
+  /** Whether an interrupt-and-send is in flight (`useSessionFeedback()
+   *  .interrupting`): the entry is disabled and reads "delivering" while the
+   *  backend settles it. */
+  interrupting?: boolean
   /** Open the live-feedback dialog (from the "+" menu). When omitted the entry
    *  is hidden (feature off). */
   onAddFeedback?: () => void
@@ -363,6 +394,9 @@ export function MessageInput({
   onCancelQueueEdit,
   onSteer,
   steerChannel = "pull",
+  steerBoundary,
+  onInterruptSend,
+  interrupting = false,
   onAddFeedback,
   feedbackAddDisabled,
   injectContent,
@@ -1634,6 +1668,23 @@ export function MessageInput({
   // uploads are gated here exactly like `handleSend` (no server-side uri to
   // hydrate from yet), since the enqueue fallback below bypasses its gate.
   const [steering, setSteering] = useState(false)
+  // Clear the composer after a mid-turn submission — but only while it still
+  // holds exactly the draft that was sent. Edits made during delivery must
+  // survive (clearing or trimming would discard them); an unedited draft
+  // clears so the split collapses like a normal send.
+  const clearSentDraftIfUnchanged = useCallback(
+    (sentDraft: PromptDraft, sentEditor: Editor | null | undefined) => {
+      const current = currentComposerRef.current
+      if (
+        current.draftStorageKey === effectiveDraftStorageKey &&
+        editorRef.current?.getEditor() === sentEditor &&
+        JSON.stringify(current.buildDraft()) === JSON.stringify(sentDraft)
+      ) {
+        resetComposer()
+      }
+    },
+    [effectiveDraftStorageKey, resetComposer]
+  )
   const handleSteerClick = useCallback(async () => {
     if (!onSteer || steering) return
     if (hasUploadingImage) {
@@ -1643,22 +1694,10 @@ export function MessageInput({
     const draft = buildDraft()
     if (!draft) return
     const sentEditor = editorRef.current?.getEditor()
-    // Keep the whole edited draft: appending during delivery can retain text
-    // already sent, but clearing or trimming it would discard the user's edits.
-    const clearSentDraft = () => {
-      const current = currentComposerRef.current
-      if (
-        current.draftStorageKey === effectiveDraftStorageKey &&
-        editorRef.current?.getEditor() === sentEditor &&
-        JSON.stringify(current.buildDraft()) === JSON.stringify(draft)
-      ) {
-        resetComposer()
-      }
-    }
     const enqueueInstead = () => {
       if (!onEnqueue) return
       onEnqueue(draft, showModeSelector ? effectiveModeId : null)
-      clearSentDraft()
+      clearSentDraftIfUnchanged(draft, sentEditor)
       toast.info(t("steerQueuedInstead"))
     }
     const payload = buildSteerPayload(draft)
@@ -1666,7 +1705,7 @@ export function MessageInput({
     setSteering(true)
     try {
       await onSteer(payload.text, payload.blocks)
-      clearSentDraft()
+      clearSentDraftIfUnchanged(draft, sentEditor)
     } catch (err) {
       if (isNoActiveTurnRejection(err)) {
         // The turn ended in the race window — reroute through the queue.
@@ -1689,9 +1728,43 @@ export function MessageInput({
     onEnqueue,
     showModeSelector,
     effectiveModeId,
-    effectiveDraftStorageKey,
-    resetComposer,
+    clearSentDraftIfUnchanged,
     steerChannel,
+    t,
+  ])
+
+  // Interrupt-and-send: "stop the running turn and send THIS draft instead".
+  // Destructive and irreversible for the work in progress, so the dropdown
+  // entry only opens a confirmation; the send itself runs from the dialog's
+  // action. Deliberately independent of the live-feedback channel
+  // (`steerChannel` / `onSteer`): every agent can be cancelled, and the entry
+  // must be offered even where no steer exists. The handler rethrows nothing —
+  // a failure keeps the draft (like a steer failure) and reports it.
+  const [interruptConfirmOpen, setInterruptConfirmOpen] = useState(false)
+  const handleInterruptSend = useCallback(async () => {
+    if (!onInterruptSend || interrupting) return
+    if (hasUploadingImage) {
+      toast.error(tAttach("attachUploadInProgress"))
+      return
+    }
+    const draft = buildDraft()
+    if (!draft) return
+    const sentEditor = editorRef.current?.getEditor()
+    try {
+      // The FULL block list (not `buildSteerPayload`): this is an ordinary
+      // prompt wire, so attachments ride as blocks exactly like a normal send.
+      await onInterruptSend(draft.blocks)
+      clearSentDraftIfUnchanged(draft, sentEditor)
+    } catch (err) {
+      toast.error(t("interruptFailed"), { description: toErrorMessage(err) })
+    }
+  }, [
+    onInterruptSend,
+    interrupting,
+    hasUploadingImage,
+    tAttach,
+    buildDraft,
+    clearSentDraftIfUnchanged,
     t,
   ])
 
@@ -1814,6 +1887,17 @@ export function MessageInput({
     [handleModeSelect, onConfigOptionChange]
   )
 
+  const steerLabelKey =
+    steerChannel === "pull"
+      ? "steerAsNote"
+      : steerBoundary === "immediate"
+        ? "insertImmediate"
+        : steerBoundary === "step"
+          ? "insertNextStep"
+          : steerBoundary === "turnEnd"
+            ? "steerQueuedReceipt"
+            : "steerIntoTurn"
+
   const actionButtons = isEditingQueueItem ? (
     <div className="flex items-center gap-1">
       <Button
@@ -1836,15 +1920,20 @@ export function MessageInput({
       </Button>
     </div>
   ) : isPrompting && onCancel ? (
-    onSteer && onEnqueue && hasSendableContent ? (
+    (onSteer || onInterruptSend) && onEnqueue && hasSendableContent ? (
       // Sessions with a working live-feedback channel surface the mid-turn
       // actions that already exist but were keyboard-only/invisible: the
       // primary half of the split queues the draft (what Enter has always
-      // done here), the dropdown sends it over the channel — a native push
-      // inserts into the RUNNING turn, a pull-tool session records a waiting
-      // note for the agent's next check (label keyed on `steerChannel`).
-      // Without `onSteer` this branch stays pixel-identical to the
-      // historical Stop-only form below.
+      // done here), the dropdown sends it over the channel. The label is
+      // keyed on `steerChannel` AND — on a native session — on the adapter's
+      // declared `steerBoundary`, so the copy promises exactly the delivery
+      // the adapter implements (a pull session records a waiting note; a
+      // native one inserts at the boundary it advertised, or says the insert
+      // runs after the turn when the adapter defers). The interrupt-and-send
+      // entry rides the same dropdown but NOT the channel: cancelling and
+      // resending is a plain ACP sequence every agent supports, so it appears
+      // even on a session with no `onSteer` at all (that arm keeps the
+      // historical Stop-only form below only when it has neither action).
       <div className="flex items-center gap-1">
         <Button
           onClick={onCancel}
@@ -1871,28 +1960,44 @@ export function MessageInput({
                 disabled={steering}
                 size="icon"
                 className="h-8 w-5 rounded-l-none border-l border-primary-foreground/20"
-                aria-label={t(
-                  steerChannel === "pull" ? "steerAsNote" : "steerIntoTurn"
-                )}
+                // Without a steer channel the dropdown's remaining action is
+                // the interrupt, so the trigger names that instead of
+                // advertising an insert this session does not have.
+                aria-label={t(onSteer ? steerLabelKey : "interruptSend")}
               >
                 <ChevronUp className="size-4" />
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end" side="top">
-              <DropdownMenuItem
-                onSelect={() => void handleSteerClick()}
-                disabled={steering}
-              >
-                {/* Icon carries the same promise as the label: the bolt is
-                    the instant insert, the clock is the note that waits —
-                    the very glyph the notes strip uses for `pending`. */}
-                {steerChannel === "pull" ? (
-                  <Clock className="h-4 w-4" />
-                ) : (
-                  <Zap className="h-4 w-4" />
-                )}
-                {t(steerChannel === "pull" ? "steerAsNote" : "steerIntoTurn")}
-              </DropdownMenuItem>
+              {onSteer && (
+                <DropdownMenuItem
+                  onSelect={() => void handleSteerClick()}
+                  disabled={steering}
+                >
+                  {/* Icon carries the same promise as the label: the bolt is
+                      the instant insert, the clock is the note that waits —
+                      the very glyph the notes strip uses for `pending`. */}
+                  {steerChannel === "pull" ? (
+                    <Clock className="h-4 w-4" />
+                  ) : (
+                    <Zap className="h-4 w-4" />
+                  )}
+                  {t(steerLabelKey)}
+                </DropdownMenuItem>
+              )}
+              {onInterruptSend && (
+                <DropdownMenuItem
+                  variant="destructive"
+                  // Opens the confirmation; the destructive part (and the
+                  // draft policy) live in `handleInterruptSend`, which only
+                  // the dialog's action runs.
+                  onSelect={() => setInterruptConfirmOpen(true)}
+                  disabled={interrupting}
+                >
+                  <OctagonX className="h-4 w-4" />
+                  {t(interrupting ? "interruptDelivering" : "interruptSend")}
+                </DropdownMenuItem>
+              )}
             </DropdownMenuContent>
           </DropdownMenu>
         </div>
@@ -2265,6 +2370,37 @@ export function MessageInput({
           initialPath={defaultPath ?? undefined}
         />
       )}
+      {/* Destructive confirmation for interrupt-and-send: it aborts whatever
+          the agent is doing, so it never fires straight from the menu. The
+          action closes the dialog and starts the delivery; the draft is kept
+          if the backend refuses, and the dropdown entry reports the in-flight
+          state. */}
+      <AlertDialog
+        open={interruptConfirmOpen}
+        onOpenChange={setInterruptConfirmOpen}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t("interruptConfirmTitle")}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {t("interruptSendHint")}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t("cancel")}</AlertDialogCancel>
+            <AlertDialogAction
+              variant="destructive"
+              onClick={(event) => {
+                event.preventDefault()
+                setInterruptConfirmOpen(false)
+                void handleInterruptSend()
+              }}
+            >
+              {t("interruptSend")}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   )
 }

@@ -460,11 +460,28 @@ pub const PI_MIN_RUNTIME_VERSION: &str = "0.81.0";
 /// steering policy (`connection.rs::steering_policy_agent`).
 pub const CLAUDE_AGENT_ACP_PACKAGE: &str = "@agentclientprotocol/claude-agent-acp";
 
+/// Adapter names whose `_session/steering` advertisement codeg admits on the
+/// adapter's own descriptor, without a version floor: a custom agent runs
+/// whatever the user pointed it at, so the only proof available is what its
+/// running adapter reports. Compliance is checked at synthesis — the adapter
+/// must declare it honors the `promptRequired` idle contract
+/// (`connection.rs::synthesize_insert_capability`), which is what keeps codeg's
+/// turn-scoped runtime from being handed a detached turn.
+///
+/// The list is a POLICY SELECTOR and a guard against accidental enablement, not
+/// a security boundary: a custom agent is an arbitrary local program, so a
+/// forged `agentInfo.name` is no harder to arrange than forged behavior.
+///
+/// `zcode-acp` (the ZCode bridge) is the first entry — its initialize reports
+/// `_meta.steering{idle:"promptRequired", outcomes:[injected, queued,
+/// promptRequired, startedNewTurn, failed]}` and `agentInfo.name = "zcode-acp"`.
+pub const ADVERTISED_STEERING_AGENTS: &[&str] = &["zcode-acp"];
+
 /// Minimum adapter version whose `_session/steering` honors the
 /// `_meta.steering.idleBehavior = "promptRequired"` opt-in — one of the three
 /// gates for codeg's NATIVE live-feedback push channel (synthesized into
-/// `SessionState.native_steering_available` at initialize; see
-/// `connection.rs::init_advertises_steering`).
+/// `SessionState.native_steering_available` / `insert_capability.steer` at
+/// initialize; see `connection.rs::synthesize_insert_capability`).
 ///
 /// `None` means "never steer natively" even when the adapter advertises
 /// `_meta.steering.supported`: an adapter that ignores the opt-in falls back

@@ -11735,6 +11735,35 @@ pub async fn acp_prompt(
             conversation_id,
             None,
             client_message_id,
+            false,
+        )
+        .await
+        .map(|_| ())
+}
+
+/// Stop the connection's running turn and send `blocks` as the next one, as a
+/// single admission (see [`ConnectionManager::prompt_interrupt`]). Same
+/// parameters and error surface as [`acp_prompt`] — the frontend treats a
+/// rejection exactly as it treats a busy one: the draft goes back to the queue.
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn acp_prompt_interrupt(
+    connection_id: String,
+    blocks: Vec<PromptInputBlock>,
+    folder_id: Option<i32>,
+    conversation_id: Option<i32>,
+    client_message_id: Option<String>,
+    db: State<'_, crate::db::AppDatabase>,
+    manager: State<'_, ConnectionManager>,
+) -> Result<(), AcpError> {
+    manager
+        .prompt_interrupt(
+            &db,
+            &connection_id,
+            blocks,
+            folder_id,
+            conversation_id,
+            client_message_id,
         )
         .await
         .map(|_| ())
