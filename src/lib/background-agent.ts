@@ -64,6 +64,36 @@ export function isOutOfTurnContentEvent(envelope: {
   return envelope.type === "tool_call"
 }
 
+/**
+ * How long after a cancelled turn content frames may still belong to its tail.
+ *
+ * Cancel does not wait for the agent (see the Cancel branch in
+ * `acp/connection.rs`): the backend immediately emits
+ * `TurnComplete{stop_reason:"cancelled"}` and flips the status back, while the
+ * agent keeps emitting the interrupted turn's last frames. Those land in the
+ * connected window, where the out-of-turn guard drops them — and the pill
+ * effect used to read them as background activity and light up (2026-10-14
+ * incident, conv 84: a thinking chunk arrived 24ms after the cancel).
+ *
+ * 8s is calibrated on the zcode bridge's teardown timeline: its hard-stop
+ * fallback settles within ~6s, and the `session/close + resume` replay (which
+ * can re-emit the cancelled turn's persisted history) lands ~5.4s after the
+ * cancel. A shorter window lets those settle frames light the pill again.
+ */
+export const CANCEL_TAIL_GRACE_MS = 8_000
+
+/**
+ * Whether `now` falls inside the grace window that a cancelled turn's trailing
+ * frames may still arrive in (`ConnectionState.cancelGraceUntil`; cleared early
+ * by the next `prompting` turn). See {@link CANCEL_TAIL_GRACE_MS}.
+ */
+export function isWithinCancelGrace(
+  cancelGraceUntil: number | null,
+  now: number
+): boolean {
+  return cancelGraceUntil !== null && now < cancelGraceUntil
+}
+
 export interface BackgroundTaskLifecycle {
   taskId: string
   /** `<status>` of the latest task-notification ("completed" on success);

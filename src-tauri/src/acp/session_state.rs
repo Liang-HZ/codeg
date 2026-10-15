@@ -8,6 +8,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::acp::connection::SteerOutcome;
 use crate::acp::delegation::types::{BlockedKind, BlockedOn};
 use crate::acp::event_stream::{
     images_slice_size, json_str_len, json_value_size, opt_json_size, opt_str_size,
@@ -493,12 +494,36 @@ pub struct SessionState {
     /// `_session/steering` push channel instead of the `check_user_feedback`
     /// pull tool. Synthesized ONCE at initialize from three gates (extension
     /// advertised + registry policy + `agent_info.version` runtime proof — see
-    /// `connection.rs::init_advertises_steering`) so every consumer reads one
-    /// authoritative bool and the frontend never re-derives it from agent
+    /// `connection.rs::synthesize_insert_capability`) so every consumer reads
+    /// one authoritative bool and the frontend never re-derives it from agent
     /// type. Downgraded to `false` for the rest of the session if a steer ever
     /// comes back `startedNewTurn` (adapter ignored the `promptRequired`
     /// opt-in), rerouting subsequent notes to the MCP pull path.
+    ///
+    /// Transitional projection of [`Self::insert_capability`]'s `steer`:
+    /// `native_steering_available == insert_capability.steer.is_some()` (always
+    /// assigned together). Kept for one release so older clients keep working;
+    /// retired once the frontend reads the capability alone.
     pub native_steering_available: bool,
+
+    /// The session's mid-turn insert capability, synthesized ONCE at initialize
+    /// from the adapter's `_meta.steering` descriptor + the registry policy (see
+    /// `connection.rs::synthesize_insert_capability`). `pull` mirrors
+    /// [`Self::feedback_tool_available`] and is filled at companion injection
+    /// time; `steer`'s boundary decides which insert copy is honest
+    /// ("next step" vs "right away" vs "at turn end"). Downgraded in step with
+    /// `native_steering_available` on a `startedNewTurn` steer.
+    pub insert_capability: InsertCapability,
+
+    /// The `outcome` vocabulary this connection's adapter declared at
+    /// initialize (`_meta.steering.outcomes`, validated against the known
+    /// strings), used to parse `_session/steering` receipts — a `queued` (or
+    /// `failed`) answer only parses for an adapter that advertised it. The
+    /// historical three parse regardless. Defaulted to the historical three so
+    /// a connection that never sees a descriptor (or a steer request before
+    /// initialize lands) parses exactly as before. Backend-internal routing
+    /// only: not part of the client snapshot.
+    pub steering_outcomes: Vec<SteerOutcome>,
 
     /// Which generation of codex-acp's `request_user_input` bridge this
     /// connection is talking to — 1.12.0 swapped the question and the tab
@@ -636,6 +661,33 @@ pub struct SessionState {
     /// serialized: backend-internal, like `turn_in_flight`.
     pub agent_initiated_turn: bool,
 
+    /// True while a preempt handover is in flight: the user interrupted a
+    /// running turn to send a new prompt, and the gate `turn_in_flight` is
+    /// handed from the cancelled turn straight to that prompt's turn.
+    ///
+    /// Set in the SAME critical section as the intermediate
+    /// `TurnComplete{cancelled}` (the loop builds it through
+    /// `emit_with_state_built`, so the flag and the event can never be split by
+    /// another writer) and consumed by that event's reducer below: the
+    /// intermediate TurnComplete must NOT release the gate, or the new turn
+    /// would run with the gate open — a concurrent prompt admitted in that
+    /// window is then silently swallowed by the loop's in-turn tripwire while
+    /// its caller sees success. The new turn's own `TurnComplete` clears the
+    /// gate normally (the flag is already consumed by then). Not serialized:
+    /// backend-internal, like `turn_in_flight`.
+    pub preempt_handover: bool,
+
+    /// True from a preempt prompt's admission until the connection loop opens
+    /// the turn for it. Set by the manager inside the same critical section
+    /// that decides the prompt is an interrupt (so two preempts admitted
+    /// concurrently cannot both claim the handover — the second sees the flag
+    /// and is answered `TurnInProgress`, and the frontend re-queues it like any
+    /// other busy bounce). Cleared by the loop at the turn opening, NOT at
+    /// command dequeue: the cancel sequence in between is exactly the window a
+    /// second preempt must not be admitted into. Not serialized: backend-
+    /// internal, like `turn_in_flight`.
+    pub preempt_pending: bool,
+
     /// How many `TurnComplete`s this connection has applied — the turn's
     /// IDENTITY, paired with `turn_in_flight`. `turn_in_flight` alone only says
     /// "some turn is running"; a caller that admitted itself against turn N and
@@ -751,6 +803,8 @@ impl SessionState {
             delegation_enabled: false,
             feedback_tool_available: false,
             native_steering_available: false,
+            insert_capability: InsertCapability::default(),
+            steering_outcomes: crate::acp::connection::DEFAULT_STEER_OUTCOMES.to_vec(),
             codex_user_input_shape: None,
             neutral_goal_channel: false,
             goal_control_method: crate::acp::codex_goal::LEGACY_GOAL_CONTROL_METHOD.to_string(),
@@ -764,6 +818,8 @@ impl SessionState {
             pending_user_message_started_at: None,
             turn_in_flight: false,
             agent_initiated_turn: false,
+            preempt_handover: false,
+            preempt_pending: false,
             turns_completed: 0,
             last_turn_ended_abnormally: false,
             config_stale: false,
@@ -1198,12 +1254,23 @@ impl SessionState {
                 // is accepted. (All connection-alive turn endings — normal,
                 // cancel, stop-reason — emit TurnComplete; disconnect/error
                 // discard the state entirely, so no stale flag can outlive them.)
-                // A turn the agent started itself never held the gate; a set
-                // flag then belongs to a prompt admitted while it ran.
-                if !self.agent_initiated_turn {
+                // Two exceptions, both meaning "this TurnComplete is not the end
+                // of the turn the gate belongs to":
+                // - A turn the agent started itself never held the gate; a set
+                //   flag then belongs to a prompt admitted while it ran.
+                // - A preempt handover: this is the intermediate
+                //   `TurnComplete{cancelled}` of a turn the user interrupted,
+                //   and the prompt that interrupted it was admitted against the
+                //   SAME gate and opens the next turn in the same breath. The
+                //   flag is consumed here (it was set in this event's own
+                //   critical section — see `preempt_handover`), so exactly one
+                //   TurnComplete ever sees it and the new turn's own completion
+                //   clears the gate normally.
+                if !self.agent_initiated_turn && !self.preempt_handover {
                     self.turn_in_flight = false;
                 }
                 self.agent_initiated_turn = false;
+                self.preempt_handover = false;
                 // Same edge, the identity half: anyone holding "the turn I was
                 // admitted against" can now see that it is gone, even if a new
                 // turn sets `turn_in_flight` again before they look.
@@ -2152,6 +2219,7 @@ impl SessionState {
             background_outstanding: self.background_outstanding,
             feedback_tool_available: self.feedback_tool_available,
             native_steering_available: self.native_steering_available,
+            insert_capability: self.insert_capability,
             modes: self.modes.clone(),
             current_mode: self.current_mode.clone(),
             config_options: self.config_options.clone(),
@@ -2193,6 +2261,59 @@ pub(crate) fn background_keepalive_max_age() -> chrono::Duration {
             .unwrap_or(3600)
     });
     chrono::Duration::seconds(secs)
+}
+
+/// How soon a native `_session/steering` insert takes effect, as the adapter
+/// declared it at initialize (`_meta.steering.boundary`). A UI-copy knob only —
+/// delivery never branches on it — but the copy must promise no more than the
+/// adapter does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SteerBoundary {
+    /// Applies to the work already in flight.
+    Immediate,
+    /// Applies at the next tool-call/step boundary — the conservative default
+    /// for an adapter that omits the field (or sends a future value).
+    #[default]
+    Step,
+    /// Accepted, but runs after the current turn.
+    TurnEnd,
+}
+
+/// The native `_session/steering` channel of a session's insert capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SteerChannel {
+    pub boundary: SteerBoundary,
+}
+
+/// What a session can do with a message sent while a turn runs. Synthesized
+/// ONCE at initialize; every consumer (the manager's submit split, the
+/// snapshot, the frontend) reads this one model instead of re-deriving it from
+/// agent type.
+///
+/// Deliberately small: a field lives here only with a named consumer. `steer`
+/// gates the insert affordance (`is_some()`) and picks its copy (`boundary`),
+/// `pull` mirrors the `check_user_feedback` tool. A `queue`/`interrupt` flag
+/// would be constant true, and no reader consumes a `receipts`/`source` field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct InsertCapability {
+    /// The native push channel. `None` = not available (the session still has
+    /// the message queue and — when `pull` — the feedback tool).
+    #[serde(default)]
+    pub steer: Option<SteerChannel>,
+    /// The `check_user_feedback` pull channel (mirror of
+    /// `SessionState.feedback_tool_available`).
+    #[serde(default)]
+    pub pull: bool,
+}
+
+impl InsertCapability {
+    /// Nothing to report (no steer channel, no pull tool). `skip_serializing_if`
+    /// keys on this so snapshots for sessions without any insert channel keep
+    /// the pre-feature wire shape.
+    pub fn is_empty(&self) -> bool {
+        self.steer.is_none() && !self.pull
+    }
 }
 
 /// `to_snapshot()` 的输出——前端可消费的 wire shape。
@@ -2256,8 +2377,17 @@ pub struct LiveSessionSnapshot {
     /// (see `SessionState.native_steering_available`). `#[serde(default)]` so
     /// older payloads deserialize to `false`; always serialized (plain bool)
     /// like `feedback_tool_available` so the frontend can rely on it.
+    ///
+    /// Transitional: mirrors `insert_capability.steer.is_some()`, kept one
+    /// release so older clients keep their insert affordance.
     #[serde(default)]
     pub native_steering_available: bool,
+    /// The session's mid-turn insert capability (see
+    /// `SessionState.insert_capability`). `#[serde(default)]` so older payloads
+    /// deserialize; `skip_serializing_if` keeps the common no-channel case off
+    /// the wire so a snapshot stays byte-identical with the pre-feature shape.
+    #[serde(default, skip_serializing_if = "InsertCapability::is_empty")]
+    pub insert_capability: InsertCapability,
     pub modes: Option<SessionModeStateInfo>,
     pub current_mode: Option<String>,
     pub config_options: Option<Vec<SessionConfigOptionInfo>>,
@@ -2836,6 +2966,81 @@ mod tests {
         assert!(!s.agent_initiated_turn);
     }
 
+    /// The preempt hand-over: the intermediate `TurnComplete{cancelled}` of the
+    /// turn the user interrupted must NOT release the gate — the prompt that
+    /// interrupted it was admitted against that very gate and opens the next
+    /// turn. The flag is consumed by that one event, so the NEW turn's own
+    /// completion releases the gate as always.
+    #[test]
+    fn a_preempt_handover_keeps_the_gate_for_the_interrupting_prompt() {
+        let mut s = fresh_state();
+        s.apply_event(&AcpEvent::StatusChanged {
+            status: ConnectionStatus::Prompting,
+        });
+        s.turn_in_flight = true;
+
+        // The loop's intermediate TurnComplete: built with the hand-over flag
+        // set in the event's own critical section (`emit_with_state_built`).
+        s.preempt_handover = true;
+        s.apply_event(&AcpEvent::TurnComplete {
+            session_id: "s1".into(),
+            stop_reason: "cancelled".into(),
+            agent_type: "claude".into(),
+        });
+        assert!(
+            s.turn_in_flight,
+            "the interrupting prompt still owns the gate"
+        );
+        assert!(
+            !s.preempt_handover,
+            "the flag is consumed by the one TurnComplete it was set for"
+        );
+
+        // The new turn opens (the loop clears `preempt_pending` here) and then
+        // ends on its own — the ordinary release, unaffected by the handover.
+        s.preempt_pending = false;
+        s.apply_event(&AcpEvent::StatusChanged {
+            status: ConnectionStatus::Prompting,
+        });
+        s.apply_event(&AcpEvent::TurnComplete {
+            session_id: "s1".into(),
+            stop_reason: "end_turn".into(),
+            agent_type: "claude".into(),
+        });
+        assert!(!s.turn_in_flight);
+    }
+
+    /// A Stop that lands while a preempt hand-over is in flight ends whatever
+    /// turn is running when it is processed, so the gate must end up RELEASED —
+    /// no hand-over may strand it. (The loop clears `preempt_pending` at the
+    /// turn opening, so this is the state a later Stop's TurnComplete sees.)
+    #[test]
+    fn a_stop_after_a_handover_releases_the_gate() {
+        let mut s = fresh_state();
+        s.turn_in_flight = true;
+        s.preempt_pending = true;
+        // Hand-over consumed, new turn running, pending cleared by the loop.
+        s.preempt_handover = true;
+        s.apply_event(&AcpEvent::TurnComplete {
+            session_id: "s1".into(),
+            stop_reason: "cancelled".into(),
+            agent_type: "claude".into(),
+        });
+        s.preempt_pending = false;
+        assert!(s.turn_in_flight);
+
+        // The user's Stop lands on the NEW turn: an ordinary TurnComplete.
+        s.apply_event(&AcpEvent::TurnComplete {
+            session_id: "s1".into(),
+            stop_reason: "cancelled".into(),
+            agent_type: "claude".into(),
+        });
+        assert!(
+            !s.turn_in_flight,
+            "a Stop after the hand-over must leave no gate held"
+        );
+    }
+
     /// Text the agent sends between turns still lands in `live_message`, but a
     /// prompted turn starts from an empty one — as every client's reducer does
     /// at `Prompting` — so neither the snapshot a mid-turn attach renders nor
@@ -3097,6 +3302,36 @@ mod tests {
         let zero = fresh_state();
         let json = serde_json::to_value(zero.to_snapshot()).unwrap();
         assert!(json.get("background_outstanding").is_none());
+    }
+
+    #[test]
+    fn snapshot_carries_insert_capability_and_skips_the_empty_one() {
+        let mut s = fresh_state();
+        s.insert_capability = InsertCapability {
+            steer: Some(SteerChannel {
+                boundary: SteerBoundary::TurnEnd,
+            }),
+            pull: true,
+        };
+        s.native_steering_available = true;
+        let json = serde_json::to_value(s.to_snapshot()).unwrap();
+        assert_eq!(
+            json["insert_capability"]["steer"]["boundary"],
+            serde_json::json!("turnEnd"),
+            "the boundary crosses the wire in the frontend's camelCase"
+        );
+        assert_eq!(json["insert_capability"]["pull"], serde_json::json!(true));
+        // Transitional: the legacy bool mirrors `steer.is_some()`.
+        assert_eq!(json["native_steering_available"], serde_json::json!(true));
+
+        // No channel at all: the field stays off the wire (pre-feature shape),
+        // and a payload without it deserializes to the empty capability.
+        let empty = fresh_state();
+        let json = serde_json::to_value(empty.to_snapshot()).unwrap();
+        assert!(json.get("insert_capability").is_none());
+        let parsed: LiveSessionSnapshot = serde_json::from_value(json).unwrap();
+        assert!(parsed.insert_capability.steer.is_none());
+        assert!(!parsed.insert_capability.pull);
     }
 
     #[test]

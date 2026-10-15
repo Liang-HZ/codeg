@@ -1960,6 +1960,7 @@ mod tauri_app {
                 acp_commands::acp_qoder_auth_status,
                 acp_commands::acp_connect,
                 acp_commands::acp_prompt,
+                acp_commands::acp_prompt_interrupt,
                 acp_commands::acp_set_mode,
                 acp_commands::acp_set_config_option,
                 acp_commands::acp_goal_control,

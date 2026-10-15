@@ -5,6 +5,7 @@ import type {
   ConnectionStatus,
   EventEnvelope,
   FeedbackItem,
+  InsertCapability,
   LiveSessionSnapshot,
 } from "@/lib/types"
 
@@ -26,6 +27,7 @@ vi.mock("next-intl", () => ({
 vi.mock("@/lib/api", () => ({
   submitSessionFeedback: vi.fn(),
   acpGetSessionSnapshot: vi.fn(),
+  acpPromptInterrupt: vi.fn(),
 }))
 vi.mock("@/lib/app-error", () => ({
   toErrorMessage: (e: unknown) => String(e),
@@ -41,12 +43,17 @@ import {
   useSessionFeedback,
   type UseSessionFeedbackArgs,
 } from "./use-session-feedback"
-import { acpGetSessionSnapshot, submitSessionFeedback } from "@/lib/api"
+import {
+  acpGetSessionSnapshot,
+  acpPromptInterrupt,
+  submitSessionFeedback,
+} from "@/lib/api"
 import { isNoActiveTurnRejection } from "@/lib/turn-busy"
 import { toast } from "sonner"
 
 const mockSnapshot = vi.mocked(acpGetSessionSnapshot)
 const mockSubmit = vi.mocked(submitSessionFeedback)
+const mockInterrupt = vi.mocked(acpPromptInterrupt)
 const mockIsNoTurn = vi.mocked(isNoActiveTurnRejection)
 
 function note(
@@ -286,6 +293,81 @@ describe("useSessionFeedback", () => {
     await waitFor(() => expect(result.current.canSubmit).toBe(true))
     expect(result.current.channel).toBe("native")
     expect(result.current.steerAvailable).toBe(true)
+  })
+
+  it("reads the capability's steer channel and its boundary", async () => {
+    // The P1/P2 model: `insert_capability.steer` is what the frontend reads for
+    // the insert entry (the legacy bool is its transitional projection). A
+    // capability-only payload — no pull tool, legacy bool absent — must unlock
+    // the entry and carry the adapter's declared boundary into the copy.
+    mockSnapshot.mockResolvedValue(
+      snapshot({
+        feedback_tool_available: false,
+        insert_capability: { steer: { boundary: "immediate" }, pull: false },
+      })
+    )
+    const { result } = renderHook(() => useSessionFeedback(baseProps))
+
+    await waitFor(() => expect(result.current.channel).toBe("native"))
+    expect(result.current.steerAvailable).toBe(true)
+    expect(result.current.canSubmit).toBe(true)
+    expect(result.current.insertBoundary).toBe("immediate")
+  })
+
+  it("self-heals the capability and boundary once the connection goes live", async () => {
+    // The new connection's FIRST snapshot (while "connecting") precedes the
+    // backend's initialize synthesis: it carries neither channel. The
+    // self-heal re-read must pick BOTH the capability and its boundary up, or
+    // a fresh zcode session renders its insert entry with generic copy — or
+    // never at all.
+    mockSnapshot.mockResolvedValue(
+      snapshot({
+        feedback_tool_available: false,
+        insert_capability: null,
+      })
+    )
+    const { result, rerender } = renderHook(
+      (props: UseSessionFeedbackArgs) => useSessionFeedback(props),
+      {
+        initialProps: {
+          ...baseProps,
+          connStatus: "connecting",
+        } as UseSessionFeedbackArgs,
+      }
+    )
+    await waitFor(() => expect(mockSnapshot).toHaveBeenCalled())
+    expect(result.current.steerAvailable).toBe(false)
+
+    mockSnapshot.mockResolvedValue(
+      snapshot({
+        feedback_tool_available: false,
+        insert_capability: { steer: { boundary: "step" }, pull: false },
+      })
+    )
+    rerender({ ...baseProps, connStatus: "prompting" })
+
+    await waitFor(() => expect(result.current.channel).toBe("native"))
+    expect(result.current.insertBoundary).toBe("step")
+  })
+
+  it("falls back to the generic insert copy on an unknown boundary", async () => {
+    // A future adapter value must not be guessed at: the channel works, but the
+    // copy promises nothing about timing.
+    mockSnapshot.mockResolvedValue(
+      snapshot({
+        feedback_tool_available: false,
+        // Deliberately outside the union — what a newer server could send. The
+        // `unknown` hop is the point: this payload is not expressible in the
+        // current type, which is exactly what the hook must survive.
+        insert_capability: {
+          steer: { boundary: "drain" },
+        } as unknown as InsertCapability,
+      })
+    )
+    const { result } = renderHook(() => useSessionFeedback(baseProps))
+
+    await waitFor(() => expect(result.current.channel).toBe("native"))
+    expect(result.current.insertBoundary).toBeNull()
   })
 
   it("stays on the pull channel when only the tool is available", async () => {
@@ -825,5 +907,122 @@ describe("useSessionFeedback steered-note strips", () => {
     await waitFor(() => expect(result.current.notes).toHaveLength(2))
     rerender({ ...baseProps, steeredMessageIds: ["n1"] })
     expect(result.current.notes.map((n) => n.id)).toEqual(["n2"])
+  })
+})
+
+/**
+ * Interrupt-and-send is NOT a live-feedback action: it goes over the ordinary
+ * prompt wire (`acpPromptInterrupt`), needs no steer/pull channel, and its
+ * in-flight latch is shared by every caller (the composer's dropdown and the
+ * queue rows) so two interrupts can never be admitted against one hand-over.
+ */
+describe("useSessionFeedback interruptAndSend", () => {
+  const blocks = [{ type: "text" as const, text: "stop and do this" }]
+
+  it("sends the full block list and latches while the admission is in flight", async () => {
+    let finish: () => void = () => {}
+    mockInterrupt.mockReturnValue(
+      new Promise<void>((resolve) => {
+        finish = resolve
+      })
+    )
+    const { result } = renderHook(() => useSessionFeedback(baseProps))
+    await waitFor(() => expect(capturedHandler).toBeTruthy())
+
+    let pending: Promise<void> | null = null
+    act(() => {
+      pending = result.current.interruptAndSend(blocks)
+    })
+    await waitFor(() => expect(result.current.interrupting).toBe(true))
+    expect(mockInterrupt).toHaveBeenCalledWith("c1", blocks)
+
+    await act(async () => {
+      finish()
+      await pending
+    })
+    expect(result.current.interrupting).toBe(false)
+  })
+
+  it("ignores a second call while one is in flight", async () => {
+    // The UI disables the action, but a click that still slips through a
+    // pending render must not cancel twice — the backend would refuse it and
+    // the caller would misread the refusal as a real failure.
+    let finish: () => void = () => {}
+    mockInterrupt.mockReturnValue(
+      new Promise<void>((resolve) => {
+        finish = resolve
+      })
+    )
+    const { result } = renderHook(() => useSessionFeedback(baseProps))
+    await waitFor(() => expect(capturedHandler).toBeTruthy())
+
+    let first: Promise<void> | null = null
+    act(() => {
+      first = result.current.interruptAndSend(blocks)
+    })
+    await waitFor(() => expect(result.current.interrupting).toBe(true))
+
+    await act(async () => {
+      await result.current.interruptAndSend(blocks)
+    })
+    expect(mockInterrupt).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      finish()
+      await first
+    })
+  })
+
+  it("rethrows a failure and clears the latch for a retry", async () => {
+    // The caller owns the draft policy: the hook must not swallow the error,
+    // and a failed attempt must not strand the latch (the retry goes through).
+    const boom = new Error("boom")
+    mockInterrupt.mockRejectedValueOnce(boom)
+    const { result } = renderHook(() => useSessionFeedback(baseProps))
+    await waitFor(() => expect(capturedHandler).toBeTruthy())
+
+    // Caught INSIDE the act callback: a rejecting one leaves React's act
+    // environment poisoned for every later render in the file.
+    let failure: unknown = null
+    await act(async () => {
+      await result.current.interruptAndSend(blocks).catch((err: unknown) => {
+        failure = err
+      })
+    })
+    expect(failure).toBe(boom)
+    expect(result.current.interrupting).toBe(false)
+
+    mockInterrupt.mockResolvedValueOnce(undefined)
+    await act(async () => {
+      await result.current.interruptAndSend(blocks)
+    })
+    expect(mockInterrupt).toHaveBeenCalledTimes(2)
+  })
+
+  it("needs no steer channel and no note state", async () => {
+    // A session with neither the pull tool nor native steering keeps its
+    // historical Stop-only composer — but cancelling and resending is a plain
+    // ACP sequence every agent supports, so the interrupt must still work.
+    mockSnapshot.mockResolvedValue(
+      snapshot({
+        feedback_tool_available: false,
+        native_steering_available: false,
+      })
+    )
+    const { result } = renderHook(() => useSessionFeedback(baseProps))
+    await waitFor(() => expect(mockSnapshot).toHaveBeenCalledTimes(2))
+    await act(async () => {
+      await Promise.resolve()
+    })
+    expect(result.current.steerAvailable).toBe(false)
+
+    mockInterrupt.mockResolvedValueOnce(undefined)
+    await act(async () => {
+      await result.current.interruptAndSend(blocks)
+    })
+    expect(mockInterrupt).toHaveBeenCalledWith("c1", blocks)
+    // Nothing about it shows up in the notes list — it is a message, not a note.
+    expect(result.current.notes).toHaveLength(0)
+    expect(toast.error).not.toHaveBeenCalled()
   })
 })

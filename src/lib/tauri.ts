@@ -127,6 +127,15 @@ export async function acpPrompt(
   return invoke("acp_prompt", { connectionId, blocks })
 }
 
+/** Stop the running turn and send `blocks` as the next one, as a single
+ *  backend admission (see `acpPromptInterrupt` in the shared API client). */
+export async function acpPromptInterrupt(
+  connectionId: string,
+  blocks: PromptInputBlock[]
+): Promise<void> {
+  return invoke("acp_prompt_interrupt", { connectionId, blocks })
+}
+
 export async function acpSetMode(
   connectionId: string,
   modeId: string

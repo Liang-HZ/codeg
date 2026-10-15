@@ -94,6 +94,7 @@ import { isWindowedDetail } from "@/lib/turn-window"
 import {
   hasTranscriptOverlay,
   isOutOfTurnContentEvent,
+  isWithinCancelGrace,
 } from "@/lib/background-agent"
 import {
   flushRetryDelayMs,
@@ -878,14 +879,18 @@ const ConversationTabView = memo(function ConversationTabView({
   // another turn while this client believes it is idle) don't spin one failed
   // send per round-trip.
   const lastFlushBounceAtRef = useRef(0)
-  // Whether a queued row's click-to-insert (`handleQueueSteer`) is mid-flight.
-  // The row STAYS in the queue for the whole round-trip — it only leaves once
-  // the backend confirms delivery — so without this the turn-end edge would
-  // hand the same row to the flush below while the insert is still settling:
+  // Whether a queued row's click-to-insert (`handleQueueSteer`) or
+  // click-to-interrupt (`handleQueueInterrupt`) is mid-flight. The row STAYS
+  // in the queue for the whole round-trip — it only leaves once the backend
+  // confirms delivery/consumption — so without this the turn-end edge would
+  // hand the same row to the flush below while the action is still settling:
   // admitted against the ending turn AND re-sent as the next turn's prompt,
-  // i.e. the agent reads the same instruction twice. Holding the flush for one
-  // round-trip is enough, and cannot strand the queue: `handleQueueSteer`
-  // always clears this in a `finally`, which re-runs the flush effect.
+  // i.e. the agent reads the same instruction twice. (The interrupt holds the
+  // turn gate backend-side, so a raced flush would bounce — but the bounce
+  // RE-QUEUES the row, which can land after the row's own removal and
+  // resurrect it. Holding the flush is what makes the removal final.) One
+  // round-trip is enough, and cannot strand the queue: both handlers always
+  // clear this in a `finally`, which re-runs the flush effect.
   const [queueSteerInFlight, setQueueSteerInFlight] = useState(false)
 
   // Flush queued messages whenever the agent is idle. This is the queue's send
@@ -1018,7 +1023,23 @@ const ConversationTabView = memo(function ConversationTabView({
         // exactly the burst at the start of every turn, and would arm the pill
         // on turns we started ourselves. `getConnection` reads the store the
         // reducer just wrote, and subscribers fire after that write.
-        if (connectionStore.getConnection(tabId)?.status === "prompting") return
+        const current = connectionStore.getConnection(tabId)
+        if (current?.status === "prompting") return
+        // …and neither is the tail of a just-cancelled turn "background
+        // activity". Cancel settles the turn immediately (the backend does not
+        // wait for the agent), so the cancelled turn's last frames land here,
+        // in the connected window, and the out-of-turn guard above drops them —
+        // while this effect, without the grace check, read that tail as the
+        // agent working on its own and armed the pill (2026-10-14 incident,
+        // conv 84: a thinking chunk 24ms after the cancel). The window ends at
+        // the next prompting turn or after `CANCEL_TAIL_GRACE_MS`, whichever
+        // comes first; past it, out-of-turn content is real background activity
+        // again.
+        if (
+          isWithinCancelGrace(current?.cancelGraceUntil ?? null, Date.now())
+        ) {
+          return
+        }
         // Unknown agent (no connection bound yet) → no pill. A connection that
         // is streaming content always carries its type, so this only degrades
         // to today's behavior in a case that shouldn't arise.
@@ -2231,6 +2252,10 @@ const ConversationTabView = memo(function ConversationTabView({
     },
     [feedbackSteer]
   )
+  // Interrupt-and-send, shared by the composer's dropdown and the queue rows.
+  // The hook owns the in-flight latch and rethrows; both call sites keep their
+  // own draft/row policy (clear on success, keep + report on failure).
+  const interruptAndSend = feedback.interruptAndSend
 
   // Click-to-insert for a queued row: send THAT item into the running turn
   // over the same live-feedback channel the composer's mid-turn dropdown uses.
@@ -2282,6 +2307,42 @@ const ConversationTabView = memo(function ConversationTabView({
       tCmp,
       mqMoveToFront,
     ]
+  )
+
+  // Click-to-interrupt for a queued row: stop the running turn and send THAT
+  // item as the next one. No live-feedback channel involved — it is a plain
+  // `session/cancel` + `session/prompt` — so this is offered on every
+  // prompting session, unlike the insert above. Success removes the row (its
+  // content is the turn now); a failure (e.g. another interrupt still handing
+  // over) keeps it queued and reports, mirroring the insert's failure path.
+  const handleQueueInterrupt = useCallback(
+    async (id: string) => {
+      const item = msgQueue.find((m) => m.id === id)
+      if (!item) return
+      // Nothing to send in this row. Leave it alone: removing it would delete
+      // queued content on a button that promises to SEND it.
+      if (item.draft.blocks.length === 0) return
+      // Set before the first await so the flush effect above is already held
+      // when the interrupt's intermediate TurnComplete lands mid-round-trip
+      // (see `queueSteerInFlight`).
+      setQueueSteerInFlight(true)
+      try {
+        // The FULL block list: the interrupt rides the ordinary prompt wire,
+        // so attachments are delivered whole (unlike the pull-channel insert).
+        await interruptAndSend(item.draft.blocks)
+        mqRemove(id)
+      } catch (err: unknown) {
+        notify({
+          level: "error",
+          key: `interrupt-failed:${tabId}`,
+          title: tCmp("interruptFailed"),
+          description: toErrorMessage(err),
+        })
+      } finally {
+        setQueueSteerInFlight(false)
+      }
+    },
+    [msgQueue, interruptAndSend, mqRemove, tabId, tCmp]
   )
 
   return (
@@ -2372,6 +2433,12 @@ const ConversationTabView = memo(function ConversationTabView({
           ? handleQueueSteer
           : undefined
       }
+      onQueueInterrupt={
+        // Unlike the insert above: no channel or feature gate — interrupting
+        // is a plain cancel + prompt. Only a running turn to interrupt is
+        // required, so the action appears exactly while it can work.
+        connStatus === "prompting" ? handleQueueInterrupt : undefined
+      }
       editingItemId={mqEditingItemId}
       editingDraftText={editingQueueDraftText}
       editingDraftBlocks={editingQueueDraftBlocks}
@@ -2390,6 +2457,9 @@ const ConversationTabView = memo(function ConversationTabView({
           : undefined
       }
       steerChannel={feedback.channel}
+      steerBoundary={feedback.insertBoundary}
+      onInterruptSend={interruptAndSend}
+      interrupting={feedback.interrupting}
     >
       {isWelcomeMode ? (
         // Same overlay scrollbar as the sidebar / file lists (os-theme-codeg)

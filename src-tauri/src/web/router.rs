@@ -962,6 +962,10 @@ pub fn build_router(
             post(handlers::acp::acp_touch_connection),
         )
         .route("/acp_prompt", post(handlers::acp::acp_prompt))
+        .route(
+            "/acp_prompt_interrupt",
+            post(handlers::acp::acp_prompt_interrupt),
+        )
         .route("/acp_preflight", post(handlers::acp::acp_preflight))
         .route("/acp_set_mode", post(handlers::acp::acp_set_mode))
         .route(

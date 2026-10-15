@@ -2078,6 +2078,63 @@ describe("MessageInput mid-turn send (live-feedback channel)", () => {
     ).toBeNull()
   })
 
+  it("keeps the generic insert copy when no boundary was declared", async () => {
+    // `steerBoundary` is optional: a caller with no capability to report (older
+    // payload, or a session still hydrating) must not promise a timing codeg
+    // does not know. Existing call sites therefore keep today's copy.
+    const editor = await mountPrompting({ onSteer: vi.fn() })
+    typeDraft(editor, "boundary unknown")
+    await waitFor(() =>
+      expect(screen.getByLabelText(MI.steerIntoTurn)).toBeInTheDocument()
+    )
+    await userEvent.setup().click(screen.getByLabelText(MI.steerIntoTurn))
+    expect(
+      await screen.findByRole("menuitem", { name: MI.steerIntoTurn })
+    ).toBeInTheDocument()
+  })
+
+  it.each([
+    ["step", "insertNextStep"],
+    ["immediate", "insertImmediate"],
+    ["turnEnd", "steerQueuedReceipt"],
+  ] as const)(
+    "promises the declared %s boundary in the mid-turn copy (%s)",
+    async (boundary, key) => {
+      // zcode declares `step`; the copy must say so instead of a bare "insert
+      // into current turn", and each other boundary gets its own honest
+      // wording (`turnEnd` reuses the queued receipt's promise). The trigger's
+      // aria-label and the menu item read the same source, so both move.
+      const editor = await mountPrompting({
+        onSteer: vi.fn(),
+        steerBoundary: boundary,
+      })
+      typeDraft(editor, "say what happens")
+      await waitFor(() =>
+        expect(screen.getByLabelText(MI[key])).toBeInTheDocument()
+      )
+      expect(screen.queryByLabelText(MI.steerIntoTurn)).toBeNull()
+      await userEvent.setup().click(screen.getByLabelText(MI[key]))
+      expect(
+        await screen.findByRole("menuitem", { name: MI[key] })
+      ).toBeInTheDocument()
+    }
+  )
+
+  it("ignores the boundary on a pull session", async () => {
+    // A pull note has no native boundary at all: its only promise is "the agent
+    // reads it on its next check", whatever the capability said elsewhere.
+    const editor = await mountPrompting({
+      onSteer: vi.fn(),
+      steerChannel: "pull",
+      steerBoundary: "immediate",
+    })
+    typeDraft(editor, "note, not insert")
+    await waitFor(() =>
+      expect(screen.getByLabelText(MI.steerAsNote)).toBeInTheDocument()
+    )
+    expect(screen.queryByLabelText(MI.insertImmediate)).toBeNull()
+  })
+
   it("names the note, not an insert, when a pull send fails", async () => {
     // The failure toast is the last place the pull channel could overpromise:
     // "couldn't insert into the current turn" would describe a delivery this
@@ -2228,6 +2285,237 @@ describe("MessageInput mid-turn send (live-feedback channel)", () => {
         "check the tests"
       )
     )
+  })
+})
+
+describe("MessageInput interrupt-and-send", () => {
+  afterEach(() => {
+    cleanup()
+    composerHandle.current = null
+    attachmentsOverride.current = null
+    vi.clearAllMocks()
+  })
+
+  const MI = enMessages.Folder.chat.messageInput
+
+  async function mountPrompting(
+    props: Partial<React.ComponentProps<typeof MessageInput>> = {}
+  ) {
+    renderInput({
+      isPrompting: true,
+      disabled: true,
+      onCancel: vi.fn(),
+      onEnqueue: vi.fn(),
+      ...props,
+    })
+    await waitFor(
+      () => expect(composerHandle.current?.getEditor()).toBeTruthy(),
+      { timeout: 5000 }
+    )
+    const editor = composerHandle.current?.getEditor()
+    if (!editor) throw new Error("composer editor not mounted")
+    return editor
+  }
+
+  function typeDraft(editor: Editor, text: string) {
+    act(() => {
+      editor.commands.insertContent(text)
+    })
+  }
+
+  /** Open the split's dropdown and pick the interrupt entry, then confirm. */
+  async function interrupt(
+    user: ReturnType<typeof userEvent.setup>,
+    triggerLabel: string = MI.interruptSend
+  ) {
+    await user.click(screen.getByLabelText(triggerLabel))
+    await user.click(
+      await screen.findByRole("menuitem", { name: MI.interruptSend })
+    )
+    await user.click(
+      await screen.findByRole("button", {
+        name: MI.interruptSend,
+      })
+    )
+  }
+
+  it("offers the interrupt with no steer channel at all", async () => {
+    // The historical Stop-only form assumed no channel meant no mid-turn
+    // action. The interrupt is not a channel: cancel + prompt works on every
+    // agent, so the split (queue button + destructive entry) must appear even
+    // when the session has no `onSteer`.
+    const editor = await mountPrompting({ onInterruptSend: vi.fn() })
+    typeDraft(editor, "actually, do this")
+    await waitFor(() =>
+      expect(screen.getByLabelText(MI.interruptSend)).toBeInTheDocument()
+    )
+    expect(screen.getByTitle(MI.queueMessage)).toBeInTheDocument()
+    // No steer entry in the menu — only the interrupt.
+    await userEvent.setup().click(screen.getByLabelText(MI.interruptSend))
+    expect(
+      await screen.findByRole("menuitem", { name: MI.interruptSend })
+    ).toBeInTheDocument()
+    expect(
+      screen.queryByRole("menuitem", { name: MI.steerIntoTurn })
+    ).toBeNull()
+  })
+
+  it("keeps the Stop-only form when neither action is wired", async () => {
+    const editor = await mountPrompting()
+    typeDraft(editor, "draft text")
+    expect(screen.getByTitle(MI.cancel)).toBeInTheDocument()
+    expect(screen.queryByTitle(MI.queueMessage)).toBeNull()
+    expect(screen.queryByLabelText(MI.interruptSend)).toBeNull()
+  })
+
+  it("confirms destructively before sending, and clears the draft on success", async () => {
+    const user = userEvent.setup()
+    let finish: () => void = () => {}
+    const onInterruptSend = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          finish = resolve
+        })
+    )
+    const editor = await mountPrompting({
+      onInterruptSend,
+      onSteer: vi.fn(),
+      steerChannel: "native",
+    })
+    typeDraft(editor, "send this instead")
+    await waitFor(() =>
+      expect(screen.getByLabelText(MI.steerIntoTurn)).toBeInTheDocument()
+    )
+
+    await user.click(screen.getByLabelText(MI.steerIntoTurn))
+    const item = await screen.findByRole("menuitem", {
+      name: MI.interruptSend,
+    })
+    // Destructive, and the menu glyph says what it does.
+    expect(item.querySelector(".lucide-octagon-x")).not.toBeNull()
+    await user.click(item)
+
+    // Nothing sent yet: the confirmation names the abort.
+    expect(onInterruptSend).not.toHaveBeenCalled()
+    expect(
+      await screen.findByText(MI.interruptConfirmTitle)
+    ).toBeInTheDocument()
+    expect(screen.getByText(MI.interruptSendHint)).toBeInTheDocument()
+
+    await user.click(screen.getByRole("button", { name: MI.interruptSend }))
+    // The full block list goes out — this rides the ordinary prompt wire.
+    await waitFor(() =>
+      expect(onInterruptSend).toHaveBeenCalledWith([
+        { type: "text", text: "send this instead" },
+      ])
+    )
+    // Unsettled: the draft survives until the backend confirms.
+    expect(serializeDocToText(editor.state.doc)).toContain("send this instead")
+
+    await act(async () => {
+      finish()
+    })
+    // Confirmed: the composer clears like a successful send.
+    await waitFor(() =>
+      expect(serializeDocToText(editor.state.doc)).not.toContain(
+        "send this instead"
+      )
+    )
+  })
+
+  it("cancelling the confirmation sends nothing and keeps the draft", async () => {
+    const user = userEvent.setup()
+    const onInterruptSend = vi.fn().mockResolvedValue(undefined)
+    const editor = await mountPrompting({ onInterruptSend })
+    typeDraft(editor, "keep me for later")
+    await waitFor(() =>
+      expect(screen.getByLabelText(MI.interruptSend)).toBeInTheDocument()
+    )
+
+    await user.click(screen.getByLabelText(MI.interruptSend))
+    await user.click(
+      await screen.findByRole("menuitem", { name: MI.interruptSend })
+    )
+    await user.click(
+      await screen.findByRole("button", {
+        name: enMessages.Folder.chat.messageInput.cancel,
+      })
+    )
+
+    expect(onInterruptSend).not.toHaveBeenCalled()
+    expect(serializeDocToText(editor.state.doc)).toContain("keep me for later")
+  })
+
+  it("keeps the draft and reports when the interrupt is refused", async () => {
+    const user = userEvent.setup()
+    const onInterruptSend = vi.fn().mockRejectedValue(new Error("boom"))
+    const editor = await mountPrompting({ onInterruptSend })
+    typeDraft(editor, "keep me")
+    await waitFor(() =>
+      expect(screen.getByLabelText(MI.interruptSend)).toBeInTheDocument()
+    )
+
+    await interrupt(user)
+
+    await waitFor(() =>
+      expect(vi.mocked(toast.error)).toHaveBeenCalledWith(
+        MI.interruptFailed,
+        expect.anything()
+      )
+    )
+    expect(serializeDocToText(editor.state.doc)).toContain("keep me")
+  })
+
+  it("disables the entry and says so while a delivery is in flight", async () => {
+    const user = userEvent.setup()
+    const onInterruptSend = vi.fn(() => new Promise<void>(() => {}))
+    const editor = await mountPrompting({ onInterruptSend, interrupting: true })
+    typeDraft(editor, "already delivering")
+    await waitFor(() =>
+      expect(screen.getByLabelText(MI.interruptSend)).toBeInTheDocument()
+    )
+
+    await user.click(screen.getByLabelText(MI.interruptSend))
+    const item = await screen.findByRole("menuitem", {
+      name: MI.interruptDelivering,
+    })
+    expect(item).toHaveAttribute("aria-disabled", "true")
+    expect(onInterruptSend).not.toHaveBeenCalled()
+  })
+
+  it("still gates on unsettled uploads, like a normal send", async () => {
+    // The interrupt rides the prompt wire, so an image without a server-side
+    // uri yet has to wait exactly like `handleSend`/`handleSteerClick` — the
+    // toast says so and nothing is sent.
+    const user = userEvent.setup()
+    attachmentsOverride.current = {
+      attachments: [
+        {
+          id: "att-1",
+          type: "image" as const,
+          data: "aGk=",
+          uri: null,
+          name: "mock.png",
+          mimeType: "image/png",
+        },
+      ],
+      hasUploadingImage: true,
+      imagePromptBlocks: () => [],
+    }
+    const onInterruptSend = vi.fn()
+    const editor = await mountPrompting({ onInterruptSend })
+    typeDraft(editor, "wait for it")
+    await waitFor(() =>
+      expect(screen.getByLabelText(MI.interruptSend)).toBeInTheDocument()
+    )
+
+    await interrupt(user)
+
+    expect(onInterruptSend).not.toHaveBeenCalled()
+    expect(vi.mocked(toast.error)).toHaveBeenCalledWith(
+      enMessages.Folder.chat.messageInput.attachUploadInProgress
+    )
+    expect(serializeDocToText(editor.state.doc)).toContain("wait for it")
   })
 })
 

@@ -1498,6 +1498,7 @@ impl TaskEngine {
                 Some(conversation_id),
                 None,
                 None,
+                false,
             )
             .await
         {
@@ -2171,6 +2172,7 @@ impl TaskEngine {
                 Some(conversation_id),
                 None,
                 None,
+                false,
             )
             .await;
         if let Err(e) = sent {

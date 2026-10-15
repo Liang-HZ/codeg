@@ -69,6 +69,14 @@ pub struct FeedbackItem {
     /// images identically.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocks: Option<Vec<crate::acp::types::UserMessageBlock>>,
+    /// How the adapter disposed of this note on the NATIVE push path, when the
+    /// disposition is not a plain insertion. `Some("queued")` (or the adapter's
+    /// own finer state, e.g. zcode's `"fellBack"` / `"notRequested"`) means the
+    /// content was consumed but deferred to run after the running turn, which
+    /// the UI says out loud. `None` = an ordinary injection (or a pull-path
+    /// note), where the historical rendering stands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steer_state: Option<String>,
 }
 
 impl FeedbackItem {
@@ -86,6 +94,7 @@ impl FeedbackItem {
             status: FeedbackStatus::Pending,
             delivered_at: None,
             blocks: None,
+            steer_state: None,
         }
     }
 
@@ -105,11 +114,16 @@ impl FeedbackItem {
     /// `blocks` is `Some` only when the draft carried more than plain text; see
     /// the field's own doc for why `text` alone cannot stand in for it. Passing
     /// `None` reproduces the historical text-only note byte for byte.
+    ///
+    /// `steer_state` records a non-plain disposition (`queued`) — see the
+    /// field's doc. `None` on every pull-path note and every ordinary
+    /// injection.
     pub fn new_delivered(
         id: String,
         text: String,
         at: DateTime<Utc>,
         blocks: Option<Vec<crate::acp::types::UserMessageBlock>>,
+        steer_state: Option<String>,
     ) -> Self {
         Self {
             id,
@@ -118,6 +132,7 @@ impl FeedbackItem {
             status: FeedbackStatus::Delivered,
             delivered_at: Some(at),
             blocks,
+            steer_state,
         }
     }
 }

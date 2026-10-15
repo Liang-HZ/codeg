@@ -77,6 +77,34 @@ describe("FeedbackNotesDisplay", () => {
     expect(onResend).not.toHaveBeenCalled()
   })
 
+  it("captions a deferred native delivery with what actually happens", () => {
+    // zcode's `queued`: the adapter consumed the content but will run it after
+    // this turn. "received" alone would hide the deferral; the row says when it
+    // runs. The generic `queued` marker and an adapter's own finer state mean
+    // the same thing.
+    renderList({
+      notes: [
+        { ...note("n1", "deferred", "delivered"), steer_state: "queued" },
+        { ...note("nn2", "fell back", "delivered"), steer_state: "fellBack" },
+      ],
+    })
+
+    expect(screen.getAllByText(LF.steerQueuedReceipt)).toHaveLength(2)
+    expect(screen.queryByText(LF.delivered)).toBeNull()
+  })
+
+  it("keeps the plain received reading for an ordinary injection", () => {
+    renderList({
+      notes: [
+        note("n1", "inserted", "delivered"),
+        { ...note("nn2", "pull note", "delivered"), steer_state: null },
+      ],
+    })
+
+    expect(screen.getAllByText(LF.delivered)).toHaveLength(2)
+    expect(screen.queryByText(LF.steerQueuedReceipt)).toBeNull()
+  })
+
   it("renders nothing without notes", () => {
     const { container } = renderList({ notes: [], expired: true })
     expect(container).toBeEmptyDOMElement()

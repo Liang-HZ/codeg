@@ -31,7 +31,11 @@ import { useTranslations } from "next-intl"
 import { toast } from "sonner"
 
 import { useAcpEvent } from "@/contexts/acp-connections-context"
-import { acpGetSessionSnapshot, submitSessionFeedback } from "@/lib/api"
+import {
+  acpGetSessionSnapshot,
+  acpPromptInterrupt,
+  submitSessionFeedback,
+} from "@/lib/api"
 import { toErrorMessage } from "@/lib/app-error"
 import { notify } from "@/lib/notify"
 import { isNoActiveTurnRejection } from "@/lib/turn-busy"
@@ -39,6 +43,7 @@ import type {
   ConnectionStatus,
   FeedbackItem,
   PromptInputBlock,
+  SteerBoundary,
 } from "@/lib/types"
 
 /** Merge snapshot-hydrated notes with live ones, keyed by id; live entries win
@@ -51,6 +56,21 @@ function mergeNotes(
   for (const n of base) byId.set(n.id, n)
   for (const n of live) byId.set(n.id, n)
   return [...byId.values()]
+}
+
+/** The boundary out of a snapshot's `insert_capability`, or null when the
+ *  snapshot carries none (older payload / no steer channel). Unknown future
+ *  values are ignored rather than guessed at: the label then falls back to the
+ *  generic copy, which promises nothing about timing. */
+function boundaryFromSnapshot(
+  capability: { steer?: { boundary?: SteerBoundary } | null } | null | undefined
+): SteerBoundary | null {
+  const boundary = capability?.steer?.boundary
+  return boundary === "immediate" ||
+    boundary === "step" ||
+    boundary === "turnEnd"
+    ? boundary
+    : null
 }
 
 export interface UseSessionFeedbackArgs {
@@ -88,6 +108,11 @@ export interface UseSessionFeedback {
    *  copy and the composer's mid-turn send entry. Backend-synthesized — never
    *  derived from agent type here. */
   channel: "native" | "pull"
+  /** When a native insert takes effect, as the adapter declared it at
+   *  initialize (`insert_capability.steer.boundary`); null while unknown (no
+   *  capability in the snapshot, or no steer channel). Picks the mid-turn
+   *  action's copy — the generic wording is the fallback. */
+  insertBoundary: SteerBoundary | null
   /** Whether THIS session has a working mid-turn delivery channel at all: a
    *  live connection plus native push or the pull tool. Gates the composer's
    *  mid-turn send affordance (`channel` picks its copy); a session with
@@ -115,6 +140,18 @@ export interface UseSessionFeedback {
   closeDialog: () => void
   /** Send a note. Closes the dialog on success / turn-end reroute. */
   submit: (text: string) => Promise<void>
+  /** Whether an interrupt-and-send is in flight (the composer and the queue row
+   *  disable the action while it settles; the backend also refuses a second one
+   *  with `TurnInProgress`, which the caller re-queues like any busy bounce). */
+  interrupting: boolean
+  /** Stop the running turn and send `blocks` as the next one, as a single
+   *  backend admission (`acpPromptInterrupt`). Rethrows on failure so the
+   *  caller keeps the draft and reports it — the same policy `steer` leaves to
+   *  its caller. Unlike `steer`, this needs no delivery channel: interrupting
+   *  is a plain `session/cancel` + `session/prompt`, so every agent supports
+   *  it. A turn that ended before admission degrades to an ordinary prompt
+   *  backend-side, so that race is not an error. */
+  interruptAndSend: (blocks: PromptInputBlock[]) => Promise<void>
   /** Composer-facing raw submit: same optimistic note append on success, but
    *  every failure — including the turn-end `NoActiveTurn` race — is
    *  RETHROWN untouched (no toast, no reroute). The composer owns its own
@@ -137,6 +174,11 @@ export function useSessionFeedback({
   const t = useTranslations("LiveFeedback")
   const [notes, setNotes] = useState<FeedbackItem[]>([])
   const [submitting, setSubmitting] = useState(false)
+  // Whether an interrupt-and-send is in flight. Owned here (rather than in each
+  // caller) so the composer and a queued row — which share this hook — can
+  // never run two interrupts against the one hand-over: the backend answers the
+  // second with `TurnInProgress` anyway, this keeps the UI from asking.
+  const [interrupting, setInterrupting] = useState(false)
   const [dialogOpen, setDialogOpen] = useState(false)
   // Whether THIS agent actually has the `check_user_feedback` tool (from the
   // snapshot). The authoritative gate — enabling the feature mid-session can't
@@ -154,6 +196,17 @@ export function useSessionFeedback({
   // leaving this true would keep offering "insert into current turn" while
   // notes actually land on the pull path.
   const [nativeSteering, setNativeSteering] = useState(false)
+  // The capability model's steer channel (`insert_capability.steer`), the
+  // successor of `nativeSteering`: same monotonic-upgrade discipline, and both
+  // read during the migration. Kept as its own flag rather than folded into
+  // one bool so a stale server payload that only carries the legacy field can
+  // never be read as "the capability says no".
+  const [capabilitySteer, setCapabilitySteer] = useState(false)
+  // When a native insert takes effect (capability.steer.boundary). `null` until
+  // a snapshot carries it; only ever upgraded with the channel it belongs to.
+  const [insertBoundary, setInsertBoundary] = useState<SteerBoundary | null>(
+    null
+  )
   // Latch for that downgrade: once set, a stale pre-downgrade snapshot that
   // resolves late can never flip the channel back to native. Reset with the
   // rest of the per-connection state.
@@ -189,6 +242,11 @@ export function useSessionFeedback({
 
   const isPrompting = connStatus === "prompting"
 
+  // Any native steer signal: the capability model's channel, or the legacy bool
+  // it mirrors. Union rather than precedence so a payload carrying only one of
+  // the two (older server, or a transitional one) still unlocks the insert.
+  const steerKnown = nativeSteering || capabilitySteer
+
   // Reset on connection change, then hydrate from the snapshot: recover pending
   // notes (a refresh / second mid-turn viewer won't get the one-shot
   // `feedback_submitted` events) AND read the agent's real feedback-tool
@@ -198,6 +256,8 @@ export function useSessionFeedback({
     setNotes([])
     setToolAvailable(false)
     setNativeSteering(false)
+    setCapabilitySteer(false)
+    setInsertBoundary(null)
     steeringDowngradedRef.current = false
     consumedRef.current = new Map()
     // `dismissedRef` deliberately survives this reset: note ids are uuids, so a
@@ -219,6 +279,14 @@ export function useSessionFeedback({
         if (snap.native_steering_available && !steeringDowngradedRef.current) {
           setNativeSteering(true)
         }
+        // The capability model wins where it exists; the legacy bool above is
+        // the transitional projection of the same synthesis, so the two agree.
+        if (!steeringDowngradedRef.current && snap.insert_capability?.steer) {
+          setCapabilitySteer(true)
+        }
+        const boundary = boundaryFromSnapshot(snap.insert_capability)
+        if (boundary && !steeringDowngradedRef.current)
+          setInsertBoundary(boundary)
         // A new turn started while the fetch was in flight — the snapshot holds
         // the previous turn's (already-cleared) notes; drop them.
         if (turnGenRef.current !== startGen) return
@@ -243,12 +311,13 @@ export function useSessionFeedback({
   // Self-heal capability flags. The hydrate above is keyed on `connectionId`,
   // which appears the moment a NEW conversation's connection is created — while
   // it's still "connecting", BEFORE the backend sets `feedback_tool_available`
-  // / `native_steering_available` at spawn. That first read returns false and
-  // would never refresh, leaving the "+" entry permanently disabled. Once the
-  // connection is actually live, re-read (only while either is still unknown —
-  // a `false` no-ops so this can't loop, and it stops once both are known).
+  // / `native_steering_available` / `insert_capability` at spawn. That first
+  // read returns false and would never refresh, leaving the "+" entry
+  // permanently disabled. Once the connection is actually live, re-read (only
+  // while something is still unknown — a `false` no-ops so this can't loop,
+  // and it stops once a delivery channel is known).
   useEffect(() => {
-    if (!enabled || !connectionId || (toolAvailable && nativeSteering)) return
+    if (!enabled || !connectionId || (toolAvailable && steerKnown)) return
     if (connStatus !== "connected" && connStatus !== "prompting") return
     let cancelled = false
     void acpGetSessionSnapshot(connectionId)
@@ -259,12 +328,26 @@ export function useSessionFeedback({
         if (snap?.native_steering_available && !steeringDowngradedRef.current) {
           setNativeSteering(true)
         }
+        if (!steeringDowngradedRef.current && snap?.insert_capability?.steer) {
+          setCapabilitySteer(true)
+        }
+        const boundary = boundaryFromSnapshot(snap?.insert_capability)
+        if (boundary && !steeringDowngradedRef.current)
+          setInsertBoundary(boundary)
       })
       .catch(() => {})
     return () => {
       cancelled = true
     }
-  }, [enabled, connectionId, connStatus, toolAvailable, nativeSteering])
+  }, [
+    enabled,
+    connectionId,
+    connStatus,
+    toolAvailable,
+    nativeSteering,
+    capabilitySteer,
+    steerKnown,
+  ])
 
   // Build the note list from the live event stream, scoped to this connection.
   useAcpEvent(
@@ -344,10 +427,11 @@ export function useSessionFeedback({
       // (both branches), or connection B would lose its native entry over
       // connection A's late result.
       if (connectionIdRef.current !== connectionId) return
-      if (!nativeSteering) return
+      if (!steerKnown) return
       if (item.status === "pending") {
         steeringDowngradedRef.current = true
         setNativeSteering(false)
+        setCapabilitySteer(false)
         toast.info(t("channelDowngraded"))
         return
       }
@@ -356,7 +440,9 @@ export function useSessionFeedback({
       void acpGetSessionSnapshot(cid)
         .then((snap) => {
           // Explicit `false` only — an older server omits the field entirely
-          // (undefined), which must not read as a downgrade.
+          // (undefined), which must not read as a downgrade. The backend keeps
+          // the capability's steer channel in step with this bool, so the one
+          // read covers both projections.
           if (
             connectionIdRef.current === cid &&
             snap &&
@@ -364,11 +450,12 @@ export function useSessionFeedback({
           ) {
             steeringDowngradedRef.current = true
             setNativeSteering(false)
+            setCapabilitySteer(false)
           }
         })
         .catch(() => {})
     },
-    [nativeSteering, connectionId, t]
+    [steerKnown, connectionId, t]
   )
 
   const submit = useCallback(
@@ -380,7 +467,7 @@ export function useSessionFeedback({
       // session — close the dialog instead. NOTE: a merely-ended turn keeps
       // `enabled`/`toolAvailable` true, so it still flows to the submit below and
       // gets rerouted via the no-active-turn fallback (draft preserved).
-      if (!enabled || (!toolAvailable && !nativeSteering)) {
+      if (!enabled || (!toolAvailable && !steerKnown)) {
         setDialogOpen(false)
         return
       }
@@ -417,7 +504,7 @@ export function useSessionFeedback({
       connectionId,
       enabled,
       toolAvailable,
-      nativeSteering,
+      steerKnown,
       onResendAsPrompt,
       reconcileChannel,
       t,
@@ -457,6 +544,28 @@ export function useSessionFeedback({
   const openDialog = useCallback(() => setDialogOpen(true), [])
   const closeDialog = useCallback(() => setDialogOpen(false), [])
 
+  // Interrupt-and-send: stop the running turn and deliver `blocks` as the next
+  // one, as a single backend admission. The caller owns the draft policy
+  // (clear on success, keep + report on failure), exactly like `steer`; this
+  // adds the shared in-flight latch so the composer and a queued row cannot
+  // both have one running.
+  const interruptAndSend = useCallback(
+    async (blocks: PromptInputBlock[]): Promise<void> => {
+      if (!connectionId) throw new Error("nothing to interrupt")
+      // A second call that still slips through a pending render is a duplicate
+      // of one already admitted: no-op rather than a second cancel.
+      if (interrupting) return
+      if (blocks.length === 0) throw new Error("nothing to interrupt")
+      setInterrupting(true)
+      try {
+        await acpPromptInterrupt(connectionId, blocks)
+      } finally {
+        setInterrupting(false)
+      }
+    },
+    [connectionId, interrupting]
+  )
+
   // Retire an expired row. Tombstone first, then drop it — the note stays
   // recorded backend-side (nothing here un-submits it), this only settles what
   // the user is still being asked about.
@@ -488,10 +597,9 @@ export function useSessionFeedback({
   // `submitSessionFeedback(connectionId, …)`, so without one there is no
   // channel to offer — the composer would surface a mid-turn send whose only
   // possible outcome is `steer`'s "nothing to steer" rejection.
-  const steerAvailable =
-    Boolean(connectionId) && (toolAvailable || nativeSteering)
+  const steerAvailable = Boolean(connectionId) && (toolAvailable || steerKnown)
   const canSubmit = enabled && steerAvailable && isPrompting
-  const channel: "native" | "pull" = nativeSteering ? "native" : "pull"
+  const channel: "native" | "pull" = steerKnown ? "native" : "pull"
   // Drop the notes the transcript is already rendering as user turns. Kept as
   // a derivation rather than a filter on `setNotes` so a note stays recoverable
   // as a strip if the transcript never took it.
@@ -529,6 +637,7 @@ export function useSessionFeedback({
       featureEnabled: enabled,
       canSubmit,
       channel,
+      insertBoundary,
       steerAvailable,
       showList,
       notesExpired,
@@ -539,6 +648,8 @@ export function useSessionFeedback({
       openDialog,
       closeDialog,
       submit,
+      interruptAndSend,
+      interrupting,
       steer,
     }),
     [
@@ -546,6 +657,7 @@ export function useSessionFeedback({
       enabled,
       canSubmit,
       channel,
+      insertBoundary,
       steerAvailable,
       showList,
       notesExpired,
@@ -556,6 +668,8 @@ export function useSessionFeedback({
       openDialog,
       closeDialog,
       submit,
+      interruptAndSend,
+      interrupting,
       steer,
     ]
   )

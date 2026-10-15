@@ -317,6 +317,40 @@ export async function acpPrompt(
   }
 }
 
+/**
+ * Stop the connection's running turn and send `blocks` as the next one, as a
+ * single backend admission (`acp_prompt_interrupt`). Same parameters and error
+ * surface as {@link acpPrompt}: the backend runs `session/cancel` and then the
+ * prompt without ever releasing the turn gate, so no concurrent send can slip
+ * between the two. A `TurnInProgress` rejection — another interrupt is still
+ * handing over — surfaces as `TurnBusyError`, exactly like a busy send; when
+ * the turn ended before admission the backend degrades to an ordinary prompt
+ * rather than failing. Callers treat a failure as "keep the draft".
+ */
+export async function acpPromptInterrupt(
+  connectionId: string,
+  blocks: PromptInputBlock[],
+  folderId: number | null = null,
+  conversationId: number | null = null,
+  clientMessageId: string | null = null
+): Promise<void> {
+  try {
+    await getTransport().call("acp_prompt_interrupt", {
+      connectionId,
+      blocks: stripUploadedImagePayloads(
+        blocks,
+        !isDesktop() || getActiveRemoteConnectionId() !== null
+      ),
+      folderId,
+      conversationId,
+      clientMessageId,
+    })
+  } catch (e) {
+    if (isTurnInProgressRejection(e)) throw new TurnBusyError()
+    throw e
+  }
+}
+
 export async function acpSetMode(
   connectionId: string,
   modeId: string
