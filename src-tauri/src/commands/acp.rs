@@ -2920,7 +2920,7 @@ fn codex_auth_json_path() -> PathBuf {
 /// `$XDG_CONFIG_HOME/opencode`, else `~/.config/opencode`; see
 /// `acp::opencode_config`). 1.x's `config.json` is not read by OpenCode 2, so it
 /// is no fallback.
-fn resolve_opencode_config_path() -> PathBuf {
+pub(crate) fn resolve_opencode_config_path() -> PathBuf {
     crate::acp::opencode_config::config_file().unwrap_or_else(|| {
         home_dir_or_default()
             .join(".config")
@@ -6165,7 +6165,7 @@ pub(crate) fn pi_enabled_model_patterns_for_env(
 /// inherits codeg's own. `~` and the default expand against the child's home
 /// ([`pi_child_home`]). Never trimmed: pi reads the raw value (`normalizePath`
 /// expands `~` and nothing else).
-fn pi_agent_dir_for_env(runtime_env: &BTreeMap<String, String>) -> PathBuf {
+pub(crate) fn pi_agent_dir_for_env(runtime_env: &BTreeMap<String, String>) -> PathBuf {
     pi_agent_dir_for_child(runtime_env, std::env::var_os("PI_CODING_AGENT_DIR"))
 }
 
