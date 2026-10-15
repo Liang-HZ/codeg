@@ -3759,8 +3759,6 @@ fn is_fork_directive_record(value: &serde_json::Value) -> bool {
         })
 }
 
-=======
->>>>>>> 43b768ce (fix(codebuddy): address review — exact-agent gates, sub-agent history timeline, emit-path tests)
 /// One parsed sub-agent transcript: the tool calls, the mixed timeline,
 /// the deduped usage, the first record's timestamp, and the
 /// first-to-last-timestamped-record span (`None` without a real interval).
