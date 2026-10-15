@@ -36,6 +36,7 @@ pub mod latest_release;
 pub mod lifecycle;
 pub mod manager;
 pub mod minimax_code;
+pub mod model_visibility;
 pub mod one_shot;
 pub mod opencode_catalog;
 pub(crate) mod opencode_config;
