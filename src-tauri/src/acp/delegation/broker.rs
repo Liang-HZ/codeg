@@ -858,9 +858,7 @@ fn running_ack(
     // surface the MCP `content` text (not `structuredContent`) — without it the
     // LLM couldn't call get_delegation_status / cancel_delegation.
     let message = format!(
-        "Delegation successful. task_id={call_id}. Call get_delegation_status \
-         with this id in the task_ids array (optionally wait_ms) to collect the \
-         result, or cancel_delegation to stop it."
+        "Delegation successful. task_id={call_id}. The result will be delivered to you automatically when it finishes; you can also collect it any time with get_delegation_status (optionally wait_ms), or stop it with cancel_delegation."
     );
     DelegationTaskReport {
         task_id: Some(call_id),
@@ -926,9 +924,7 @@ fn resume_ack(
     agent_type: AgentType,
 ) -> DelegationTaskReport {
     let message = format!(
-        "Delegation resumed. task_id={call_id} (unchanged). Call \
-         get_delegation_status with this id in the task_ids array (optionally \
-         wait_ms) to collect the result, or cancel_delegation to stop it."
+        "Delegation resumed. task_id={call_id} (unchanged). The result will be delivered to you automatically when it finishes; you can also collect it any time with get_delegation_status (optionally wait_ms), or stop it with cancel_delegation."
     );
     DelegationTaskReport {
         task_id: Some(call_id),
@@ -1026,7 +1022,7 @@ fn attach_blocked(report: &mut DelegationTaskReport, blocked: BlockedOn) {
         (BlockedKind::PlanApproval, None) => "a plan approval".to_string(),
     };
     // The third line is guidance for the orchestrating LLM, in the same spirit
-    // as `running_ack`'s "call get_delegation_status with this id". Keep it in
+    // as `running_ack`'s proactive-delivery guidance. Keep it in
     // step with the tool description in `tool_schema.json`.
     report.message = Some(format!(
         "Running.\n{BLOCKED_LINE_PREFIX} {what}\nThe sub-agent is parked until \
@@ -9513,11 +9509,14 @@ mod tests {
     fn running_ack_message_embeds_task_id() {
         let report = running_ack("task-xyz".into(), 42, AgentType::Codex);
         assert_eq!(report.task_id.as_deref(), Some("task-xyz"));
+        let msg = report.message.as_deref().unwrap();
         assert!(
-            report.message.as_deref().unwrap().contains("task-xyz"),
+            msg.contains("task-xyz"),
             "ack message must embed the literal task_id, got {:?}",
             report.message
         );
+        assert!(msg.starts_with("Delegation successful. task_id="));
+        assert!(msg.contains("delivered to you automatically"));
     }
 
     /// Previews and cached text must stay within their advertised BYTE caps
@@ -9790,7 +9789,10 @@ mod tests {
         assert_eq!(ack.status, TaskStatus::Running);
         assert_eq!(ack.task_id.as_deref(), Some("task-1"));
         assert_eq!(ack.child_conversation_id, Some(42));
-        assert!(ack.message.unwrap().starts_with("Delegation resumed. task_id=task-1"));
+        let msg = ack.message.unwrap();
+        assert!(msg.starts_with("Delegation resumed. task_id=task-1"));
+        assert!(!msg.starts_with("Delegation successful."));
+        assert!(msg.contains("delivered to you automatically"));
 
         // The spawn resumed the recorded agent session in the recorded dir.
         let spawns = mock.resume_spawn_args.lock().await;
