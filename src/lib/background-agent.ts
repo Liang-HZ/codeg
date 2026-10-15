@@ -68,8 +68,9 @@ const MCP_STARTUP_REPORT_ID_PREFIX = "mcp_startup."
  */
 export function isOutOfTurnContentEvent(envelope: {
   type: string
-  // `null` too: the `prompt_suggestion` event carries `text: null` to withdraw
-  // its offer, and is not content either way.
+  // `null` is what wire-optional text fields normalize to (e.g. a
+  // `prompt_suggestion` withdrawal or a `member_chunk` tool frame); the string
+  // arms below treat it as absent.
   text?: string | null
   tool_call_id?: string
 }): boolean {
