@@ -31261,6 +31261,8 @@ mod tests {
                     blocks: vec![PromptInputBlock::Text { text: text.into() }],
                     user_message: None,
                     internal_suffix: Vec::new(),
+                    source: None,
+                    preempt: false,
                 })
                 .await
                 .expect("the connection is running");
