@@ -1127,6 +1127,10 @@ pub fn build_router(
             post(handlers::acp::acp_download_agent_binary),
         )
         .route(
+            "/acp_update_system_agent",
+            post(handlers::acp::acp_update_system_agent),
+        )
+        .route(
             "/acp_install_uv_tool",
             post(handlers::acp::acp_install_uv_tool),
         )
@@ -1402,6 +1406,10 @@ pub fn build_router(
         .route(
             "/stop_office_watch",
             post(handlers::office_tools::stop_office_watch),
+        )
+        .route(
+            "/renew_office_watch",
+            post(handlers::office_tools::renew_office_watch),
         )
         // ─── Project boot ───
         .route(
@@ -1770,6 +1778,14 @@ pub fn build_router(
             post(handlers::forge::forge_settings_set),
         )
         .route(
+            "/forge_auto_status",
+            post(handlers::forge::forge_auto_status),
+        )
+        .route(
+            "/forge_auto_scan_now",
+            post(handlers::forge::forge_auto_scan_now),
+        )
+        .route(
             "/work_task_deliver_pr",
             post(handlers::work_task::work_task_deliver_pr),
         )
@@ -1941,6 +1957,17 @@ pub fn build_router(
         .route(
             "/get_system_language_settings",
             post(handlers::system_settings::get_system_language_settings),
+        )
+        // Forge webhooks for the repository panel's auto-processing. No forge
+        // can send codeg's bearer token, so the delivery authenticates itself:
+        // its HMAC signature (GitHub / Gitea) or secret token (GitLab) is
+        // checked against the folders' webhook secrets before anything else
+        // happens. See `handlers::forge::forge_webhook`.
+        .route(
+            "/forge_webhook",
+            post(handlers::forge::forge_webhook).layer(DefaultBodyLimit::max(
+                handlers::forge::WEBHOOK_BODY_LIMIT,
+            )),
         )
         .route(
             "/workspace_download/{ticket}",

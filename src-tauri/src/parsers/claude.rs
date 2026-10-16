@@ -8,8 +8,8 @@ use regex::Regex;
 
 use crate::models::*;
 use crate::parsers::{
-    folder_name_from_path, is_safe_subagent_id, title_from_user_text, truncate_str, AgentParser,
-    ParseError, TIMELINE_ENTRY_MAX_CHARS,
+    folder_name_from_path, is_safe_subagent_id, title_from_user_text, truncate_str, AgentEnv,
+    AgentParser, ParseError, TIMELINE_ENTRY_MAX_CHARS,
 };
 
 /// Regex that matches Claude Code system-injected XML tags and their content.
@@ -1161,8 +1161,14 @@ impl Default for ClaudeParser {
 
 impl ClaudeParser {
     pub fn new() -> Self {
-        let base_dir = resolve_claude_config_dir().join("projects");
-        Self { base_dir }
+        Self::for_env(&AgentEnv::inherited())
+    }
+
+    /// The history of the Claude launched with `env`.
+    pub fn for_env(env: &AgentEnv) -> Self {
+        Self {
+            base_dir: resolve_claude_projects_dir_for_env(env),
+        }
     }
 
     /// Test-only constructor that lets callers point the parser at a fixture
@@ -1177,18 +1183,15 @@ impl ClaudeParser {
     }
 }
 
-/// Locate `<session_id>.jsonl` under any project directory of the Claude
-/// config dir. Used by the background watcher (`crate::acp::background_watch`)
-/// to arm its transcript tail; mirrors `get_conversation`'s discovery scan
-/// (Claude offers no forward cwd→project-dir encoding, so discovery is by
-/// session-id filename).
-pub(crate) fn find_session_file(session_id: &str) -> Option<PathBuf> {
-    find_session_file_in(&resolve_claude_config_dir().join("projects"), session_id)
-}
-
-/// `find_session_file` against an explicit base dir (test seam). `session_id`
-/// is embedded in a filename, so path-traversal shapes are rejected outright
-/// (`is_safe_subagent_id`: separators, `..`, drive colon, NUL).
+/// Locate `<session_id>.jsonl` under any project directory of `base_dir` —
+/// the `projects` dir of the launch's Claude config dir
+/// ([`resolve_claude_projects_dir_for_env`]). Used by the background watcher
+/// (`crate::acp::background_watch`) to arm its transcript tail; mirrors
+/// `get_conversation`'s discovery scan (Claude offers no forward
+/// cwd→project-dir encoding, so discovery is by session-id filename).
+/// `session_id` is embedded in a filename, so path-traversal shapes are
+/// rejected outright (`is_safe_subagent_id`: separators, `..`, drive colon,
+/// NUL).
 pub(crate) fn find_session_file_in(base_dir: &Path, session_id: &str) -> Option<PathBuf> {
     if session_id.is_empty() || !is_safe_subagent_id(session_id) {
         return None;
@@ -1434,6 +1437,11 @@ impl ClaudeParser {
         let mut first_timestamp: Option<DateTime<Utc>> = None;
         let mut last_timestamp: Option<DateTime<Utc>> = None;
         let mut message_count: u32 = 0;
+        // Same rule as the detail parse: history a resume wrote out again is
+        // not more conversation (`ClaudeRecordAccumulator::seen_record_uuids`).
+        // Counted, the copies inflated the message count, and their older
+        // timestamps rewound the conversation's end.
+        let mut seen_record_uuids = std::collections::HashSet::new();
 
         for line in reader.lines() {
             let line = match line {
@@ -1448,6 +1456,16 @@ impl ClaudeParser {
                 Ok(v) => v,
                 Err(_) => continue,
             };
+
+            if let Some(uuid) = value
+                .get("uuid")
+                .and_then(|u| u.as_str())
+                .filter(|u| !u.is_empty())
+            {
+                if !seen_record_uuids.insert(uuid.to_string()) {
+                    continue;
+                }
+            }
 
             let msg_type = value.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
@@ -1561,7 +1579,19 @@ impl ClaudeParser {
 }
 
 pub(crate) fn resolve_claude_config_dir() -> PathBuf {
-    resolve_claude_config_dir_from(std::env::var_os("CLAUDE_CONFIG_DIR"), dirs::home_dir())
+    resolve_claude_config_dir_for_env(&AgentEnv::inherited())
+}
+
+/// The config dir of the Claude launched with `env`: its `CLAUDE_CONFIG_DIR`,
+/// else `~/.claude`.
+pub(crate) fn resolve_claude_config_dir_for_env(env: &AgentEnv) -> PathBuf {
+    resolve_claude_config_dir_from(env.var_os("CLAUDE_CONFIG_DIR"), dirs::home_dir())
+}
+
+/// Where the Claude launched with `env` keeps its transcripts:
+/// `<config dir>/projects/<encoded cwd>/<session id>.jsonl`.
+pub(crate) fn resolve_claude_projects_dir_for_env(env: &AgentEnv) -> PathBuf {
+    resolve_claude_config_dir_for_env(env).join("projects")
 }
 
 fn resolve_claude_config_dir_from(
@@ -1713,6 +1743,17 @@ pub(crate) struct ClaudeRecordAccumulator {
     /// task id → LATEST `<task-notification>` payload (the same id can notify
     /// more than once — a resumed sub-agent re-notifies; last wins).
     background_notifications: std::collections::HashMap<String, BackgroundNotification>,
+    /// When each turn Claude Code opened ON ITS OWN began: the
+    /// `<task-notification>` user record a background task settles with while
+    /// the CLI is idle, which the CLI answers straight away. That record never
+    /// becomes a user turn — it only settles the launch card — so without a
+    /// marker [`super::backfill_turn_durations`] measured the reply from the
+    /// end of the previous one, charging it the whole idle stretch in between:
+    /// 79 minutes for a 16-second answer on a real transcript. A notification
+    /// that lands mid-turn is a `queued_command` attachment instead
+    /// ([`queued_task_notification`]) and opens nothing. Read through
+    /// [`Self::chronological_turn_starts`].
+    turn_starts: Vec<DateTime<Utc>>,
     /// `message.id` → index in `messages` of the line currently carrying that
     /// API call's usage. See [`Self::claim_assistant_usage`] for why only one
     /// line of a group may carry it.
@@ -1722,16 +1763,24 @@ pub(crate) struct ClaudeRecordAccumulator {
     /// thinking-only fragments from one response share a message without
     /// crossing text, tool, or user boundaries.
     pending_assistant_message_id: Option<String>,
-    /// `uuid`s of the `system`/`compact_boundary` records already turned into a
-    /// divider, because a transcript repeats them VERBATIM.
+    /// `uuid`s of the records already taken in, because a transcript can repeat
+    /// its history.
     ///
-    /// Every resume replays the surviving history into the same file, boundary
-    /// records included — same uuid, same timestamp, same `compactMetadata`.
-    /// Measured on one real 19,435-line transcript: 22 boundary records for 7
-    /// actual compactions, one of them written six times. Keyed on the record
-    /// uuid rather than the metadata so two genuine compactions that happen to
-    /// reduce the same amount still get a divider each.
-    seen_compaction_uuids: std::collections::HashSet<String>,
+    /// A resume can write the session's history into the same file again: the
+    /// same records — same uuid, same timestamp, same message — with only
+    /// bookkeeping changed (a `slug`, a `promptId`, trimmed tool output,
+    /// stripped image bytes, zeroed usage). Measured: one real 19,435-line
+    /// transcript held 22 compaction boundaries for 7 actual compactions, one
+    /// written six times; 9 of 400 recent transcripts on one machine hold a
+    /// second or third copy of the whole conversation, 38,341 repeated records
+    /// in all, every one matching its first copy in type and timestamp. Read
+    /// in file order, each copy came back as more conversation — the history
+    /// shown again, with no elapsed time on the copies (their timestamps run
+    /// backwards) — so a record whose uuid was already taken in is skipped
+    /// whole. The first copy wins: it is where the message happened, and the
+    /// only one still carrying the call's usage. Claude Code reads its session
+    /// the same way, as a tree keyed by uuid.
+    seen_record_uuids: std::collections::HashSet<String>,
     /// Where the `/compact` prompt belongs, once its local-command echo shows
     /// up: the index of the divider it produced. See the insert in `feed_value`
     /// for why the prompt can't simply be emitted where the CLI wrote it.
@@ -1745,11 +1794,6 @@ pub(crate) struct ClaudeRecordAccumulator {
     /// the divider, which is what made the reopened conversation disagree with
     /// the one that was just streaming.
     compaction_summary_slot: Option<usize>,
-    /// `uuid`s of the continuation records already rendered. A resume replays
-    /// each one together with its boundary, byte-identical (the same pairing
-    /// held for every replayed boundary measured), and the boundary's dedup
-    /// alone would leave the replayed summary to render on its own.
-    seen_compaction_summary_uuids: std::collections::HashSet<String>,
 }
 
 impl ClaudeRecordAccumulator {
@@ -1770,12 +1814,12 @@ impl ClaudeRecordAccumulator {
             open_goal: None,
             background_acks: std::collections::HashMap::new(),
             background_notifications: std::collections::HashMap::new(),
+            turn_starts: Vec::new(),
             usage_owner_by_message_id: std::collections::HashMap::new(),
             pending_assistant_message_id: None,
-            seen_compaction_uuids: std::collections::HashSet::new(),
+            seen_record_uuids: std::collections::HashSet::new(),
             compaction_prompt_slot: None,
             compaction_summary_slot: None,
-            seen_compaction_summary_uuids: std::collections::HashSet::new(),
         }
     }
 
@@ -1850,6 +1894,17 @@ impl ClaudeRecordAccumulator {
         }
     }
 
+    /// The turn-start markers ([`Self::turn_starts`]) in the chronological
+    /// order [`super::backfill_turn_durations`] walks them in. File order is
+    /// not time order: a resume replays history into the same file, its
+    /// notifications included.
+    pub(crate) fn chronological_turn_starts(&self) -> Vec<DateTime<Utc>> {
+        let mut starts = self.turn_starts.clone();
+        starts.sort_unstable();
+        starts.dedup();
+        starts
+    }
+
     /// Feed one raw JSONL line. Blank and non-JSON lines are skipped, mirroring
     /// the historical `BufReader::lines()` loop (whose per-line errors were
     /// skipped via `Err(_) => continue`).
@@ -1881,13 +1936,25 @@ impl ClaudeRecordAccumulator {
             open_goal,
             background_acks,
             background_notifications,
+            turn_starts,
             usage_owner_by_message_id,
             pending_assistant_message_id,
-            seen_compaction_uuids,
+            seen_record_uuids,
             compaction_prompt_slot,
             compaction_summary_slot,
-            seen_compaction_summary_uuids,
         } = self;
+
+        // A record already taken in is the history written out again by a
+        // resume, not more of it. See `seen_record_uuids`.
+        if let Some(uuid) = value
+            .get("uuid")
+            .and_then(|u| u.as_str())
+            .filter(|u| !u.is_empty())
+        {
+            if !seen_record_uuids.insert(uuid.to_string()) {
+                return;
+            }
+        }
 
         let msg_type = value.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
@@ -2068,6 +2135,11 @@ impl ClaudeRecordAccumulator {
                 {
                     record_task_notification(background_notifications, raw);
                 }
+                if is_task_notification_record(&value) {
+                    if let Some(timestamp) = parse_timestamp(&value) {
+                        turn_starts.push(timestamp);
+                    }
+                }
 
                 let mut content = extract_user_content(&value);
 
@@ -2090,11 +2162,6 @@ impl ClaudeRecordAccumulator {
                 // for it — which no measured transcript has — is still drawn
                 // as a system turn, so it never vanishes.
                 let role = if let Some(text) = context_continuation_text(&content) {
-                    // A resume replays it verbatim along with its boundary,
-                    // which is deduped already — this is its other half.
-                    if !uuid.is_empty() && !seen_compaction_summary_uuids.insert(uuid.clone()) {
-                        return;
-                    }
                     let summary = continuation_summary_text(text);
                     let folded = compaction_summary_slot
                         .take()
@@ -2431,13 +2498,9 @@ impl ClaudeRecordAccumulator {
                                 || format!("claude-compaction-{}", messages.len()),
                                 str::to_string,
                             );
-                        // A resume replays the surviving history into the same
-                        // file, boundary records included — so one compaction
-                        // can appear a dozen lines apart, byte-identical. Draw
-                        // it once. See `seen_compaction_uuids`.
-                        if !seen_compaction_uuids.insert(id.clone()) {
-                            return;
-                        }
+                        // A resume writes boundary records again with the
+                        // rest of the history; the copies never get here (see
+                        // `seen_record_uuids`), so each compaction draws once.
                         messages.push(UnifiedMessage {
                             id: format!("synth-compaction-{}", messages.len()),
                             role: MessageRole::Assistant,
@@ -2732,6 +2795,7 @@ impl ClaudeParser {
             acc.feed_line(line);
         }
         acc.finalize_background_lifecycle();
+        let turn_starts = acc.chronological_turn_starts();
 
         let ClaudeRecordAccumulator {
             messages,
@@ -2757,8 +2821,9 @@ impl ClaudeParser {
         // records; current ones log no timings at all, so without this every
         // reply lost its elapsed-time chip the moment the live timer stopped.
         // Runs before the facts are derived, so the usage dashboard's elapsed
-        // time is backfilled too.
-        super::backfill_turn_durations(&mut turns, &[]);
+        // time is backfilled too. The markers start the turns the CLI opened
+        // on its own (see `ClaudeRecordAccumulator::turn_starts`).
+        super::backfill_turn_durations(&mut turns, &turn_starts);
         // Read the context window *before* folding in delegated spend: the
         // gauge measures how full this conversation's own prompt is, and a
         // sub-agent's context is its own, not this one's.
@@ -2983,7 +3048,10 @@ fn parse_data_uri_image(raw: &str) -> Option<(String, String)> {
 ///   `old_string`, `new_str` → `new_string`, and `replace_name` →
 ///   `replace_all` (true only for `true` / `"true"`).
 /// * `Grep` (2.1.292, read out of the 2.1.293 binary): the other way round,
-///   see [`canonical_grep_input`].
+///   see [`canonical_grep_input`], which since 2.1.295 also reads grep's own
+///   `-l` / `-c` / `-r` flags.
+/// * `Bash` (2.1.295, read out of the 2.1.296 binary): `command_description` →
+///   `description`, and `timeout_ms` → `timeout`, see [`canonical_bash_input`].
 ///
 /// Each rename fills a canonical key the input left ABSENT, and only from a
 /// string, so an input that already uses the canonical names — the common
@@ -3004,6 +3072,7 @@ pub(crate) fn canonical_file_tool_input(
         "Write" => (true, &["path", "file_text", "file_content"]),
         "Edit" => (false, &["path", "old_str", "new_str", "replace_name"]),
         "Grep" => return canonical_grep_input(input),
+        "Bash" => return canonical_bash_input(input),
         _ => return None,
     };
     let args = input.as_object()?;
@@ -3042,30 +3111,115 @@ pub(crate) fn canonical_file_tool_input(
     changed.then_some(serde_json::Value::Object(args))
 }
 
-/// Grep's one alias, the way the CLI repairs it: a non-empty `file_path` is
-/// read as `path` when `path` is absent, and dropped when it repeats `path`.
-/// Beside a different `path` it is left alone, as the CLI leaves it, and so is
-/// an empty one. The CLI also appends a note on the rename to the result
-/// ("Note: Grep's parameter for where to search is named `path`. …"), which
-/// the search card's output parser keeps as a note line.
+/// Grep's aliases, the way the CLI repairs them (`coerceInput`, read out of the
+/// 2.1.296 binary), in its order:
+///
+/// * `file_path` (2.1.292): a non-empty one is read as `path` when `path` is
+///   absent, and dropped when it repeats `path`. Beside a different `path` it
+///   is left alone, as the CLI leaves it, and so is an empty one.
+/// * grep's own flags (2.1.295): `-l` is read as `output_mode:
+///   "files_with_matches"` and `-c` as `output_mode: "count"` when
+///   `output_mode` is absent, and dropped when it already says the same; `-r`
+///   is dropped (Grep always searches recursively). A flag counts when it is
+///   `true` or `"true"`. `-l` goes first, so beside `-c` it wins and `-c`
+///   stays, as in the CLI.
+///
+/// The CLI also appends a note on each repair to the result ("Note: Grep's
+/// parameter for where to search is named `path`. …", "Note: `-c` is not a
+/// Grep parameter and was read as …"), which the search card's output parser
+/// keeps as a note line.
 fn canonical_grep_input(input: &serde_json::Value) -> Option<serde_json::Value> {
+    const FLAG_MODES: [(&str, &str); 2] = [("-l", "files_with_matches"), ("-c", "count")];
     let original = input.as_object()?;
-    let file_path = original
-        .get("file_path")?
-        .as_str()
-        .filter(|path| !path.is_empty())?;
-    let mut args = original.clone();
-    match original.get("path") {
-        None => {
-            let value = args.remove("file_path")?;
-            args.insert("path".to_string(), value);
-        }
-        Some(path) if path.as_str() == Some(file_path) => {
-            args.remove("file_path");
-        }
-        Some(_) => return None,
+    if !["file_path", "-l", "-c", "-r"]
+        .iter()
+        .any(|key| original.contains_key(*key))
+    {
+        return None;
     }
-    Some(serde_json::Value::Object(args))
+    let mut args = original.clone();
+    let mut changed = false;
+    if let Some(file_path) = original
+        .get("file_path")
+        .and_then(serde_json::Value::as_str)
+        .filter(|path| !path.is_empty())
+    {
+        match original.get("path") {
+            None => {
+                if let Some(value) = args.remove("file_path") {
+                    args.insert("path".to_string(), value);
+                    changed = true;
+                }
+            }
+            Some(path) if path.as_str() == Some(file_path) => {
+                args.remove("file_path");
+                changed = true;
+            }
+            Some(_) => {}
+        }
+    }
+    for (flag, mode) in FLAG_MODES {
+        if !is_cli_true(args.get(flag)) {
+            continue;
+        }
+        let unset = !args.contains_key("output_mode");
+        if unset || args.get("output_mode").and_then(serde_json::Value::as_str) == Some(mode) {
+            args.remove(flag);
+            args.insert(
+                "output_mode".to_string(),
+                serde_json::Value::String(mode.to_string()),
+            );
+            changed = true;
+        }
+    }
+    if is_cli_true(args.get("-r")) {
+        args.remove("-r");
+        changed = true;
+    }
+    changed.then_some(serde_json::Value::Object(args))
+}
+
+/// Bash's two aliases, the way CLI 2.1.296 repairs them:
+///
+/// * `timeout_ms` is read as `timeout` when `timeout` is absent and it holds a
+///   number or a string of digits; anything else stays where it is.
+/// * `command_description` (2.1.295) is read as `description` when
+///   `description` is absent and it is a string, and is dropped otherwise.
+///
+/// Values move as they are: a string of digits stays a string, as in the CLI.
+fn canonical_bash_input(input: &serde_json::Value) -> Option<serde_json::Value> {
+    let original = input.as_object()?;
+    if !original.contains_key("timeout_ms") && !original.contains_key("command_description") {
+        return None;
+    }
+    let mut args = original.clone();
+    let mut changed = false;
+    if !args.contains_key("timeout")
+        && args.get("timeout_ms").is_some_and(|value| {
+            value.is_number()
+                || value
+                    .as_str()
+                    .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+        })
+    {
+        if let Some(value) = args.remove("timeout_ms") {
+            args.insert("timeout".to_string(), value);
+            changed = true;
+        }
+    }
+    if let Some(description) = args.remove("command_description") {
+        if !args.contains_key("description") && description.is_string() {
+            args.insert("description".to_string(), description);
+        }
+        changed = true;
+    }
+    changed.then_some(serde_json::Value::Object(args))
+}
+
+/// The CLI's reading of a flag-like argument: `true` and `"true"` are true.
+fn is_cli_true(value: Option<&serde_json::Value>) -> bool {
+    matches!(value, Some(serde_json::Value::Bool(true)))
+        || value.and_then(serde_json::Value::as_str) == Some("true")
 }
 
 /// Move `alias` onto `canonical` when the canonical key is absent and the alias
@@ -3992,6 +4146,139 @@ mod tests {
     }
 
     #[test]
+    fn grep_flags_are_read_the_way_the_cli_reads_them() {
+        // CLI 2.1.295: `-l` / `-c` set an absent `output_mode`, `true` or
+        // "true" alike, and `-r` is dropped.
+        assert_eq!(
+            canonical_file_tool_input("Grep", &json!({"pattern": "x", "-l": true})),
+            Some(json!({"pattern": "x", "output_mode": "files_with_matches"}))
+        );
+        assert_eq!(
+            canonical_file_tool_input("Grep", &json!({"pattern": "x", "-c": "true", "-r": true})),
+            Some(json!({"pattern": "x", "output_mode": "count"}))
+        );
+        // A flag that repeats `output_mode` is dropped; one that contradicts it
+        // stays, and so does a flag that is not true.
+        assert_eq!(
+            canonical_file_tool_input(
+                "Grep",
+                &json!({"pattern": "x", "-c": true, "output_mode": "count"})
+            ),
+            Some(json!({"pattern": "x", "output_mode": "count"}))
+        );
+        for input in [
+            json!({"pattern": "x", "-l": true, "output_mode": "content"}),
+            json!({"pattern": "x", "-l": false}),
+            json!({"pattern": "x", "-c": "yes"}),
+            json!({"pattern": "x", "-r": "false"}),
+            json!({"pattern": "x", "-l": true, "output_mode": null}),
+        ] {
+            assert_eq!(canonical_file_tool_input("Grep", &input), None, "{input}");
+        }
+        // `-l` is read first, so it takes the mode and `-c` stays behind.
+        assert_eq!(
+            canonical_file_tool_input("Grep", &json!({"pattern": "x", "-l": true, "-c": true})),
+            Some(json!({"pattern": "x", "output_mode": "files_with_matches", "-c": true}))
+        );
+        // The flags and the `file_path` alias are repaired together.
+        assert_eq!(
+            canonical_file_tool_input(
+                "Grep",
+                &json!({"pattern": "x", "file_path": "/w", "-r": "true", "-l": "true"})
+            ),
+            Some(json!({"pattern": "x", "path": "/w", "output_mode": "files_with_matches"}))
+        );
+        // Beside a `path` the `file_path` alias cannot settle, a flag still is.
+        assert_eq!(
+            canonical_file_tool_input(
+                "Grep",
+                &json!({"pattern": "x", "path": "/w", "file_path": "/v", "-r": true})
+            ),
+            Some(json!({"pattern": "x", "path": "/w", "file_path": "/v"}))
+        );
+    }
+
+    #[test]
+    fn bash_aliases_are_read_the_way_the_cli_reads_them() {
+        // CLI 2.1.295: `command_description` is read as an absent
+        // `description`.
+        assert_eq!(
+            canonical_file_tool_input(
+                "Bash",
+                &json!({"command": "ls", "command_description": "List files"})
+            ),
+            Some(json!({"command": "ls", "description": "List files"}))
+        );
+        // Beside a `description`, or when it is not a string, it is dropped.
+        assert_eq!(
+            canonical_file_tool_input(
+                "Bash",
+                &json!({"command": "ls", "description": "Mine", "command_description": "Other"})
+            ),
+            Some(json!({"command": "ls", "description": "Mine"}))
+        );
+        assert_eq!(
+            canonical_file_tool_input("Bash", &json!({"command": "ls", "command_description": 3})),
+            Some(json!({"command": "ls"}))
+        );
+        // `timeout_ms` moves to an absent `timeout` when it holds a number or a
+        // string of digits, which moves as it is.
+        assert_eq!(
+            canonical_file_tool_input("Bash", &json!({"command": "ls", "timeout_ms": 5000})),
+            Some(json!({"command": "ls", "timeout": 5000}))
+        );
+        assert_eq!(
+            canonical_file_tool_input("Bash", &json!({"command": "ls", "timeout_ms": "5000"})),
+            Some(json!({"command": "ls", "timeout": "5000"}))
+        );
+        for input in [
+            json!({"command": "ls", "timeout_ms": "5s"}),
+            json!({"command": "ls", "timeout_ms": ""}),
+            json!({"command": "ls", "timeout_ms": 10, "timeout": 20}),
+            json!({"command": "ls", "description": "d"}),
+        ] {
+            assert_eq!(canonical_file_tool_input("Bash", &input), None, "{input}");
+        }
+        // PowerShell is not repaired by the CLI, so not here either.
+        assert_eq!(
+            canonical_file_tool_input(
+                "PowerShell",
+                &json!({"command": "ls", "command_description": "List files"})
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_history_bash_that_used_command_description_renders_with_description() {
+        let record = json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_b",
+                    "name": "Bash",
+                    "input": {"command": "cargo test", "command_description": "Run the tests"},
+                }],
+            },
+        });
+        let blocks = extract_assistant_content(&record);
+        let Some(ContentBlock::ToolUse {
+            input_preview: Some(input),
+            ..
+        }) = blocks.first()
+        else {
+            panic!("expected a tool_use block, got {blocks:?}");
+        };
+        let input: serde_json::Value = serde_json::from_str(input).unwrap();
+        assert_eq!(
+            input,
+            json!({"command": "cargo test", "description": "Run the tests"})
+        );
+    }
+
+    #[test]
     fn a_history_grep_that_used_file_path_renders_with_path() {
         let record = json!({
             "type": "assistant",
@@ -4623,6 +4910,100 @@ mod tests {
         );
     }
 
+    /// A resume can write the session's whole history into the same file
+    /// again — same uuids and timestamps, a `slug` added, the usage of the
+    /// repeated call zeroed — before the next prompt. Read in file order, the
+    /// conversation came back twice, the copy with no elapsed time, and the
+    /// list counted it twice and ended it at the copy's old timestamp.
+    #[test]
+    fn a_history_written_out_again_by_a_resume_shows_once() {
+        let prompt = |uuid: &str, ts: &str, text: &str, slug: bool| {
+            let mut record = json!({
+                "type": "user", "timestamp": ts, "uuid": uuid,
+                "cwd": "/Users/test/proj", "sessionId": "sess-rewritten",
+                "message": {"role": "user", "content": [{"type": "text", "text": text}]},
+            });
+            if slug {
+                record["slug"] = json!("velvety-sleeping-kitten");
+            }
+            record.to_string()
+        };
+        let reply = |uuid: &str, id: &str, ts: &str, text: &str, input: u64| {
+            json!({
+                "type": "assistant", "timestamp": ts, "uuid": uuid,
+                "message": {
+                    "id": id, "role": "assistant", "model": "claude-opus-5",
+                    "content": [{"type": "text", "text": text}],
+                    "usage": {
+                        "input_tokens": input, "output_tokens": input,
+                        "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+                    },
+                },
+            })
+            .to_string()
+        };
+        let lines = vec![
+            prompt("u1", "2026-10-13T10:00:00.000Z", "fix the bug", false),
+            reply("a1", "m1", "2026-10-13T10:00:30.000Z", "Fixed it.", 10),
+            r#"{"type":"queue-operation","operation":"enqueue","timestamp":"2026-10-13T11:00:00.000Z","sessionId":"sess-rewritten"}"#.to_string(),
+            r#"{"type":"last-prompt","lastPrompt":"fix the bug","sessionId":"sess-rewritten"}"#.to_string(),
+            // The rewrite.
+            prompt("u1", "2026-10-13T10:00:00.000Z", "fix the bug", true),
+            reply("a1", "m1", "2026-10-13T10:00:30.000Z", "Fixed it.", 0),
+            // What the resume was for.
+            prompt("u2", "2026-10-13T11:00:00.100Z", "now the tests", false),
+            reply("a2", "m2", "2026-10-13T11:00:20.100Z", "Tests pass.", 20),
+        ];
+        let detail = parse_lines("sess-rewritten", &lines);
+
+        assert_eq!(
+            turn_shapes(&detail),
+            vec![
+                "User:fix the bug",
+                "Assistant:Fixed it.",
+                "User:now the test",
+                "Assistant:Tests pass.",
+            ]
+        );
+        let replies: Vec<_> = detail
+            .turns
+            .iter()
+            .filter(|t| matches!(t.role, TurnRole::Assistant))
+            .collect();
+        assert_eq!(replies[0].duration_ms, Some(30_000));
+        assert_eq!(
+            replies[0].usage.as_ref().map(|u| u.input_tokens),
+            Some(10),
+            "the first copy keeps the call's real usage"
+        );
+        assert_eq!(replies[1].duration_ms, Some(20_000));
+
+        let summarize = |lines: &[String]| {
+            let path = std::env::temp_dir().join(format!(
+                "codeg-claude-rewritten-{}.jsonl",
+                uuid::Uuid::new_v4()
+            ));
+            fs::write(&path, lines.join("\n") + "\n").expect("write transcript");
+            let summary = ClaudeParser {
+                base_dir: PathBuf::new(),
+            }
+            .parse_jsonl_summary(&path)
+            .expect("parse summary")
+            .expect("summary present");
+            fs::remove_file(&path).expect("cleanup temp jsonl");
+            summary
+        };
+        let at = |ts: &str| Some(ts.parse::<DateTime<Utc>>().unwrap());
+        let summary = summarize(&lines);
+        assert_eq!(summary.message_count, 4);
+        assert_eq!(summary.ended_at, at("2026-10-13T11:00:20.100Z"));
+        // Read before the new prompt lands, the copy is the transcript's tail:
+        // its old timestamps must not wind the conversation's end back.
+        let summary = summarize(&lines[..6]);
+        assert_eq!(summary.message_count, 2);
+        assert_eq!(summary.ended_at, at("2026-10-13T11:00:00.000Z"));
+    }
+
     /// Live, claude-agent-acp hands the compaction its summary and the divider
     /// opens onto it behind a "Summary" toggle. The transcript keeps that
     /// summary in the continuation record written right after the boundary —
@@ -4970,11 +5351,12 @@ mod tests {
         }
         acc.finalize_background_lifecycle();
         let cwd = acc.cwd.clone();
+        let turn_starts = acc.chronological_turn_starts();
         let mut turns = group_into_turns(acc.messages);
         crate::parsers::relocate_orphaned_tool_results(&mut turns);
         crate::parsers::structurize_read_tool_output(&mut turns);
         crate::parsers::resolve_patch_line_numbers(&mut turns, cwd.as_deref());
-        crate::parsers::backfill_turn_durations(&mut turns, &[]);
+        crate::parsers::backfill_turn_durations(&mut turns, &turn_starts);
 
         assert_eq!(
             serde_json::to_string(&turns).unwrap(),
@@ -5717,6 +6099,52 @@ mod tests {
         // (which would have landed at 10:06:38.334Z, ~3min 19s later).
         let wrong = "2026-03-01T10:06:38.334Z".parse::<DateTime<Utc>>().unwrap();
         assert_ne!(completed_at, wrong);
+    }
+
+    /// A background task that settles while the CLI is idle makes Claude Code
+    /// open a turn on its own. The `<task-notification>` starting it never
+    /// becomes a user turn, so that reply was measured from the end of the
+    /// previous one, the idle stretch in between included — a real transcript
+    /// charged a 16-second answer 79 minutes. The reply the user prompted must
+    /// keep its own span either way.
+    #[test]
+    fn a_turn_opened_by_a_task_notification_is_timed_from_the_notification() {
+        let lines: Vec<String> = [
+            r#"{"type":"user","timestamp":"2026-10-14T11:00:00.000Z","uuid":"u1","message":{"role":"user","content":[{"type":"text","text":"build it in the background"}]}}"#,
+            r#"{"type":"assistant","timestamp":"2026-10-14T11:00:05.000Z","uuid":"a1","message":{"id":"m1","role":"assistant","model":"claude-opus-5","content":[{"type":"tool_use","id":"toolu_bg","name":"Bash","input":{"command":"pnpm build","run_in_background":true}}]}}"#,
+            r#"{"type":"user","timestamp":"2026-10-14T11:00:06.000Z","uuid":"u2","message":{"role":"user","content":[{"tool_use_id":"toolu_bg","type":"tool_result","content":"Command running in background with ID: bg1."}]},"toolUseResult":{"stdout":"","stderr":"","interrupted":false,"backgroundTaskId":"bg1"}}"#,
+            r#"{"type":"assistant","timestamp":"2026-10-14T11:00:20.000Z","uuid":"a2","message":{"id":"m2","role":"assistant","model":"claude-opus-5","content":[{"type":"text","text":"Started, I will report back."}]}}"#,
+            // 79 idle minutes later the build settles and the CLI answers it.
+            r#"{"type":"user","timestamp":"2026-10-14T12:19:30.000Z","uuid":"u3","message":{"role":"user","content":"<task-notification>\n<task-id>bg1</task-id>\n<tool-use-id>toolu_bg</tool-use-id>\n<status>completed</status>\n<summary>Background command \"pnpm build\" completed</summary>\n</task-notification>"}}"#,
+            r#"{"type":"assistant","timestamp":"2026-10-14T12:19:40.000Z","uuid":"a3","message":{"id":"m3","role":"assistant","model":"claude-opus-5","content":[{"type":"thinking","thinking":"","signature":"sig"}]}}"#,
+            r#"{"type":"assistant","timestamp":"2026-10-14T12:19:46.000Z","uuid":"a4","message":{"id":"m3","role":"assistant","model":"claude-opus-5","content":[{"type":"text","text":"The build passed."}]}}"#,
+        ]
+        .iter()
+        .map(|line| line.to_string())
+        .collect();
+        let detail = parse_lines("sess-notified", &lines);
+
+        let notified_at = "2026-10-14T12:19:30Z".parse::<DateTime<Utc>>().unwrap();
+        let span = |after_notification: bool| -> u64 {
+            detail
+                .turns
+                .iter()
+                .filter(|t| matches!(t.role, TurnRole::Assistant))
+                .filter(|t| (t.timestamp >= notified_at) == after_notification)
+                .filter_map(|t| t.duration_ms)
+                .sum()
+        };
+        assert_eq!(
+            detail
+                .turns
+                .iter()
+                .filter(|t| matches!(t.role, TurnRole::User))
+                .count(),
+            1,
+            "the notification must stay out of the thread"
+        );
+        assert_eq!(span(false), 20_000, "11:00:00 → 11:00:20");
+        assert_eq!(span(true), 16_000, "12:19:30 → 12:19:46, not the idle hour");
     }
 
     #[test]
@@ -8378,6 +8806,17 @@ mod tests {
                 ("assistant", "Meanwhile, reading the code.".to_string()),
                 ("assistant", "The review is back.".to_string()),
             ]
+        );
+    }
+
+    /// #948: built with an agent's launch env, the parser reads where THAT
+    /// env puts the agent's files, not where codeg's own environment does.
+    #[test]
+    fn for_env_reads_the_config_dir_of_the_launch_env() {
+        let env = AgentEnv::with_overrides(&[("CLAUDE_CONFIG_DIR", "/relocated/claude")]);
+        assert_eq!(
+            ClaudeParser::for_env(&env).base_dir,
+            PathBuf::from("/relocated/claude").join("projects")
         );
     }
 }
