@@ -2684,12 +2684,11 @@ pub async fn spawn_agent_connection(
         initial_state.pi_enabled_model_patterns =
             crate::commands::acp::pi_enabled_model_patterns_for_env(&runtime_env, &launch_cwd);
     }
-    // The model rows this launch may SHOW, taken in the same breath and from
-    // the same `agent_type` + merged env the process is spawned with. A fresh
-    // session re-computes (no hot reload — that is what makes `auth login`
-    // reach the next connect).
-    initial_state.model_availability =
-        crate::acp::model_visibility::compute(agent_type, &runtime_env);
+    // The model rows this launch may SHOW, taken in the same breath as the
+    // spawn: for OpenCode, the desktop app's per-model toggles (the user's
+    // own word, not an availability inference). A fresh connect re-reads the
+    // desktop state (no hot reload while the connection lives).
+    initial_state.model_availability = crate::acp::model_visibility::compute(agent_type);
 
     let session_state = Arc::new(RwLock::new(initial_state));
 
@@ -38498,8 +38497,8 @@ mod tests {
         )));
         state.write().await.model_availability =
             ModelAvailability::Restricted(RestrictedAvailability {
-                providers: HashSet::from(["kept".to_string()]),
-                hidden_models: HashMap::new(),
+                opinionated_providers: HashSet::from(["hidden".to_string()]),
+                shown_models: HashSet::new(),
             });
         let mut events = state.read().await.event_stream().subscribe();
 
