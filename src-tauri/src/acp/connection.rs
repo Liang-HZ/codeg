@@ -14071,21 +14071,24 @@ fn cursor_companion_title_from_content(content: Option<&str>) -> Option<&'static
 
 /// Whether this live agent belongs to the CodeBuddy family and therefore gets
 /// the CodeBuddy quirk handling: the built-in CodeBuddy agent, or a custom
-/// agent registered as a CodeBuddy CLI variant (registry id `codebuddy` or
-/// `codebuddy-*` — dual-account setups run the same CLI binary under different
-/// envs and stream identical `codebuddy.ai/*` `_meta` shapes).
+/// agent whose launch recipe runs the same CLI (`codebuddy --acp`, or a direct
+/// `npx @tencent-ai/codebuddy-code` launch — dual-account setups run the same
+/// CLI binary under different envs and stream identical `codebuddy.ai/*`
+/// `_meta` shapes).
 ///
 /// LOCAL (codeg-fix, 2026-10-12): upstream gates every CodeBuddy quirk on
 /// `AgentType::CodeBuddy` alone, so custom variants leaked sub-agent
 /// thought/message chunks into the main stream (each also rendered inside the
 /// Agent pill's window, out of order) and missed the Agent-pill title rewrite
-/// and deferred-MCP unwraps. The id-prefix scope keeps every quirk on agents
-/// that ARE the CodeBuddy CLI, so no unrelated agent's `codebuddy.ai/*` keys
-/// can alias in.
+/// and deferred-MCP unwraps. The scope is anchored on the launch RECIPE, not
+/// the registry id (2026-10-16): an id is free-form user input — renamed, it
+/// would silently drop every quirk — while the CLI cannot be replaced. Only
+/// the real CLI emits the `codebuddy.ai/*` `_meta` keys those quirks read, so
+/// "launched the CodeBuddy CLI" cannot alias an unrelated agent in.
 fn is_codebuddy_family(agent_type: AgentType) -> bool {
     match agent_type {
         AgentType::CodeBuddy => true,
-        AgentType::Custom(id) => id == "codebuddy" || id.starts_with("codebuddy-"),
+        AgentType::Custom(_) => crate::acp::registry::uses_codebuddy_cli_backend(agent_type),
         _ => false,
     }
 }
@@ -31422,21 +31425,75 @@ mod tests {
         );
     }
 
-    // ─── is_codebuddy_family (LOCAL: custom CodeBuddy CLI variants) ──────
+    // ─── is_codebuddy_family (LOCAL: anchored on the launch recipe) ──────
 
-    /// The dual-account custom agents (`codebuddy-cn` / `codebuddy-intl`) run
-    /// the same CLI as the built-in and must get the same quirk handling; ids
-    /// outside the family must not.
+    /// A custom registration launching `package`'s `cmd` with `--acp` — the
+    /// npx shape the built-in CodeBuddy entry and the dual-account variants
+    /// share.
+    fn npx_acp_def(
+        registry_id: &str,
+        package: &str,
+        cmd: &str,
+    ) -> crate::acp::custom_registry::CustomAgentDef {
+        use crate::acp::custom_registry::{
+            CustomAgentDef, CustomAgentSpec, CustomDistributionKind, NpxSpec,
+        };
+        CustomAgentDef {
+            registry_id: registry_id.into(),
+            name: registry_id.into(),
+            description: String::new(),
+            version: "2.164.0".into(),
+            distribution_kind: CustomDistributionKind::Npx,
+            spec: CustomAgentSpec {
+                npx: Some(NpxSpec {
+                    package: package.into(),
+                    args: vec!["--acp".into()],
+                    env: Default::default(),
+                    cmd: Some(cmd.into()),
+                    node_required: None,
+                }),
+                ..Default::default()
+            },
+            icon_url: None,
+            skills_shared_store: false,
+            skills_dir: None,
+            source: Default::default(),
+            version_probe: None,
+            supports_mcp: true,
+        }
+    }
+
+    /// The dual-account shape: the built-in entry's CLI (`codebuddy --acp`)
+    /// under an arbitrary registry id.
+    fn codebuddy_cli_def(registry_id: &str) -> crate::acp::custom_registry::CustomAgentDef {
+        npx_acp_def(registry_id, "@tencent-ai/codebuddy-code@2.164.0", "codebuddy")
+    }
+
+    /// The family follows the LAUNCH RECIPE, not the registry id: a custom
+    /// registration that runs `codebuddy --acp` gets the quirks under any id
+    /// (`cb-intl` — a rename drops every `codebuddy` prefix the old gate keyed
+    /// on), while a registration that runs a different CLI stays out even when
+    /// its id still says `codebuddy-cn`. `hydrate` replaces the process-global
+    /// registry, so the test holds `hydrate_test_guard` and clears at the end.
     #[test]
-    fn codebuddy_family_covers_builtin_and_custom_variants_only() {
+    fn codebuddy_family_follows_the_launch_recipe_not_the_registry_id() {
+        use crate::acp::custom_registry::{hydrate, hydrate_test_guard};
+        let _guard = hydrate_test_guard();
+
         assert!(is_codebuddy_family(AgentType::CodeBuddy));
-        assert!(is_codebuddy_family(AgentType::Custom("codebuddy")));
-        assert!(is_codebuddy_family(AgentType::Custom("codebuddy-cn")));
-        assert!(is_codebuddy_family(AgentType::Custom("codebuddy-intl")));
-        assert!(!is_codebuddy_family(AgentType::Custom("codebuddyx")));
-        assert!(!is_codebuddy_family(AgentType::Custom("qoder-cli")));
         assert!(!is_codebuddy_family(AgentType::ClaudeCode));
         assert!(!is_codebuddy_family(AgentType::OpenCode));
+
+        let defs = [
+            codebuddy_cli_def("cb-intl"),
+            npx_acp_def("codebuddy-cn", "other-agent@1.0.0", "other-agent"),
+            npx_acp_def("other-agent", "other-agent@1.0.0", "other-agent"),
+        ];
+        assert!(hydrate(&defs).is_empty());
+        assert!(is_codebuddy_family(AgentType::Custom("cb-intl")));
+        assert!(!is_codebuddy_family(AgentType::Custom("codebuddy-cn")));
+        assert!(!is_codebuddy_family(AgentType::Custom("other-agent")));
+        hydrate(&[]);
     }
 
     /// The suppression window is the core of the sub-agent folding the custom
@@ -31444,6 +31501,9 @@ mod tests {
     /// custom CodeBuddy variant exactly like the built-in.
     #[test]
     fn custom_codebuddy_variant_gets_subagent_suppression_and_meta_reads() {
+        use crate::acp::custom_registry::{hydrate, hydrate_test_guard};
+        let _guard = hydrate_test_guard();
+        assert!(hydrate(&[codebuddy_cli_def("codebuddy-cn")]).is_empty());
         let custom = AgentType::Custom("codebuddy-cn");
         // Window open, chunk meta absent → suppressed (the window invariant).
         assert!(should_suppress_subagent_chunk(custom, true, None));
@@ -31473,6 +31533,7 @@ mod tests {
         // Still scoped: a non-family agent with the same meta is untouched.
         assert!(!codebuddy_meta_marks_subagent(AgentType::Qoder, agent_meta.as_object()));
         assert!(!should_suppress_subagent_chunk(AgentType::Qoder, true, None));
+        hydrate(&[]);
     }
 
     // ─── codebuddy_meta_marks_subagent ───────────────────────────────────
@@ -31703,6 +31764,9 @@ mod tests {
     /// tests below pin the two decisions together.
     #[test]
     fn member_event_chunks_are_suppressed_unless_linked() {
+        use crate::acp::custom_registry::{hydrate, hydrate_test_guard};
+        let _guard = hydrate_test_guard();
+        assert!(hydrate(&[codebuddy_cli_def("codebuddy-intl")]).is_empty());
         // The unlinked member stream (and its record echo) → suppressed even
         // with the window closed: the meta arm alone catches it. A member is
         // NOT window-excluded as a background worker — its start frame carries
@@ -31750,6 +31814,7 @@ mod tests {
             false,
             main.as_object()
         ));
+        hydrate(&[]);
     }
 
     /// Unit contract of the member-channel decision: the flat
@@ -31759,6 +31824,13 @@ mod tests {
     /// veto — mirroring `codebuddy_chunk_parent_reads_the_flat_meta_only_for_the_family`.
     #[test]
     fn member_channel_reads_the_flat_meta_only_for_the_family() {
+        use crate::acp::custom_registry::{hydrate, hydrate_test_guard};
+        let _guard = hydrate_test_guard();
+        let defs = [
+            codebuddy_cli_def("codebuddy-cn"),
+            codebuddy_cli_def("codebuddy-intl"),
+        ];
+        assert!(hydrate(&defs).is_empty());
         let tagged = serde_json::json!({
             "codebuddy.ai/memberEvent": "impl-x",
             "codebuddy.ai/memberHistoryItemId": "h1",
@@ -31828,6 +31900,7 @@ mod tests {
         assert_eq!(member_history_item_id(absent.as_object()), None);
         let empty_hist = serde_json::json!({ "codebuddy.ai/memberHistoryItemId": "" });
         assert_eq!(member_history_item_id(empty_hist.as_object()), None);
+        hydrate(&[]);
     }
 
     /// Drive `frames` (raw `session/update` payloads) through
@@ -32189,6 +32262,13 @@ mod tests {
 
     #[test]
     fn codebuddy_chunk_parent_reads_the_flat_meta_only_for_the_family() {
+        use crate::acp::custom_registry::{hydrate, hydrate_test_guard};
+        let _guard = hydrate_test_guard();
+        let defs = [
+            codebuddy_cli_def("codebuddy-cn"),
+            codebuddy_cli_def("codebuddy-intl"),
+        ];
+        assert!(hydrate(&defs).is_empty());
         let valid = serde_json::json!({ "codebuddy.ai/parentToolCallId": "chatcmpl-tool-1" });
         // The built-in and both dual-account custom variants all read it.
         for agent in [
@@ -32227,6 +32307,7 @@ mod tests {
             None
         );
         assert_eq!(subagent_chunk_parent_tool_use_id(AgentType::CodeBuddy, None), None);
+        hydrate(&[]);
     }
 
     #[test]
