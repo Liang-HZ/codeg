@@ -20181,11 +20181,11 @@ fn codebuddy_meta_marks_background(
 }
 
 /// True when a CodeBuddy thought/message `ContentChunk`'s own `_meta` marks the
-/// chunk as sub-agent output (`codebuddy.ai/isSubagent`, or a
-/// `codebuddy.ai/parentToolCallId` link to the Agent call). This is a precision
-/// supplement to the open-sub-agent window — CodeBuddy is not confirmed to
-/// populate chunk `_meta`, so suppression never relies on it alone. Gated on
-/// CodeBuddy.
+/// chunk as sub-agent output (`codebuddy.ai/isSubagent`). A precision
+/// supplement to the open-sub-agent window, never relied on alone: chunks the
+/// wire LINKED to their Agent call (`codebuddy.ai/parentToolCallId`, measured
+/// populated on 2.164.0) are routed by `subagent_chunk_parent_tool_use_id`
+/// before suppression is ever consulted. Gated on CodeBuddy.
 fn codebuddy_chunk_marks_subagent(
     agent_type: AgentType,
     meta: Option<&serde_json::Map<String, serde_json::Value>>,
@@ -20193,15 +20193,9 @@ fn codebuddy_chunk_marks_subagent(
     if agent_type != AgentType::CodeBuddy {
         return false;
     }
-    let Some(meta) = meta else {
-        return false;
-    };
-    if meta.get("codebuddy.ai/isSubagent").and_then(|v| v.as_bool()) == Some(true) {
-        return true;
-    }
-    meta.get("codebuddy.ai/parentToolCallId")
-        .and_then(|v| v.as_str())
-        .is_some_and(|s| !s.is_empty())
+    meta.and_then(|m| m.get("codebuddy.ai/isSubagent"))
+        .and_then(|v| v.as_bool())
+        == Some(true)
 }
 
 /// Whether a live thought/message chunk should be dropped from the top-level
@@ -20231,6 +20225,9 @@ fn should_suppress_subagent_chunk(
     if agent_type != AgentType::CodeBuddy {
         return false;
     }
+    if subagent_chunk_parent_tool_use_id(agent_type, chunk_meta).is_some() {
+        return false;
+    }
     window_open || codebuddy_chunk_marks_subagent(agent_type, chunk_meta)
 }
 
@@ -20245,15 +20242,26 @@ fn should_suppress_subagent_chunk(
 /// * Qoder — `_meta.qoder.parentToolUseId`, emitted by a locally patched
 ///   qodercli (see `~/agentrelay/qoder-attribution-patch`). Stock 1.1.65 /
 ///   1.1.67 builds forward subagent chunks with no attribution at all.
+/// * CodeBuddy writes a FLAT `_meta["codebuddy.ai/parentToolCallId"]`
+///   (measured on CodeBuddy 2.164.0: present on every sub-agent thought/message
+///   chunk, never on a main-thread one).
 ///
-/// The chunk is emitted WITH this attribution (never suppressed): the
-/// frontend routes parented chunks into the live Agent capsule instead of the
-/// main thread. The namespace is selected per agent so no other agent's meta
-/// can alias into parented routing; empty strings are treated as absent.
+/// Only the owning agent's own id space is read, so no other agent's
+/// namespaced meta can alias into parented routing; empty strings are treated
+/// as absent.
 fn subagent_chunk_parent_tool_use_id(
     agent_type: AgentType,
     meta: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Option<String> {
+    // CodeBuddy's link is a flat single key, not nested under a namespace
+    // object — read it before the namespaced pair.
+    if agent_type == AgentType::CodeBuddy {
+        return meta?
+            .get("codebuddy.ai/parentToolCallId")?
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+    }
     let namespace = match agent_type {
         AgentType::ClaudeCode => "claudeCode",
         // A locally patched qodercli (see ~/agentrelay/qoder-attribution-patch)
@@ -25253,11 +25261,14 @@ async fn emit_conversation_update(
                         .await;
                     }
                     PiChunkRoute::Prose => {
-                        // Claude subagent chunks (claude-agent-acp ≥0.63 with the
-                        // `subagent-transcript` capability) are NOT suppressed: they
-                        // emit with their parent id so the frontend can route them
-                        // into the live Agent capsule. An OpenCode sub-agent's take
-                        // the same route.
+                        // Sub-agent chunks the wire LINKED to their Agent call are
+                        // NOT suppressed: they emit with their parent id so the
+                        // frontend can route them into the live Agent capsule
+                        // (claude-agent-acp ≥0.63 nested `claudeCode.parentToolUseId`;
+                        // CodeBuddy flat `codebuddy.ai/parentToolCallId`; Qoder nested
+                        // `qoder.parentToolUseId` — all read by
+                        // `subagent_chunk_parent_tool_use_id`). An OpenCode
+                        // sub-agent's take the same route.
                         let parent_tool_use_id = opencode_parent
                             .or_else(|| subagent_chunk_parent_tool_use_id(agent_type, meta.as_ref()));
                         // The adapter's own answer to a `/remote-control`
@@ -44659,6 +44670,178 @@ mod tests {
         }
         // Other agents never suppress, even inside a (spurious) open window.
         assert!(!should_suppress_subagent_chunk(AgentType::OpenCode, true, None));
+    }
+
+    #[test]
+    fn codebuddy_chunk_parent_reads_the_flat_meta_only_for_codebuddy() {
+        let valid = serde_json::json!({ "codebuddy.ai/parentToolCallId": "chatcmpl-tool-1" });
+        assert_eq!(
+            subagent_chunk_parent_tool_use_id(AgentType::CodeBuddy, valid.as_object()),
+            Some("chatcmpl-tool-1".to_string())
+        );
+        // The same flat key on another agent must not alias into routing.
+        assert_eq!(
+            subagent_chunk_parent_tool_use_id(AgentType::ClaudeCode, valid.as_object()),
+            None
+        );
+        // Empty / wrong type / absent key / absent meta → None.
+        let empty = serde_json::json!({ "codebuddy.ai/parentToolCallId": "" });
+        assert_eq!(
+            subagent_chunk_parent_tool_use_id(AgentType::CodeBuddy, empty.as_object()),
+            None
+        );
+        let wrong_type = serde_json::json!({ "codebuddy.ai/parentToolCallId": 42 });
+        assert_eq!(
+            subagent_chunk_parent_tool_use_id(AgentType::CodeBuddy, wrong_type.as_object()),
+            None
+        );
+        let no_key = serde_json::json!({ "codebuddy.ai/isSubagent": true });
+        assert_eq!(
+            subagent_chunk_parent_tool_use_id(AgentType::CodeBuddy, no_key.as_object()),
+            None
+        );
+        assert_eq!(subagent_chunk_parent_tool_use_id(AgentType::CodeBuddy, None), None);
+    }
+
+    /// The quirk gate is the exact built-in registration, never an id prefix:
+    /// a custom registration whose id merely starts with "codebuddy" gets
+    /// none of the built-in CodeBuddy quirk handling. Pins the review
+    /// decision that removed the prefix-based `is_codebuddy_family`.
+    #[test]
+    fn custom_codebuddy_registrations_get_no_builtin_quirks() {
+        let custom = AgentType::Custom("codebuddy-cn");
+        let meta = serde_json::json!({
+            "codebuddy.ai/toolName": "Agent",
+            "codebuddy.ai/isSubagent": true,
+            "codebuddy.ai/parentToolCallId": "chatcmpl-tool-1",
+        });
+        assert!(!codebuddy_meta_marks_subagent(custom, meta.as_object()));
+        assert!(!should_suppress_subagent_chunk(
+            custom,
+            true,
+            meta.as_object()
+        ));
+        assert_eq!(
+            subagent_chunk_parent_tool_use_id(custom, meta.as_object()),
+            None
+        );
+        let raw = Some("{\"toolName\":\"x\"}".to_string());
+        assert_eq!(codebuddy_deferred_tool_name(custom, &raw), None);
+        assert_eq!(unwrap_codebuddy_deferred_output(custom, "\"type\""), None);
+    }
+
+    /// Drive `emit_conversation_update` over several updates sharing one
+    /// `CodeBuddyLiveState`, like `pi_emit_chunk` does for pi's banner —
+    /// the suppression window only exists across updates, so a CodeBuddy
+    /// test needs the shared-state form.
+    async fn cb_emit_all(agent_type: AgentType, wires: &[serde_json::Value]) -> Vec<AcpEvent> {
+        let st = SessionState::new(
+            "conn-cb".to_string(),
+            agent_type,
+            None,
+            "win".to_string(),
+            None,
+        );
+        let state = Arc::new(RwLock::new(st));
+        let emitter = EventEmitter::Noop;
+        let mut cache = ToolCallOutputCache::default();
+        let mut cb = CodeBuddyLiveState::default();
+        for wire in wires {
+            let update: SessionUpdate =
+                serde_json::from_value(wire.clone()).expect("valid CodeBuddy wire shape");
+            emit_conversation_update(
+                &state, &emitter, agent_type, update, None, &mut cache, &mut cb,
+            )
+            .await;
+        }
+
+        let guard = state.read().await;
+        guard
+            .recent_events_after(0)
+            .map(|events| events.iter().map(|e| e.payload.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// The live contract end to end: while an Agent call's window is open, a
+    /// chunk LINKED to it is routed (emitted with its parent id) and an
+    /// unlinked chunk is suppressed; after the Agent call completes, the main
+    /// agent's chunk is emitted unparented.
+    #[tokio::test]
+    async fn codebuddy_linked_chunk_routes_through_emit_and_unlinked_is_suppressed() {
+        let agent_call = serde_json::json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "call-agent",
+            "title": "Agent",
+            "kind": "other",
+            "status": "in_progress",
+            "rawInput": {"description": "explore", "prompt": "map it"},
+            "_meta": {"codebuddy.ai/toolName": "Agent", "codebuddy.ai/isSubagent": true}
+        });
+        let linked_thought = serde_json::json!({
+            "sessionUpdate": "agent_thought_chunk",
+            "content": {"type": "text", "text": "SUB thinks"},
+            "_meta": {"codebuddy.ai/parentToolCallId": "call-agent"}
+        });
+        let unlinked_thought = serde_json::json!({
+            "sessionUpdate": "agent_thought_chunk",
+            "content": {"type": "text", "text": "SUB unlinked"}
+        });
+        let agent_done = serde_json::json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call-agent",
+            "status": "completed"
+        });
+        let main_chunk = serde_json::json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": "MAIN summary"}
+        });
+
+        let events = cb_emit_all(
+            AgentType::CodeBuddy,
+            &[
+                agent_call,
+                linked_thought,
+                unlinked_thought,
+                agent_done,
+                main_chunk,
+            ],
+        )
+        .await;
+
+        // The linked thought is routed with its parent id.
+        let routed = events
+            .iter()
+            .find_map(|e| match e {
+                AcpEvent::Thinking {
+                    text,
+                    parent_tool_use_id,
+                } => Some((text.clone(), parent_tool_use_id.clone())),
+                _ => None,
+            })
+            .expect("linked sub-agent thought is routed, not suppressed");
+        assert_eq!(routed.0, "SUB thinks");
+        assert_eq!(routed.1.as_deref(), Some("call-agent"));
+
+        // The unlinked thought inside the open window never reaches the stream.
+        assert!(events.iter().all(|e| match e {
+            AcpEvent::Thinking { text, .. } => text != "SUB unlinked",
+            _ => true,
+        }));
+
+        // After the Agent call completes, the main agent's prose is emitted
+        // unparented.
+        let main = events
+            .iter()
+            .find_map(|e| match e {
+                AcpEvent::ContentDelta {
+                    text,
+                    parent_tool_use_id,
+                } => Some((text.clone(), parent_tool_use_id.clone())),
+                _ => None,
+            })
+            .expect("main-agent prose after the window closes");
+        assert_eq!(main.0, "MAIN summary");
+        assert_eq!(main.1, None);
     }
 
     #[test]
