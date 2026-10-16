@@ -2891,6 +2891,20 @@ pub(crate) fn resolve_opencode_config_path() -> PathBuf {
     primary
 }
 
+/// Every config file an OpenCode install may carry `provider` entries in: the
+/// primary `opencode.json`, the `opencode.jsonc` scaffold OpenCode 1.x creates
+/// and READS (verified against 1.19.1 — a provider planted there reaches
+/// session/new), and the legacy `config.json`. The model-visibility policy
+/// unions provider ids across every existing candidate; single-file consumers
+/// (the connect UI) keep using `resolve_opencode_config_path`.
+pub(crate) fn opencode_config_candidates() -> Vec<PathBuf> {
+    vec![
+        opencode_primary_config_path(),
+        opencode_config_dir().join("opencode.jsonc"),
+        opencode_legacy_config_path(),
+    ]
+}
+
 /// `pub(crate)` for the model-visibility policy, which must look at the SAME
 /// `auth.json` the credential cascade writes.
 pub(crate) fn opencode_auth_json_path() -> PathBuf {
