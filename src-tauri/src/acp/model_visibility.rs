@@ -39,6 +39,15 @@
 //!   stay), plus the Zen
 //!   (`opencode`) provider's free subset from the bundled models.dev snapshot
 //!   when Zen itself is not logged in.
+//! - **OpenCode desktop (same agent, third source)**: the model page's
+//!   per-model toggles, persisted in the desktop app's `drafts.sqlite` row
+//!   `opencode.global.dat`/`model`. These materialize near the whole catalog,
+//!   so a provider the desktop has opinions about becomes opt-in: only its
+//!   `show` rows survive, and a `show` outranks the credential and Zen-pricing
+//!   inferences (the desktop reaches Zen/Console-account models `auth.json`
+//!   never sees — measured 2026-10-16: 9 of 15 shows on unauthenticated
+//!   providers). Fail-SOFT, unlike the file tiers: every read failure leaves
+//!   the policy computed so far untouched.
 //! - **Pi**: `~/.pi/agent/auth.json` keys union `models.json` `providers` keys
 //!   union `settings.json` `defaultProvider` (the provider the session's
 //!   current value comes from).
@@ -108,6 +117,9 @@ pub enum ModelAvailability {
 ///
 /// - its value equals the select's `currentValue` (constant rule, not a field —
 ///   it needs the option, not the policy), or
+/// - its exact value is in [`Self::shown_models`] — the OpenCode desktop's
+///   per-row `show` is the user's most explicit word and outranks every
+///   inference below, or
 /// - its provider is in [`Self::providers`], or
 /// - its provider is in [`Self::hidden_models`] and the model is NOT in that
 ///   provider's hidden set — notably a model id the provider's catalog has
@@ -115,7 +127,11 @@ pub enum ModelAvailability {
 /// - its value has no `/` at all, so it cannot be attributed to any provider
 ///   (fail-open).
 ///
-/// Rows of any other provider are dropped. A provider is never in both maps.
+/// Otherwise it is dropped — in particular every non-shown row of a provider
+/// with desktop opinions ([`Self::shown_models_providers`]): the desktop's
+/// per-model toggles materialize near the whole catalog, so an opinionated
+/// provider is opt-in. A provider is never in both [`Self::providers`] and
+/// [`Self::hidden_models`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RestrictedAvailability {
     /// Provider prefixes whose rows are kept whole (authenticated providers,
@@ -132,6 +148,19 @@ pub struct RestrictedAvailability {
     /// so the computable direction is "these are known to cost money", and
     /// the rest fails open per row.
     pub hidden_models: HashMap<String, HashSet<String>>,
+    /// Providers the OpenCode desktop app's model page has toggle entries for
+    /// (`drafts.sqlite` → `opencode.global.dat`/`model`): for these, visibility
+    /// is opt-in — only [`Self::shown_models`] rows survive. Empty when the
+    /// desktop has no state (CLI-only machines) or it could not be read
+    /// (fail-soft: this source never breaks the file-derived policy).
+    pub shown_models_providers: HashSet<String>,
+    /// Exact row values (`providerID/modelID`) the desktop marks `show`. A hit
+    /// here keeps the row outright — it outranks the credential and Zen-pricing
+    /// inferences (measured 2026-10-16: 9 of this machine's 15 shows sit on
+    /// providers `auth.json` does not carry, because the desktop reaches them
+    /// through its Console account), and it can only ever ADD rows the user
+    /// explicitly enabled.
+    pub shown_models: HashSet<String>,
 }
 
 /// The availability policy for a launch with `agent_type` and the merged
@@ -141,9 +170,12 @@ pub struct RestrictedAvailability {
 /// against.
 pub fn compute(agent_type: AgentType, runtime_env: &BTreeMap<String, String>) -> ModelAvailability {
     match agent_type {
-        AgentType::OpenCode => opencode_availability(
-            &crate::commands::acp::opencode_auth_json_path(),
-            &crate::commands::acp::opencode_config_candidates(),
+        AgentType::OpenCode => attach_desktop_visibility(
+            opencode_availability(
+                &crate::commands::acp::opencode_auth_json_path(),
+                &crate::commands::acp::opencode_config_candidates(),
+            ),
+            read_desktop_visibility(),
         ),
         AgentType::Pi => pi_availability(&crate::commands::acp::pi_agent_dir_for_env(runtime_env)),
         // The thirteen other built-ins need no policy: Claude/Gemini/Grok/
@@ -283,11 +315,22 @@ fn row_is_kept(policy: &RestrictedAvailability, current_value: &str, value: &str
     if value == current_value {
         return true;
     }
+    // The desktop's per-row `show` outranks everything below: it can rescue a
+    // row the credential or Zen-pricing inferences would drop, but it can only
+    // ever add rows the user explicitly enabled.
+    if policy.shown_models.contains(value) {
+        return true;
+    }
     let Some((provider, model)) = value.split_once('/') else {
         // No provider segment: nothing to judge it against. Fail open rather
         // than hide a row whose shape we do not recognize.
         return true;
     };
+    // A provider with desktop opinions is opt-in: everything but its `show`
+    // rows (handled above) is dropped, whatever the rules below would say.
+    if policy.shown_models_providers.contains(provider) {
+        return false;
+    }
     if policy.providers.contains(provider) {
         return true;
     }
@@ -544,6 +587,7 @@ fn opencode_availability(auth_path: &Path, config_candidates: &[PathBuf]) -> Mod
     ModelAvailability::Restricted(RestrictedAvailability {
         providers,
         hidden_models,
+        ..Default::default()
     })
 }
 
@@ -566,6 +610,103 @@ fn zen_hidden_models() -> HashSet<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Layer the OpenCode desktop app's per-model visibility onto a computed
+/// policy. The desktop state is an independent USER-authored fact source: it
+/// narrows (never widens) what the credential/config rules keep, and it must
+/// never break them — a failed read leaves the base policy standing. Applied
+/// only to a `Restricted` base: an `Unfiltered` base means the file facts
+/// already failed open, and expressing the gate there would need a second
+/// policy shape (bare `Restricted` would wrongly drop the providers we know
+/// nothing about) for a branch that is rare and already logged.
+fn attach_desktop_visibility(
+    base: ModelAvailability,
+    visibility: Option<DesktopVisibility>,
+) -> ModelAvailability {
+    let Some(visibility) = visibility else {
+        return base;
+    };
+    let ModelAvailability::Restricted(mut policy) = base else {
+        return base;
+    };
+    policy.shown_models_providers = visibility.providers_with_opinions;
+    policy.shown_models = visibility.shown;
+    ModelAvailability::Restricted(policy)
+}
+
+/// The OpenCode desktop app's per-model visibility state, as its model page
+/// persists it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct DesktopVisibility {
+    /// Providers with at least one toggle entry (show or hide).
+    providers_with_opinions: HashSet<String>,
+    /// Exact `providerID/modelID` row values marked `show`.
+    shown: HashSet<String>,
+}
+
+/// Where the desktop app keeps its UI state — Electron's userData dir
+/// (`~/Library/Application Support/ai.opencode.desktop` on macOS, `%APPDATA%`
+/// on Windows, `~/.config` on Linux; `dirs::data_dir()` covers the first two
+/// and `dirs::config_dir()` the third).
+fn opencode_desktop_drafts_db() -> Option<PathBuf> {
+    dirs::data_dir()
+        .or_else(dirs::config_dir)
+        .map(|dir| dir.join("ai.opencode.desktop").join("drafts.sqlite"))
+}
+
+/// Read the desktop visibility. EVERY failure mode — no desktop app, unreadable
+/// or locked db, absent row, unexpected JSON — collapses into `None` and the
+/// base policy stands unchanged: this is one opinion among several, never an
+/// authority whose absence invalidates the rest.
+fn read_desktop_visibility() -> Option<DesktopVisibility> {
+    read_desktop_visibility_at(&opencode_desktop_drafts_db()?)
+}
+
+fn read_desktop_visibility_at(path: &Path) -> Option<DesktopVisibility> {
+    let connection =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .ok()?;
+    let raw: String = connection
+        .query_row(
+            "SELECT value FROM state WHERE name = 'opencode.global.dat' AND key = 'model'",
+            [],
+            |row| row.get(0),
+        )
+        .ok()?;
+    parse_desktop_model_state(&raw)
+}
+
+/// Pure parse of the `opencode.global.dat`/`model` payload — measured shape:
+/// `{"user":[{"providerID","modelID","visibility":"show"|"hide"},...],
+/// "recent":[...],"variant":{...}}`. Only the `user` toggles count: each
+/// parseable entry makes its provider opinionated, and exactly `"show"` marks
+/// the row visible (`hide`, a future value, or a missing visibility does not).
+/// Entries without both ids are skipped; `recent` and `variant` are usage
+/// metadata, not the user's word. An empty opinion set means the desktop holds
+/// no state worth honoring → `None`.
+fn parse_desktop_model_state(raw: &str) -> Option<DesktopVisibility> {
+    let value = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+    let entries = value.get("user")?.as_array()?;
+    let mut visibility = DesktopVisibility::default();
+    for entry in entries {
+        let (Some(provider), Some(model)) = (
+            entry.get("providerID").and_then(serde_json::Value::as_str),
+            entry.get("modelID").and_then(serde_json::Value::as_str),
+        ) else {
+            continue;
+        };
+        visibility
+            .providers_with_opinions
+            .insert(provider.to_string());
+        if entry.get("visibility").and_then(serde_json::Value::as_str) == Some("show") {
+            visibility.shown.insert(format!("{provider}/{model}"));
+        }
+    }
+    if visibility.providers_with_opinions.is_empty() {
+        return None;
+    }
+    Some(visibility)
 }
 
 /// pi's policy: the union of its three native files, read through the same
@@ -609,6 +750,7 @@ fn pi_availability(dir: &Path) -> ModelAvailability {
     ModelAvailability::Restricted(RestrictedAvailability {
         providers,
         hidden_models: HashMap::new(),
+        ..Default::default()
     })
 }
 
@@ -629,7 +771,23 @@ mod tests {
                     )
                 })
                 .collect(),
+            ..Default::default()
         })
+    }
+
+    /// A policy with the OpenCode desktop's visibility layered on.
+    fn restricted_desktop(
+        providers: &[&str],
+        hidden: &[(&str, &[&str])],
+        desktop_providers: &[&str],
+        shown: &[&str],
+    ) -> ModelAvailability {
+        let ModelAvailability::Restricted(mut policy) = restricted(providers, hidden) else {
+            unreachable!()
+        };
+        policy.shown_models_providers = desktop_providers.iter().map(|p| p.to_string()).collect();
+        policy.shown_models = shown.iter().map(|s| s.to_string()).collect();
+        ModelAvailability::Restricted(policy)
     }
 
     fn rows(values: &[&str]) -> Vec<SessionConfigSelectOption> {
@@ -1015,6 +1173,213 @@ mod tests {
         assert_eq!(
             strip_jsonc(r#""e":"a\"//b""#),
             r#""e":"a\"//b""#,
+        );
+    }
+
+    #[test]
+    fn desktop_gate_narrows_an_opinionated_provider_to_its_shows() {
+        let policy = restricted_desktop(&["go", "authed"], &[], &["go"], &["go/m1"]);
+        let options = filter_model_options(
+            &policy,
+            vec![model_select(
+                "go/m2",
+                &["go/m1", "go/m2", "go/m3", "authed/a", "authed/b"],
+            )],
+        );
+        // `go` has desktop opinions: only its show row and the session's
+        // current row survive it; the authed provider without opinions keeps
+        // its credential rule.
+        assert_eq!(
+            values(&options),
+            vec!["go/m1".to_string(), "go/m2".to_string(), "authed/a".to_string(), "authed/b".to_string()],
+        );
+    }
+
+    #[test]
+    fn desktop_show_outranks_zen_pricing_and_the_per_row_fail_open() {
+        let (free, paid) = zen_snapshot_split();
+        // Zen unauthenticated, so the deny-list hides `paid`; the desktop
+        // marks `paid` shown anyway (Console-account reachability), and has
+        // opinions about the provider at all.
+        let policy = restricted_desktop(
+            &[],
+            &[("opencode", &[&paid])],
+            &["opencode"],
+            &[&format!("opencode/{paid}"), &format!("opencode/{free}")],
+        );
+        let options = filter_model_options(
+            &policy,
+            vec![model_select(
+                &format!("opencode/{paid}"),
+                &[
+                    &format!("opencode/{paid}"),
+                    &format!("opencode/{free}"),
+                    "opencode/never-heard-of-it",
+                    "opencode/other-priced",
+                ],
+            )],
+        );
+        assert_eq!(
+            values(&options),
+            vec![
+                format!("opencode/{paid}"),
+                format!("opencode/{free}"),
+                // `never-heard-of-it` would fail open under the bare Zen
+                // deny-list, but the desktop's opinion narrows first; the
+                // show rows above (and the current value, which is also the
+                // show) are all that survive.
+            ]
+        );
+    }
+
+    #[test]
+    fn desktop_show_rescues_an_uncredentialed_provider_row() {
+        // The measured 2026-10-16 case: `deepseek` is toggled on in the
+        // desktop but absent from auth.json (Console-account credential).
+        let policy = restricted_desktop(&[], &[], &["deepseek"], &["deepseek/flash"]);
+        let options = filter_model_options(
+            &policy,
+            vec![model_select("deepseek/flash", &["deepseek/flash"])],
+        );
+        assert_eq!(values(&options), vec!["deepseek/flash".to_string()]);
+    }
+
+    #[test]
+    fn unopinionated_providers_keep_their_existing_rules() {
+        let policy = restricted_desktop(&["authed"], &[], &["go"], &[]);
+        let options = filter_model_options(
+            &policy,
+            vec![model_select(
+                "authed/a",
+                &["authed/a", "authed/b", "go/x", "random/y"],
+            )],
+        );
+        // `go/x`: opinionated but not shown → dropped. `random/y`: no
+        // opinions, not credentialed → dropped exactly as before this source
+        // existed.
+        assert_eq!(
+            values(&options),
+            vec!["authed/a".to_string(), "authed/b".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_desktop_model_state_reads_toggles_and_skips_noise() {
+        let payload = serde_json::json!({
+            "user": [
+                {"providerID": "go", "modelID": "m1", "visibility": "show"},
+                {"providerID": "go", "modelID": "m2", "visibility": "hide"},
+                {"providerID": "go", "modelID": "m3", "visibility": "some-future-value"},
+                {"providerID": "vercel", "modelID": "a/b", "visibility": "hide"},
+                {"modelID": "orphan", "visibility": "show"},
+                {"providerID": "orphan2"},
+                "not-an-object",
+            ],
+            "recent": [{"providerID": "go", "modelID": "m1"}],
+        });
+        let visibility = parse_desktop_model_state(&payload.to_string()).expect("parseable");
+        assert_eq!(
+            visibility.providers_with_opinions,
+            HashSet::from(["go".to_string(), "vercel".to_string()]),
+        );
+        assert_eq!(
+            visibility.shown,
+            HashSet::from(["go/m1".to_string()]),
+        );
+
+        // Only-shows-when-there-is-something-to-honor.
+        assert_eq!(
+            parse_desktop_model_state(r#"{"user": [], "recent": []}"#),
+            None,
+        );
+        assert_eq!(parse_desktop_model_state(r#"{"recent": []}"#), None);
+        assert_eq!(parse_desktop_model_state("not json"), None);
+    }
+
+    #[test]
+    fn read_desktop_visibility_at_reads_the_state_row() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("drafts.sqlite");
+        let connection = rusqlite::Connection::open(&db).expect("create db");
+        connection
+            .execute_batch(
+                "CREATE TABLE state (
+                    name TEXT NOT NULL,
+                    key TEXT NOT NULL,
+                    value TEXT NOT NULL,
+                    updated_at INTEGER,
+                    PRIMARY KEY (name, key)
+                );",
+            )
+            .expect("create table");
+        let payload = serde_json::json!({
+            "user": [
+                {"providerID": "go", "modelID": "m1", "visibility": "show"},
+                {"providerID": "go", "modelID": "m2", "visibility": "hide"},
+                {"providerID": "zen", "modelID": "free", "visibility": "show"},
+            ],
+            "recent": [],
+        });
+        connection
+            .execute(
+                "INSERT INTO state (name, key, value) VALUES ('opencode.global.dat', 'model', ?1)",
+                [payload.to_string()],
+            )
+            .expect("insert row");
+        drop(connection);
+
+        let visibility = read_desktop_visibility_at(&db).expect("readable");
+        assert_eq!(
+            visibility.providers_with_opinions,
+            HashSet::from(["go".to_string(), "zen".to_string()]),
+        );
+        assert_eq!(
+            visibility.shown,
+            HashSet::from(["go/m1".to_string(), "zen/free".to_string()]),
+        );
+    }
+
+    #[test]
+    fn read_desktop_visibility_at_fails_soft_on_a_corrupt_db() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("drafts.sqlite");
+        std::fs::write(&db, b"not a database at all").expect("write garbage");
+        assert_eq!(read_desktop_visibility_at(&db), None);
+    }
+
+    #[test]
+    fn attach_desktop_visibility_extends_restricted_and_leaves_unfiltered_alone() {
+        let base = restricted(&["authed"], &[]);
+        let visibility = Some(DesktopVisibility {
+            providers_with_opinions: HashSet::from(["go".to_string()]),
+            shown: HashSet::from(["go/m1".to_string()]),
+        });
+        let ModelAvailability::Restricted(policy) =
+            attach_desktop_visibility(base.clone(), visibility.clone())
+        else {
+            panic!("a restricted base must stay restricted");
+        };
+        assert_eq!(
+            policy.shown_models_providers,
+            HashSet::from(["go".to_string()]),
+        );
+        assert_eq!(policy.shown_models, HashSet::from(["go/m1".to_string()]));
+        assert_eq!(policy.providers, HashSet::from(["authed".to_string()]));
+
+        // A failed read leaves the base untouched.
+        assert_eq!(
+            attach_desktop_visibility(base.clone(), None),
+            ModelAvailability::Restricted(RestrictedAvailability {
+                providers: HashSet::from(["authed".to_string()]),
+                ..Default::default()
+            }),
+        );
+        // An Unfiltered base stays Unfiltered: the gate cannot express
+        // "narrow only the opinionated providers" there without a second
+        // policy shape.
+        assert_eq!(
+            attach_desktop_visibility(ModelAvailability::Unfiltered, visibility),
+            ModelAvailability::Unfiltered,
         );
     }
 
