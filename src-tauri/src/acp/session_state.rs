@@ -435,9 +435,9 @@ pub struct SessionState {
     /// Backend-internal — not serialized, not carried on `to_snapshot()`.
     pub env_pinned_config_option_ids: Vec<String>,
     /// Which of the agent's advertised model rows codeg SHOWS the user for this
-    /// launch: the availability snapshot computed at spawn
-    /// (`acp::model_visibility::compute`, from the same `agent_type` + merged
-    /// `runtime_env` the process is launched with).
+    /// launch: the visibility snapshot computed at spawn
+    /// (`acp::model_visibility::compute` — for OpenCode, the desktop app's
+    /// per-model toggles).
     ///
     /// Applied once, at the emit choke point
     /// (`connection::emit_session_config_options_values`), so every producer of
@@ -447,9 +447,8 @@ pub struct SessionState {
     /// any decision path: preference replay, retirement healing and the wire
     /// `set` all keep reading the agent's raw list.
     ///
-    /// Fixed for the connection's lifetime — a fresh connect re-reads the fact
-    /// sources, which is what lets `opencode auth login` reach the NEXT session
-    /// without a codeg restart. Backend-internal — not serialized, not carried
+    /// Fixed for the connection's lifetime — a fresh connect re-reads the
+    /// desktop state. Backend-internal — not serialized, not carried
     /// on `to_snapshot()`.
     pub(crate) model_availability: ModelAvailability,
     pub prompt_capabilities: Option<PromptCapabilitiesInfo>,

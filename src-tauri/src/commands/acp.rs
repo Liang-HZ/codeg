@@ -2873,11 +2873,7 @@ fn opencode_legacy_config_path() -> PathBuf {
 /// Resolve the config file OpenCode actually reads: the primary
 /// `opencode.json`, else the legacy `config.json`, else the primary path (a
 /// caller-visible answer even when neither exists).
-///
-/// `pub(crate)` for the model-visibility policy
-/// (`acp::model_visibility::compute`), which must read the SAME file OpenCode
-/// would.
-pub(crate) fn resolve_opencode_config_path() -> PathBuf {
+fn resolve_opencode_config_path() -> PathBuf {
     let primary = opencode_primary_config_path();
     if primary.exists() {
         return primary;
@@ -2891,23 +2887,8 @@ pub(crate) fn resolve_opencode_config_path() -> PathBuf {
     primary
 }
 
-/// Every config file an OpenCode install may carry `provider` entries in: the
-/// primary `opencode.json`, the `opencode.jsonc` scaffold OpenCode 1.x creates
-/// and READS (verified against 1.19.1 — a provider planted there reaches
-/// session/new), and the legacy `config.json`. The model-visibility policy
-/// unions provider ids across every existing candidate; single-file consumers
-/// (the connect UI) keep using `resolve_opencode_config_path`.
-pub(crate) fn opencode_config_candidates() -> Vec<PathBuf> {
-    vec![
-        opencode_primary_config_path(),
-        opencode_config_dir().join("opencode.jsonc"),
-        opencode_legacy_config_path(),
-    ]
-}
-
-/// `pub(crate)` for the model-visibility policy, which must look at the SAME
-/// `auth.json` the credential cascade writes.
-pub(crate) fn opencode_auth_json_path() -> PathBuf {
+/// The `auth.json` the credential cascade writes.
+fn opencode_auth_json_path() -> PathBuf {
     crate::parsers::opencode::resolve_opencode_base_dir().join("auth.json")
 }
 
@@ -6050,11 +6031,7 @@ fn account_home_dir() -> Option<PathBuf> {
 /// inherits codeg's own. `~` and the default expand against the child's home
 /// ([`pi_child_home`]). Never trimmed: pi reads the raw value (`normalizePath`
 /// expands `~` and nothing else).
-///
-/// `pub(crate)` for the model-visibility policy
-/// (`acp::model_visibility::compute`), which must read the three native files
-/// where THIS launch's pi would.
-pub(crate) fn pi_agent_dir_for_env(runtime_env: &BTreeMap<String, String>) -> PathBuf {
+fn pi_agent_dir_for_env(runtime_env: &BTreeMap<String, String>) -> PathBuf {
     pi_agent_dir_for_child(runtime_env, std::env::var_os("PI_CODING_AGENT_DIR"))
 }
 
@@ -7428,7 +7405,7 @@ pub struct PiConfigProjection {
 /// Read pi's native files into a `PiConfigProjection`. Never errors: absent or
 /// malformed files yield `None` / an empty provider list (the panel treats that
 /// as "not configured yet").
-pub(crate) fn load_pi_config_at(pi_dir: &Path) -> PiConfigProjection {
+fn load_pi_config_at(pi_dir: &Path) -> PiConfigProjection {
     let settings = read_json_object_or_empty(&pi_dir.join("settings.json"));
     let string_key = |key: &str| {
         settings
