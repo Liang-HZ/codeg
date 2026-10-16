@@ -9,7 +9,7 @@ use regex::Regex;
 use crate::models::*;
 use crate::parsers::{
     folder_name_from_path, is_safe_subagent_id, title_from_user_text, truncate_str, AgentEnv,
-    AgentParser, ParseError,
+    AgentParser, ParseError, TIMELINE_ENTRY_MAX_CHARS,
 };
 
 /// Regex that matches Claude Code system-injected XML tags and their content.
@@ -3711,14 +3711,6 @@ fn attribute_subagent_usage(session_path: &Path, turns: &mut [MessageTurn]) {
     }
 }
 
-/// Per-entry cap for thinking/text blocks folded into a sub-agent timeline, so
-/// one huge block cannot balloon the stats every detail load carries. Almost
-/// every block is far below it; the ones that reach it are typically the
-/// child's long final report (measured on local Claude Code transcripts: 27 of
-/// 7,715 blocks, the longest ~40K chars), which the card also shows in full as
-/// the Agent call's own result.
-const TIMELINE_ENTRY_MAX_CHARS: usize = 16_384;
-
 /// How Claude Code opens the directive message of a `subagent_type: "fork"`
 /// child. Same marker as claude-agent-acp 0.94.0's `FORK_BOILERPLATE_OPEN`.
 const FORK_BOILERPLATE_OPEN: &str = "<fork-boilerplate>";
@@ -3767,6 +3759,8 @@ fn is_fork_directive_record(value: &serde_json::Value) -> bool {
         })
 }
 
+=======
+>>>>>>> 43b768ce (fix(codebuddy): address review — exact-agent gates, sub-agent history timeline, emit-path tests)
 /// One parsed sub-agent transcript: the tool calls, the mixed timeline,
 /// the deduped usage, the first record's timestamp, and the
 /// first-to-last-timestamped-record span (`None` without a real interval).
