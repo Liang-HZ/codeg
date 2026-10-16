@@ -2952,8 +2952,7 @@ fn persist_opencode_config_text(text: &str) -> Result<(), AcpError> {
         format!("{text}\n")
     };
     crate::acp::opencode_config::write_atomic(&resolve_opencode_config_path(), &text)
-        .map_err(|e| AcpError::protocol(format!("write OpenCode config failed: {e}")))
-}
+        .map_err(|e| AcpError::protocol(format!("write OpenCode config failed: {e}")))}
 
 // ---------------------------------------------------------------------------
 // Cline config helpers
@@ -6165,7 +6164,11 @@ pub(crate) fn pi_enabled_model_patterns_for_env(
 /// inherits codeg's own. `~` and the default expand against the child's home
 /// ([`pi_child_home`]). Never trimmed: pi reads the raw value (`normalizePath`
 /// expands `~` and nothing else).
+<<<<<<< HEAD
 pub(crate) fn pi_agent_dir_for_env(runtime_env: &BTreeMap<String, String>) -> PathBuf {
+=======
+fn pi_agent_dir_for_env(runtime_env: &BTreeMap<String, String>) -> PathBuf {
+>>>>>>> 78868818 (refactor(acp): make the opencode desktop model toggles the only filter source)
     pi_agent_dir_for_child(runtime_env, std::env::var_os("PI_CODING_AGENT_DIR"))
 }
 
@@ -7617,7 +7620,7 @@ pub struct PiConfigProjection {
 /// Read pi's native files into a `PiConfigProjection`. Never errors: absent or
 /// malformed files yield `None` / an empty provider list (the panel treats that
 /// as "not configured yet").
-pub(crate) fn load_pi_config_at(pi_dir: &Path) -> PiConfigProjection {
+fn load_pi_config_at(pi_dir: &Path) -> PiConfigProjection {
     let settings = read_json_object_or_empty(&pi_dir.join("settings.json"));
     let string_key = |key: &str| {
         settings
