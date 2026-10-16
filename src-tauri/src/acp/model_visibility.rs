@@ -32,8 +32,11 @@
 //! - **OpenCode**: `auth.json` keys under `<XDG data>/opencode/` (only keys
 //!   whose value is a JSON object — the credential cascade also writes a
 //!   top-level `api_key` STRING, which is not a provider), union the `provider`
-//!   object's keys of `opencode.json` (legacy `config.json` accepted — the user
-//!   explicitly configured those models, they must stay), plus the Zen
+//!   object's keys of every config file OpenCode reads — `opencode.json` (2.x),
+//!   `opencode.jsonc` (the scaffold OpenCode 1.x creates AND parses; verified
+//!   against 1.19.1 that a provider planted there reaches session/new), legacy
+//!   `config.json` — the user explicitly configured those models, they must
+//!   stay), plus the Zen
 //!   (`opencode`) provider's free subset from the bundled models.dev snapshot
 //!   when Zen itself is not logged in.
 //! - **Pi**: `~/.pi/agent/auth.json` keys union `models.json` `providers` keys
@@ -66,7 +69,7 @@
 //! codebuddy-cn/intl share the built-in judgment (no action).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use agent_client_protocol::schema::v1::{
     SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelect,
@@ -140,7 +143,7 @@ pub fn compute(agent_type: AgentType, runtime_env: &BTreeMap<String, String>) ->
     match agent_type {
         AgentType::OpenCode => opencode_availability(
             &crate::commands::acp::opencode_auth_json_path(),
-            &crate::commands::acp::resolve_opencode_config_path(),
+            &crate::commands::acp::opencode_config_candidates(),
         ),
         AgentType::Pi => pi_availability(&crate::commands::acp::pi_agent_dir_for_env(runtime_env)),
         // The thirteen other built-ins need no policy: Claude/Gemini/Grok/
@@ -324,29 +327,148 @@ fn read_json_object_file(path: &Path) -> JsonObjectFile {
     match std::fs::read_to_string(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => JsonObjectFile::Missing,
         Err(_) => JsonObjectFile::Unparsable,
-        Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
-            Ok(serde_json::Value::Object(map)) => JsonObjectFile::Parsed(map),
-            _ => JsonObjectFile::Unparsable,
-        },
+        Ok(raw) => {
+            // `opencode.jsonc` is JSON-with-comments — OpenCode 1.x's default
+            // scaffold format (verified against 1.19.1). Comments and trailing
+            // commas are stripped before the strict parse; a file that is not
+            // valid JSONC still lands in Unparsable and the caller fails open.
+            let text = if is_jsonc(path) { strip_jsonc(&raw) } else { raw };
+            match serde_json::from_str::<serde_json::Value>(&text) {
+                Ok(serde_json::Value::Object(map)) => JsonObjectFile::Parsed(map),
+                _ => JsonObjectFile::Unparsable,
+            }
+        }
     }
 }
 
-/// OpenCode's policy over its two config files. `auth_path` and `config_path`
-/// are injected so tests can drive real files in a temp dir; `compute` passes
-/// the same resolvers the launch and the credential cascade use
-/// (`resolve_opencode_base_dir()` for the data side,
-/// `resolve_opencode_config_path()` for the config side).
-fn opencode_availability(auth_path: &Path, config_path: &Path) -> ModelAvailability {
+fn is_jsonc(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()) == Some("jsonc")
+}
+
+/// Remove what JSONC adds on top of JSON — `//` and `/*…*/` comments and
+/// trailing commas — without touching string literals (a `"https://…"` URL
+/// must survive byte-for-byte). Two linear string-aware passes; whitespace is
+/// insignificant to JSON, so dropping what surrounds a dropped comma is safe.
+fn strip_jsonc(raw: &str) -> String {
+    strip_trailing_commas(&strip_comments(raw))
+}
+
+fn strip_comments(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    let mut in_string = false;
+    let mut escaped = false;
+    while let Some(c) = chars.next() {
+        if in_string {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_string = true;
+                out.push(c);
+            }
+            '/' => match chars.peek() {
+                Some('/') => {
+                    for n in chars.by_ref() {
+                        if n == '\n' {
+                            out.push('\n');
+                            break;
+                        }
+                    }
+                }
+                Some('*') => {
+                    chars.next();
+                    while let Some(n) = chars.next() {
+                        if n == '*' && chars.peek() == Some(&'/') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                _ => out.push('/'),
+            },
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+fn strip_trailing_commas(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut pending_comma = false;
+    for c in raw.chars() {
+        if in_string {
+            if pending_comma {
+                out.push(',');
+                pending_comma = false;
+            }
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                if pending_comma {
+                    out.push(',');
+                    pending_comma = false;
+                }
+                in_string = true;
+                out.push(c);
+            }
+            ',' => pending_comma = true,
+            '}' | ']' => {
+                pending_comma = false;
+                out.push(c);
+            }
+            c if c.is_whitespace() => {
+                if !pending_comma {
+                    out.push(c);
+                }
+            }
+            _ => {
+                if pending_comma {
+                    out.push(',');
+                    pending_comma = false;
+                }
+                out.push(c);
+            }
+        }
+    }
+    out
+}
+
+/// OpenCode's policy over its config files. `auth_path` and the
+/// `config_candidates` are injected so tests can drive real files in a temp
+/// dir; `compute` passes the same resolvers the launch and the credential
+/// cascade use (`resolve_opencode_base_dir()` for the data side,
+/// `opencode_config_candidates()` for the config side).
+fn opencode_availability(auth_path: &Path, config_candidates: &[PathBuf]) -> ModelAvailability {
     // Tier 1: the fact-source locations themselves. `resolve_opencode_base_dir`
     // falls back to the RELATIVE path "opencode" when neither XDG_DATA_HOME nor
     // the account home resolves; a relative path means we cannot say which
     // machine state this launch reads, so nothing is filtered.
-    if !auth_path.is_absolute() || !config_path.is_absolute() {
+    if !auth_path.is_absolute() || config_candidates.iter().any(|path| !path.is_absolute()) {
         tracing::warn!(
-            "[ACP] opencode config/data dir could not be located ({}, {}); \
+            "[ACP] opencode config/data dir could not be located ({}, {:?}); \
              showing the unfiltered model list",
             auth_path.display(),
-            config_path.display()
+            config_candidates
         );
         return ModelAvailability::Unfiltered;
     }
@@ -374,25 +496,35 @@ fn opencode_availability(auth_path: &Path, config_path: &Path) -> ModelAvailabil
             .collect(),
     };
 
-    // opencode.json: missing → no explicit providers (nothing to protect).
-    // Exists but unreadable/unparsable → fail open — the user's hand-edited
-    // providers must never be hidden off a file we failed to read.
-    let explicit: HashSet<String> = match read_json_object_file(config_path) {
-        JsonObjectFile::Missing => HashSet::new(),
-        JsonObjectFile::Unparsable => {
-            tracing::warn!(
-                "[ACP] opencode config exists but could not be parsed ({}); \
-                 showing the unfiltered model list",
-                config_path.display()
-            );
-            return ModelAvailability::Unfiltered;
+    // Every config file OpenCode may carry `provider` entries in: the primary
+    // `opencode.json`, the `opencode.jsonc` scaffold OpenCode 1.x creates AND
+    // reads (verified against 1.19.1: a provider planted there shows up in
+    // session/new), and the legacy `config.json`. Union their provider ids —
+    // OpenCode merges these files, so a provider in any one of them is the
+    // user's explicit word. Missing → skip; exists but unparsable → fail open,
+    // the user's hand-edited providers must never be hidden off a file we
+    // failed to read.
+    let mut explicit: HashSet<String> = HashSet::new();
+    for candidate in config_candidates {
+        match read_json_object_file(candidate) {
+            JsonObjectFile::Missing => continue,
+            JsonObjectFile::Unparsable => {
+                tracing::warn!(
+                    "[ACP] opencode config exists but could not be parsed ({}); \
+                     showing the unfiltered model list",
+                    candidate.display()
+                );
+                return ModelAvailability::Unfiltered;
+            }
+            JsonObjectFile::Parsed(map) => {
+                if let Some(providers) =
+                    map.get("provider").and_then(serde_json::Value::as_object)
+                {
+                    explicit.extend(providers.keys().cloned());
+                }
+            }
         }
-        JsonObjectFile::Parsed(map) => map
-            .get("provider")
-            .and_then(serde_json::Value::as_object)
-            .map(|providers| providers.keys().cloned().collect())
-            .unwrap_or_default(),
-    };
+    }
 
     let providers: HashSet<String> = authed.union(&explicit).cloned().collect();
 
@@ -613,7 +745,7 @@ mod tests {
 
         let availability = opencode_availability(
             &dir.path().join("auth.json"),
-            &dir.path().join("opencode.json"),
+            &[dir.path().join("opencode.json")],
         );
         let ModelAvailability::Restricted(policy) = &availability else {
             panic!("a parsed pair of fact files must restrict, got {availability:?}");
@@ -649,7 +781,7 @@ mod tests {
         );
         let availability = opencode_availability(
             &dir.path().join("auth.json"),
-            &dir.path().join("opencode.json"),
+            &[dir.path().join("opencode.json")],
         );
 
         let (free, paid) = zen_snapshot_split();
@@ -702,7 +834,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let availability = opencode_availability(
             &dir.path().join("auth.json"),
-            &dir.path().join("opencode.json"),
+            &[dir.path().join("opencode.json")],
         );
         let ModelAvailability::Restricted(policy) = &availability else {
             panic!("a missing auth.json must still restrict");
@@ -743,7 +875,7 @@ mod tests {
         assert_eq!(
             opencode_availability(
                 Path::new("opencode/auth.json"),
-                Path::new("opencode/opencode.json")
+                &[Path::new("opencode/opencode.json").to_path_buf()],
             ),
             ModelAvailability::Unfiltered
         );
@@ -752,13 +884,13 @@ mod tests {
         let auth = dir.path().join("auth.json");
         write(dir.path(), "auth.json", "{ not json");
         assert_eq!(
-            opencode_availability(&auth, &dir.path().join("opencode.json")),
+            opencode_availability(&auth, &[dir.path().join("opencode.json")]),
             ModelAvailability::Unfiltered
         );
         // …or parses to something other than an object.
         write(dir.path(), "auth.json", "[]");
         assert_eq!(
-            opencode_availability(&auth, &dir.path().join("opencode.json")),
+            opencode_availability(&auth, &[dir.path().join("opencode.json")]),
             ModelAvailability::Unfiltered
         );
 
@@ -766,8 +898,123 @@ mod tests {
         write(dir.path(), "auth.json", r#"{ "vercel": {} }"#);
         write(dir.path(), "opencode.json", "{ oops");
         assert_eq!(
-            opencode_availability(&auth, &dir.path().join("opencode.json")),
+            opencode_availability(&auth, &[dir.path().join("opencode.json")]),
             ModelAvailability::Unfiltered
+        );
+    }
+
+    #[test]
+    fn opencode_jsonc_scaffold_providers_are_kept() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "auth.json", r#"{ "vercel": {} }"#);
+        write(
+            dir.path(),
+            "opencode.jsonc",
+            r#"{
+    // opencode 1.x scaffold
+    "$schema": "https://opencode.ai/config.json", // trailing comment
+    "provider": {
+        /* block comment */
+        "jsonc-only": {
+            "npm": "@ai-sdk/openai-compatible",
+            "options": { "baseURL": "https://example.invalid/v1" },
+        },
+    },
+}"#,
+        );
+
+        let availability = opencode_availability(
+            &dir.path().join("auth.json"),
+            &[dir.path().join("opencode.jsonc")],
+        );
+        let ModelAvailability::Restricted(policy) = &availability else {
+            panic!("a valid jsonc config must restrict, got {availability:?}");
+        };
+        assert!(
+            policy.providers.contains("jsonc-only"),
+            "providers configured in the 1.x jsonc scaffold must be kept, got {:?}",
+            policy.providers
+        );
+    }
+
+    #[test]
+    fn opencode_unions_json_and_jsonc_providers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "auth.json", "{}");
+        write(
+            dir.path(),
+            "opencode.json",
+            r#"{ "provider": { "from-json": {} } }"#,
+        );
+        write(
+            dir.path(),
+            "opencode.jsonc",
+            r#"{ "provider": { "from-jsonc": {} } }"#,
+        );
+
+        let availability = opencode_availability(
+            &dir.path().join("auth.json"),
+            &[
+                dir.path().join("opencode.json"),
+                dir.path().join("opencode.jsonc"),
+            ],
+        );
+        let ModelAvailability::Restricted(policy) = &availability else {
+            panic!("a configured pair of files must restrict, got {availability:?}");
+        };
+        assert_eq!(
+            policy.providers,
+            HashSet::from(["from-json".to_string(), "from-jsonc".to_string()]),
+            "providers from both config files must be unioned"
+        );
+    }
+
+    #[test]
+    fn opencode_fails_open_off_an_unparsable_jsonc() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "auth.json", r#"{ "vercel": {} }"#);
+        write(dir.path(), "opencode.json", r#"{ "provider": { "ok": {} } }"#);
+        write(dir.path(), "opencode.jsonc", "{ not jsonc either");
+
+        assert_eq!(
+            opencode_availability(
+                &dir.path().join("auth.json"),
+                &[
+                    dir.path().join("opencode.json"),
+                    dir.path().join("opencode.jsonc")
+                ],
+            ),
+            ModelAvailability::Unfiltered,
+            "an unparsable candidate config must disable filtering entirely, \
+             the same as an unparsable opencode.json"
+        );
+    }
+
+    #[test]
+    fn strip_jsonc_preserves_strings_and_shapes() {
+        // URLs with comment-like or comma/brace characters inside strings
+        // must survive byte-for-byte.
+        assert_eq!(
+            strip_jsonc(r#"{"u": "https://a.invalid/v1//x"}"#),
+            r#"{"u": "https://a.invalid/v1//x"}"#,
+        );
+        // Comments of both flavors disappear, including after values.
+        assert_eq!(strip_jsonc("{ /* c */ }"), "{  }");
+        assert_eq!(
+            strip_jsonc("{\n  // line\n  \"a\": 1,\n}"),
+            // The trailing comma is dropped along with the whitespace it
+            // held before the closer — semantically identical JSON.
+            "{\n  \n  \"a\": 1}",
+        );
+        // Trailing commas are dropped before `}` and `]`, at any nesting.
+        assert_eq!(
+            strip_jsonc(r#"{"a":{"b":1,},"arr":[1,2,],"esc":"x,}"}"#),
+            r#"{"a":{"b":1},"arr":[1,2],"esc":"x,}"}"#,
+        );
+        // An escaped quote must not flip the string state machine.
+        assert_eq!(
+            strip_jsonc(r#""e":"a\"//b""#),
+            r#""e":"a\"//b""#,
         );
     }
 
