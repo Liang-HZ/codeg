@@ -34063,6 +34063,7 @@ mod tests {
             ModelAvailability::Restricted(RestrictedAvailability {
                 providers: HashSet::from(["kept".to_string()]),
                 hidden_models: HashMap::new(),
+                ..Default::default()
             });
         let mut events = state.read().await.event_stream().subscribe();
 
