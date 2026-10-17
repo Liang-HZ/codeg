@@ -541,6 +541,20 @@ mod tests {
     }
 
     #[test]
+    fn a_row_without_a_provider_segment_fails_open_under_an_opinionated_policy() {
+        // A value with no `/` cannot be attributed to any provider, so the
+        // policy has nothing to judge it against — it is kept even when the
+        // policy is otherwise opinionated (and the attribution-based drop
+        // next to it proves the bare rule is not vacuous).
+        let policy = desktop_policy(&["go"], &[]);
+        let options = filter_model_options(
+            &policy,
+            vec![model_select("go/m1", &["go/m1", "go/m2", "lc"])],
+        );
+        assert_eq!(values(&options), vec!["go/m1".to_string(), "lc".to_string()],);
+    }
+
+    #[test]
     fn a_show_keeps_a_row_the_provider_gate_would_otherwise_drop() {
         // The measured 2026-10-16 case: the desktop's Console account reaches
         // providers the CLI's own files never carry — the user's `show` is
@@ -690,6 +704,13 @@ mod tests {
         let visibility =
             read_desktop_visibility_at_any(&[missing.clone(), db.clone()]).expect("second exists");
         assert_eq!(visibility.shown, HashSet::from(["go/m1".to_string()]),);
+        // A corrupt first candidate is still "found": first-wins does not
+        // second-guess it with a later candidate — the parse failure surfaces
+        // (and fails soft to Unfiltered downstream) instead.
+        let corrupt_dir = tempfile::tempdir().expect("tempdir");
+        let corrupt = corrupt_dir.path().join("drafts.sqlite");
+        std::fs::write(&corrupt, b"not a database at all").expect("write garbage");
+        assert_eq!(read_desktop_visibility_at_any(&[corrupt, db.clone()]), None);
         // All candidates missing (a CLI-only machine) → None.
         assert_eq!(read_desktop_visibility_at_any(&[missing]), None);
         assert_eq!(read_desktop_visibility_at_any(&[]), None);
