@@ -339,10 +339,9 @@ fn user_block_size(block: &UserMessageBlock) -> usize {
 ///
 /// `emit_with_state` calls this on every event while holding the `SessionState`
 /// write lock. The hot, high-frequency, and potentially-large variants —
-/// streaming text/thinking deltas, tool calls and updates, user messages
-/// (which can carry multi-MB base64 images), Agent Teams member chunks (one
-/// per member token), and forwarded Claude SDK messages — are therefore
-/// estimated STRUCTURALLY from their string/JSON fields, with no
+/// streaming text/thinking deltas, tool calls and updates and user messages
+/// (which can carry multi-MB base64 images), and forwarded Claude SDK messages —
+/// are therefore estimated STRUCTURALLY from their string/JSON fields, with no
 /// serialization: serializing a per-token delta or a multi-MB image on that
 /// locked hot path only to measure and discard the bytes was the cost this
 /// replaced. Every other variant is small and infrequent, so it falls back to an
@@ -453,8 +452,8 @@ fn estimate_envelope_size(envelope: &EventEnvelope) -> usize {
                     .iter()
                     .map(|s| {
                         // Keys + braces + commas for every field (task_id,
-                        // status, summary, tool_use_id, result) plus the
-                        // element comma — generously fixed so `estimate >=
+                        // status, summary, tool_use_id, result, interim) plus
+                        // the element comma — generously fixed so `estimate >=
                         // serialized` holds for every present/absent optional
                         // combination.
                         128 + json_str_len(&s.task_id)
@@ -464,31 +463,6 @@ fn estimate_envelope_size(envelope: &EventEnvelope) -> usize {
                             + opt_str_size(&s.result)
                     })
                     .sum::<usize>()
-        }
-        // High-frequency on an Agent Teams session (one delta per token per
-        // member), so sized structurally like the other streaming deltas
-        // instead of falling through to the serialize-fallback — which would
-        // re-serialize every member token under the `SessionState` write lock.
-        AcpEvent::MemberChunk {
-            member,
-            text,
-            tool_call_id,
-            title,
-            status,
-            history_item_id,
-            // Spelled out (not `..`) so a newly-added large field forces this
-            // estimator to be revisited rather than silently under-counted.
-            kind: _,
-        } => {
-            json_str_len(member)
-                + opt_str_size(text)
-                + opt_str_size(tool_call_id)
-                + opt_str_size(title)
-                + opt_str_size(status)
-                + opt_str_size(history_item_id)
-                // `"kind":"<variant>",` — the longest tag is
-                // `tool_call_update` (~28 B with quotes/colon/comma).
-                + 64
         }
         // Small, infrequent variants: an exact serialized length is cheap here
         // and preserves the prior threshold behavior; the 256 fallback only
@@ -572,11 +546,15 @@ fn content_block_size(block: &crate::models::message::ContentBlock) -> usize {
 }
 
 /// Structural size for a `ToolResult`'s `agent_stats` object: a dozen optional
-/// numeric scalars (each ≤ ~40 B serialized with its key) plus the nested
-/// `tool_calls` array — 640 generously covers skeleton + every scalar.
+/// numeric scalars (each ≤ ~40 B serialized with its key), the optional
+/// strings, and the two nested arrays — `tool_calls` and `timeline`, the
+/// child's whole thinking/text activity, which is why every entry is counted.
+/// 640 generously covers skeleton + every scalar + every key.
 fn agent_stats_size(stats: &crate::models::message::AgentExecutionStats) -> usize {
     640 + opt_str_size(&stats.agent_type)
         + opt_str_size(&stats.status)
+        + opt_str_size(&stats.recovered_result)
+        + opt_str_size(&stats.child_session_id)
         + stats
             .tool_calls
             .iter()
@@ -586,12 +564,18 @@ fn agent_stats_size(stats: &crate::models::message::AgentExecutionStats) -> usiz
                     + opt_str_size(&c.output_preview)
             })
             .sum::<usize>()
+        // `{"type":…,"text":…}` or `{"type":…,"childIndex":<≤20 digits>}`
+        // plus the element comma: 64 covers keys, braces and the index.
+        + stats
+            .timeline
+            .iter()
+            .map(|e| 64 + json_str_len(&e.entry_type) + opt_str_size(&e.text))
+            .sum::<usize>()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acp::types::MemberChunkKind;
 
     fn make_envelope(seq: u64, text: &str) -> Arc<EventEnvelope> {
         Arc::new(EventEnvelope {
@@ -875,8 +859,7 @@ mod tests {
         // any structural branch — else an oversized event would be wrongly
         // retained and replayed. Covers plain/escape-heavy text, thinking, nested
         // Claude SDK JSON, a fully-populated ToolCall, an all-`null`-but-near-cap
-        // ToolCallUpdate, member-channel chunks (full and minimal), and user
-        // messages with many blocks / an image.
+        // ToolCallUpdate, and user messages with many blocks / an image.
         let cases: Vec<Arc<EventEnvelope>> = vec![
             make_envelope(1, "plain"),
             make_envelope(2, &"\"\\\n\t".repeat(500)),
@@ -971,35 +954,6 @@ mod tests {
             }),
             user_message_with_image(8, "A".repeat(1000)),
             tool_update_with_image(9, "A".repeat(1000)),
-            // Member-channel chunks: a fully-populated tool frame (every
-            // optional field present, escape-heavy strings)…
-            Arc::new(EventEnvelope {
-                seq: 33,
-                connection_id: "conn-xyz".into(),
-                payload: AcpEvent::MemberChunk {
-                    member: "impl\"x\n".into(),
-                    kind: MemberChunkKind::ToolCallUpdate,
-                    text: Some("te\"xt\n".into()),
-                    tool_call_id: Some("call_1".into()),
-                    title: Some("Send\"Message".into()),
-                    status: Some("completed".into()),
-                    history_item_id: Some("h\"1".into()),
-                },
-            }),
-            // …and the minimal text delta (every option absent).
-            Arc::new(EventEnvelope {
-                seq: 34,
-                connection_id: "conn-xyz".into(),
-                payload: AcpEvent::MemberChunk {
-                    member: "impl-x".into(),
-                    kind: MemberChunkKind::Message,
-                    text: Some("你".into()),
-                    tool_call_id: None,
-                    title: None,
-                    status: None,
-                    history_item_id: None,
-                },
-            }),
         ];
         for env in &cases {
             assert_ge_serialized(env);
@@ -1014,8 +968,8 @@ mod tests {
         // nested tool calls, result images, plus settled entries — and assert
         // the structural estimate still covers the exact serialized length.
         use crate::models::message::{
-            AgentExecutionStats, AgentToolCall, ContentBlock, ImageData, MessageTurn, TurnRole,
-            TurnUsage,
+            AgentExecutionStats, AgentTimelineEntry, AgentToolCall, ContentBlock, ImageData,
+            MessageTurn, TurnRole, TurnUsage,
         };
 
         let image = ImageData {
@@ -1075,8 +1029,31 @@ mod tests {
                             output_preview: Some("line\n".repeat(40)),
                             is_error: false,
                         }],
-                        timeline: Vec::new(),
-                        recovered_result: None,
+                        // The child's whole thinking/text activity rides
+                        // here (up to 16,384 characters per entry, any number
+                        // of entries), and so can the recovered report: both
+                        // must be counted, escape-aware like every other
+                        // string.
+                        timeline: (0..40)
+                            .map(|i| match i % 3 {
+                                0 => AgentTimelineEntry {
+                                    entry_type: "thinking".into(),
+                                    text: Some("思考 \"why\"\n\t".repeat(60)),
+                                    child_index: None,
+                                },
+                                1 => AgentTimelineEntry {
+                                    entry_type: "text".into(),
+                                    text: Some("report \\ line\n".repeat(60)),
+                                    child_index: None,
+                                },
+                                _ => AgentTimelineEntry {
+                                    entry_type: "tool_call".into(),
+                                    text: None,
+                                    child_index: Some(usize::MAX),
+                                },
+                            })
+                            .collect(),
+                        recovered_result: Some("The \"full\" report\n\t".repeat(400)),
                         child_session_id: Some("019fe6bf-0bcb-70c2-a02d-e5c006dfc32a".into()),
                     }),
                     images: vec![image],
@@ -1110,6 +1087,9 @@ mod tests {
                         // Escape-heavy + large, to exercise the estimate's
                         // coverage of the (previously omitted) `result` field.
                         result: Some("Build \"log\"\n\t".repeat(2048)),
+                        // Serialized only when set: the fixed per-entry
+                        // overhead must cover its key too.
+                        interim: true,
                     },
                     crate::acp::types::BackgroundSettledInfo {
                         task_id: "bipkee1pw".into(),
@@ -1117,6 +1097,7 @@ mod tests {
                         summary: None,
                         tool_use_id: None,
                         result: None,
+                        interim: false,
                     },
                 ],
                 watermark: u64::MAX,
@@ -1137,6 +1118,59 @@ mod tests {
             },
         });
         assert_ge_serialized(&env);
+    }
+
+    #[test]
+    fn agent_stats_estimate_counts_each_variable_field_on_its_own() {
+        // The test above has fixed budgets to spare; here each variable-size
+        // field of `agent_stats` stands alone at a size no budget absorbs, so
+        // leaving any one of them out of the estimate fails by name.
+        use crate::models::message::{AgentExecutionStats, AgentTimelineEntry};
+
+        let big = "a \"quoted\" \\ line\n\t".repeat(200);
+        let entry = |entry_type: &str, text: Option<String>| AgentTimelineEntry {
+            entry_type: entry_type.into(),
+            text,
+            child_index: None,
+        };
+        let cases = [
+            (
+                "timeline text",
+                AgentExecutionStats {
+                    timeline: vec![entry("thinking", Some(big.clone()))],
+                    ..Default::default()
+                },
+            ),
+            (
+                "timeline type",
+                AgentExecutionStats {
+                    timeline: vec![entry(&big, None)],
+                    ..Default::default()
+                },
+            ),
+            (
+                "recovered_result",
+                AgentExecutionStats {
+                    recovered_result: Some(big.clone()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "child_session_id",
+                AgentExecutionStats {
+                    child_session_id: Some(big.clone()),
+                    ..Default::default()
+                },
+            ),
+        ];
+        let undercounted: Vec<&str> = cases
+            .iter()
+            .filter(|(_, stats)| {
+                agent_stats_size(stats) < serde_json::to_string(stats).unwrap().len()
+            })
+            .map(|(field, _)| *field)
+            .collect();
+        assert!(undercounted.is_empty(), "undercounted: {undercounted:?}");
     }
 
     #[test]

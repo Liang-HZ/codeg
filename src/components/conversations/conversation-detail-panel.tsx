@@ -719,7 +719,6 @@ const ConversationTabView = memo(function ConversationTabView({
   useEffect(() => {
     isViewerRef.current = conn.isViewer
   }, [conn.isViewer])
-  const isConnecting = connStatus === "connecting"
   // The tab's connection is keyed by a stable tabId, but agent switching is
   // async — and for a not-installed target, connect()'s preflight throws BEFORE
   // it tears down the old connection. So `conn` can still describe the PREVIOUS
@@ -2499,7 +2498,9 @@ const ConversationTabView = memo(function ConversationTabView({
                     )
                   }}
                   onOpenAgentsSettings={handleOpenAgentsSettings}
-                  disabled={isConnecting || dbConversationId != null}
+                  // Drafts remain switchable while connecting; saved
+                  // conversations retain the agent they were created with.
+                  disabled={dbConversationId != null}
                 />
               </div>
               {composerBlockedMessage ? (
@@ -2579,7 +2580,8 @@ const ConversationTabView = memo(function ConversationTabView({
                 )
               }}
               onOpenAgentsSettings={handleOpenAgentsSettings}
-              disabled={isConnecting || dbConversationId != null}
+              // Same draft/saved rule as the welcome-mode picker above.
+              disabled={dbConversationId != null}
             />
             {composerBlockedMessage ? (
               <div className="mt-2 flex w-full items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
@@ -3039,6 +3041,10 @@ export function ConversationDetailPanel() {
             tileTabRefs.current.delete(tab.id)
           }
         }}
+        // Tiled, everything below this wrapper is invisible to the row's
+        // scrollbar (a tile clips its content), so TileScrollContainer skips
+        // the layout read its observer would otherwise force per mutation.
+        data-tile-scroll-item=""
         style={canTileG ? { order: indexInGroup } : undefined}
         className={cn(
           canTileG

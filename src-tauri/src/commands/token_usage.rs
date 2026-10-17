@@ -118,12 +118,14 @@ const TOP_CONVERSATIONS: usize = 8;
 ///   the cache-write column stayed 0. Totals are unchanged; the columns are
 ///   not.
 ///   See `parsers::codex::codex_usage_counters`.
-/// * `5` — Qoder sub-agent spend reads the run's own transcripts
-///   (`<sessionId>/subagents/agent-*.jsonl`) instead of its segment logs:
-///   deduped by `message.id`, the cached prefix split out, each call
-///   attributed to the turn current at its own timestamp. Totals change for
-///   unchanged transcripts — the old path double-counted the cached prefix,
-///   and a rotated log silently dropped the spend. See
+/// * `5` — Qoder sub-agent spend counted. Each delegated run writes its own
+///   transcript (`<sessionId>/subagents/agent-*.jsonl`) and nothing read it,
+///   so a session that delegated work was short by everything its
+///   sub-agents spent. Now each call is deduped by `message.id`, has its
+///   cached prefix split out, and lands on the turn current at its own
+///   timestamp — totals grow for unchanged transcripts. The same release
+///   made a Qoder session's model its LAST one instead of its first, which
+///   is what a turn naming no model falls back to. See
 ///   `parsers::qoder::attribute_subagent_usage`.
 ///
 /// Only the accounting stored in `token_usage_turn` counts: the four token
@@ -1373,6 +1375,8 @@ mod tests {
                 parent_tool_use_id: None,
                 delegation_call_id: None,
                 origin_cwd: None,
+                assistant_id: None,
+                assistant_name: None,
                 tag_ids: Vec::new(),
             },
             turns,
@@ -1382,6 +1386,7 @@ mod tests {
             turns_offset: None,
             turns_total: None,
             assistant_turns_before_offset: None,
+            user_turns_before_offset: None,
             prefix_hash: None,
             uncovered_prefix_max_ts: None,
         }
