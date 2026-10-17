@@ -121,6 +121,7 @@ function emptySession(conversationId: number): ConversationRuntimeSession {
     loadingOlderTurns: false,
     olderTurnsPrependEpoch: 0,
     pendingOutOfTurnContent: false,
+    pendingCancelledTurnReports: null,
     pendingCleanup: false,
   }
 }

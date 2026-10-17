@@ -1183,6 +1183,7 @@ impl ConnectionManager {
         conversation_id: Option<i32>,
         delegation: Option<crate::acp::delegation::spawner::DelegationLink>,
         client_message_id: Option<String>,
+        preempt: bool,
     ) -> Result<Option<i32>, AcpError> {
         self.send_prompt_linked_full(
             db,
@@ -1192,7 +1193,7 @@ impl ConnectionManager {
             conversation_id,
             delegation,
             client_message_id,
-            false,
+            preempt,
             Vec::new(),
         )
         .await
@@ -6265,6 +6266,7 @@ mod tests {
             blocks,
             user_message,
             internal_suffix,
+            ..
         } = cmd_rx.try_recv().expect("one prompt command")
         else {
             panic!("expected prompt command");

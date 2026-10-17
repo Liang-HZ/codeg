@@ -2849,6 +2849,30 @@ export type AcpEvent =
    */
   | { type: "content_delta"; text: string; parent_tool_use_id?: string | null }
   | { type: "thinking"; text: string; parent_tool_use_id?: string | null }
+  /**
+   * One chunk of an Agent Teams member's own stream, rerouted off the main
+   * thread by the backend (CodeBuddy `_meta.codebuddy.ai/memberEvent` frames
+   * with no parent link; see the Rust `AcpEvent::MemberChunk`). The frontend
+   * files these into the per-member timeline — never the main conversation —
+   * mirroring the CLI's documented contract. `history_item_id`
+   * (`codebuddy.ai/memberHistoryItemId`) marks a committed-record echo: its
+   * `text` is the whole record and it finalizes the member's streaming buffer.
+   */
+  | {
+      type: "member_chunk"
+      member: string
+      kind:
+        | "message"
+        | "thought"
+        | "user_echo"
+        | "tool_call"
+        | "tool_call_update"
+      text?: string | null
+      tool_call_id?: string | null
+      title?: string | null
+      status?: string | null
+      history_item_id?: string | null
+    }
   | {
       type: "claude_sdk_message"
       session_id: string
@@ -3395,6 +3419,27 @@ export interface ActiveDelegationState {
 export type FeedbackStatus = "pending" | "delivered"
 
 /**
+ * When an accepted native (`_session/steering`) insert takes effect (mirror of
+ * Rust `SteerBoundary`). Purely a copy knob: delivery never branches on it, but
+ * the composer's mid-turn action must not promise more than the adapter does.
+ */
+export type SteerBoundary = "immediate" | "step" | "turnEnd"
+
+/**
+ * What a session can do with a message sent while a turn runs (mirror of Rust
+ * `InsertCapability`). Synthesized backend-side at initialize — never derived
+ * from agent type in the frontend. Absent on older payloads / sessions with no
+ * insert channel at all.
+ */
+export interface InsertCapability {
+  /** The native `_session/steering` push channel; absent/null = unavailable. */
+  steer?: { boundary: SteerBoundary } | null
+  /** The `check_user_feedback` pull channel (mirror of
+   *  `feedback_tool_available`). */
+  pull?: boolean
+}
+
+/**
  * A user-submitted live-feedback ("steering") note (mirror of Rust
  * `FeedbackItem`). Turn-scoped: the backend clears the set when the next turn's
  * `user_message` arrives. `delivered_at` is set once the agent reads it.
@@ -3414,6 +3459,14 @@ export interface FeedbackItem {
    *  words about an image. Backend-projected by `user_blocks_from_prompt`
    *  after hydration, the same shape `user_message` broadcasts. */
   blocks?: UserMessageBlock[] | null
+  /** How the adapter disposed of this note on the native push path, when that
+   *  was not a plain insertion: the content was CONSUMED but deferred to run
+   *  after the running turn. `"queued"` is codeg's generic marker; an adapter
+   *  may report its own finer state (zcode: `"fellBack"` / `"notRequested"`).
+   *  Any value means the same delivery promise — the note is listed with the
+   *  "accepted, runs after this turn" caption. Absent for a plain injection and
+   *  for every pull-path note. */
+  steer_state?: string | null
 }
 
 /** Snapshot of the most recent ACP runtime error. */
@@ -3638,8 +3691,16 @@ export interface LiveSessionSnapshot {
   /** Whether feedback notes ride the native `_session/steering` push channel
    *  (synthesized backend-side from advertisement + registry policy + runtime
    *  version proof — the frontend must NOT re-derive it from agent type).
-   *  Absent → `false`. */
+   *  Absent → `false`.
+   *
+   *  Transitional: mirrors `insert_capability.steer`; read both during the
+   *  migration. */
   native_steering_available?: boolean
+  /** The session's mid-turn insert capability (mirror of Rust
+   *  `InsertCapability`). Absent on older payloads and on sessions with no
+   *  insert channel at all (then the legacy `native_steering_available` /
+   *  `feedback_tool_available` bools are the only signal). */
+  insert_capability?: InsertCapability | null
   modes: SessionModeStateInfo | null
   current_mode: string | null
   config_options: SessionConfigOptionInfo[] | null

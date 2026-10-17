@@ -3092,7 +3092,7 @@ mod zcode_history_tests {
                 serde_json::json!({"stopReason":"end_turn","model":"glm-test","usage":{"inputTokens":10,"outputTokens":5}}),
             ),
         ] {
-            acp_transcript::record_entry_in(root, agent, "old", kind, payload)
+            acp_transcript::record_entry_in(root, agent, "old", kind, payload, None)
                 .await
                 .unwrap();
         }
@@ -3130,6 +3130,7 @@ mod zcode_history_tests {
             "new",
             EntryKind::Prompt,
             serde_json::json!([{"type":"text","text":"Continue"}]),
+            None,
         )
         .await
         .unwrap();
@@ -3182,6 +3183,7 @@ mod zcode_legacy_history_tests {
                     sid,
                     EntryKind::Prompt,
                     serde_json::json!([{"type":"text","text":format!("{marker}:{sid}")}]),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -3191,6 +3193,7 @@ mod zcode_legacy_history_tests {
                     sid,
                     EntryKind::TurnEnd,
                     serde_json::json!({"stopReason":"end_turn"}),
+                    None,
                 )
                 .await
                 .unwrap();

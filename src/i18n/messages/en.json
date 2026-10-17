@@ -3339,7 +3339,15 @@
         "mentionGroupSession": "Sessions",
         "mentionGroupCommit": "Commits",
         "mentionGroupSkill": "Skills",
-        "mentionGroupAssistant": "Assistants"
+        "mentionGroupAssistant": "Assistants",
+        "insertNextStep": "Insert (applies at the next step)",
+        "insertImmediate": "Insert (takes effect immediately)",
+        "steerQueuedReceipt": "Accepted — will run after this turn",
+        "interruptSend": "Interrupt and send now",
+        "interruptSendHint": "This stops the agent's current turn and sends your message as the next one. Work in progress will be aborted.",
+        "interruptConfirmTitle": "Interrupt the running turn?",
+        "interruptDelivering": "Delivering…",
+        "interruptFailed": "Couldn't interrupt and send"
       },
       "messageQueue": {
         "addToQueue": "Queue message",
@@ -3348,7 +3356,11 @@
         "editItem": "Edit",
         "deleteItem": "Remove",
         "steerItemNow": "Insert into current turn",
-        "steerItemAsNote": "Send as note for next check"
+        "steerItemAsNote": "Send as note for next check",
+        "interruptItem": "Interrupt and send now",
+        "interruptItemHint": "Stops the running turn and sends this queued message instead. Work in progress will be aborted.",
+        "interruptItemConfirmTitle": "Interrupt the running turn?",
+        "cancel": "Cancel"
       },
       "welcomeInputPanel": {
         "agentsSettingsPath": "Settings > Agents",
@@ -4102,6 +4114,16 @@
       "proposedPlan": {
         "title": "Proposed plan",
         "planning": "Planning…"
+      },
+      "memberTimeline": {
+        "title": "Team members",
+        "collapsedSummary": "Team members {count}",
+        "collapseAria": "Collapse team members",
+        "userEchoLabel": "Message received",
+        "statusPending": "Pending",
+        "statusRunning": "Running",
+        "statusCompleted": "Completed",
+        "statusFailed": "Failed"
       }
     },
     "diffPreview": {
@@ -5289,7 +5311,8 @@
     "dismiss": "Dismiss",
     "turnEndedResent": "The turn ended — sent as a new message instead.",
     "turnEnded": "The turn already ended.",
-    "submitFailed": "Couldn't send your note"
+    "submitFailed": "Couldn't send your note",
+    "steerQueuedReceipt": "Accepted — will run after this turn"
   },
   "AgentToolsSettings": {
     "title": "In-conversation tools",

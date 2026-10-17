@@ -596,6 +596,9 @@ fn distribution_uses_codebuddy_cli(distribution: &AgentDistribution) -> bool {
             launch_spec_uses_codebuddy_cli(cmd, args)
                 || system_cmd.is_some_and(|(c, a)| launch_spec_uses_codebuddy_cli(c, a))
         }
+        AgentDistribution::System { cmd, args, .. } => {
+            launch_spec_uses_codebuddy_cli(cmd, args)
+        }
     }
 }
 
