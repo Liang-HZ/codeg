@@ -3683,8 +3683,9 @@ async fn emit_session_config_options_values(
     };
     let visible = visible_config_options(&pinned, config_options);
     // …then the model-side visibility policy: which of the advertised model
-    // rows this launch can actually run (`acp::model_visibility`). Also here,
-    // before mapping, so the composer, the picker and the delegation probe all
+    // rows the user chose to see (`acp::model_visibility`; for OpenCode, the
+    // desktop app's per-model toggles). Also here, before mapping, so the
+    // composer, the picker and the delegation probe all
     // read the same filtered list — while every decision path (the wire `set`,
     // preference replay, retirement healing) keeps the agent's raw one.
     let visible = crate::acp::model_visibility::filter_model_options(&availability, visible);
