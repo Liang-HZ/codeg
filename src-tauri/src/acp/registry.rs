@@ -627,6 +627,55 @@ fn launch_spec_uses_cursor_acp(cmd: &str, args: &[&str]) -> bool {
     base.eq_ignore_ascii_case("cursor-agent") && args.contains(&"acp")
 }
 
+/// Whether this agent's resolved launch recipe runs the CodeBuddy CLI
+/// (`codebuddy --acp`, or a direct `npx @tencent-ai/codebuddy-code` launch).
+/// Custom agents that wrap the same CLI as the built-in CodeBuddy entry must
+/// get the same CodeBuddy quirk handling. The anchor is the launch RECIPE, not
+/// the registry id: an id is free-form user input (renaming it must not
+/// silently drop the quirks), while the CLI cannot be replaced — and only the
+/// real CLI emits the `codebuddy.ai/*` `_meta` keys those quirks read, so a
+/// recipe match cannot alias an unrelated agent in.
+pub fn uses_codebuddy_cli_backend(agent_type: AgentType) -> bool {
+    distribution_uses_codebuddy_cli(&get_agent_meta(agent_type).distribution)
+}
+
+fn distribution_uses_codebuddy_cli(distribution: &AgentDistribution) -> bool {
+    match distribution {
+        AgentDistribution::Npx { cmd, args, .. } | AgentDistribution::Binary { cmd, args, .. } => {
+            launch_spec_uses_codebuddy_cli(cmd, args)
+        }
+        AgentDistribution::Uvx {
+            cmd,
+            args,
+            system_cmd,
+            ..
+        } => {
+            launch_spec_uses_codebuddy_cli(cmd, args)
+                || system_cmd.is_some_and(|(c, a)| launch_spec_uses_codebuddy_cli(c, a))
+        }
+        AgentDistribution::System { cmd, args, .. } => {
+            launch_spec_uses_codebuddy_cli(cmd, args)
+        }
+    }
+}
+
+/// True when the launch recipe runs the CodeBuddy CLI in ACP mode: the
+/// resolved executable basename is `codebuddy`, OR the npx argument list
+/// carries the `@tencent-ai/codebuddy-code[@<version>]` package spec (a direct
+/// `npx` launch), AND `--acp` is among the arguments.
+fn launch_spec_uses_codebuddy_cli(cmd: &str, args: &[&str]) -> bool {
+    let trimmed = cmd.trim();
+    let base = std::path::Path::new(trimmed)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(trimmed);
+    let names_the_cli = base.eq_ignore_ascii_case("codebuddy")
+        || args.iter().any(|a| {
+            *a == "@tencent-ai/codebuddy-code" || a.starts_with("@tencent-ai/codebuddy-code@")
+        });
+    names_the_cli && args.contains(&"--acp")
+}
+
 pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
     if let AgentType::Custom(id) = agent_type {
         return crate::acp::custom_registry::get(id)
