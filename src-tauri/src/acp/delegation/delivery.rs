@@ -767,6 +767,7 @@ impl DeliveryTransport for ManagerDeliveryTransport {
                 Some(conversation_id),
                 None,
                 Some(notice_id),
+                false,
             )
             .await
         {

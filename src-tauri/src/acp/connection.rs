@@ -17862,13 +17862,13 @@ fn codebuddy_chunk_marks_subagent(
 /// matches the suppression path exactly (the link wins there), so a member
 /// frame that carries BOTH tags is still the capsule's copy, routed as before.
 ///
-/// Gated on the CodeBuddy family so the flat `codebuddy.ai/*` keys of any other
+/// Gated on CodeBuddy so the flat `codebuddy.ai/*` keys of any other
 /// agent's `_meta` can never alias into member routing.
 fn codebuddy_member_channel(
     agent_type: AgentType,
     meta: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Option<String> {
-    if !is_codebuddy_family(agent_type) {
+    if agent_type != AgentType::CodeBuddy {
         return None;
     }
     let meta = meta?;
@@ -24504,7 +24504,11 @@ mod tests {
         assert!(caps.session_capabilities.close.is_some());
         assert!(caps.session_capabilities.fork.is_some());
         assert!(caps.prompt_capabilities.image);
-        assert!(init_advertises_steering(response.meta.as_ref()));
+        assert!(
+            parse_steering_descriptor(response.meta.as_ref())
+                .expect("the steering descriptor parses")
+                .is_some()
+        );
         assert!(init_advertises_goal(response.meta.as_ref()));
         assert_eq!(
             response.agent_info.as_ref().map(|info| info.name.as_str()),
@@ -38479,6 +38483,9 @@ mod tests {
         assert_eq!(
             pi_select_values(&filtered, "model"),
             vec!["openai/gpt-5", "openai/gpt-4o"]
+        );
+    }
+
     #[tokio::test]
     async fn the_emit_path_filters_the_model_select_into_state_and_event_alike() {
         use crate::acp::model_visibility::{ModelAvailability, RestrictedAvailability};
@@ -41450,6 +41457,8 @@ mod tests {
                     blocks: vec![PromptInputBlock::Text { text: text.into() }],
                     user_message: None,
                     internal_suffix: Vec::new(),
+                    source: None,
+                    preempt: false,
                 })
                 .await
                 .expect("the loop is running");
@@ -43808,6 +43817,475 @@ mod tests {
             assert_eq!(raw_output.as_deref(), Some(text), "{agent_type:?} {status}");
         }
     }
+
+    /// N3: a `queued` steer is CONSUMED (the adapter will run it after the
+    /// running turn), and zcode's bridge never echoes the user message into the
+    /// ACP stream — so the loop must record it exactly like an injection, or
+    /// the message would be permanently absent from a custom agent's history
+    /// (which IS codeg's transcript). `promptRequired` — the unconsumed arm,
+    /// covered above — stays unrecorded.
+    #[tokio::test]
+    async fn a_queued_steer_a_custom_agent_accepted_is_recorded_too() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let home_str = home.path().to_string_lossy().into_owned();
+        let (turns, transcript) =
+            temp_env::async_with_vars([("CODEG_HOME", Some(home_str.as_str()))], async {
+                let agent_id = "idle-probe-queued-steer";
+                let mut lp =
+                    CustomLoop::start(agent_id, vec![vec![custom_text("Building the page.")]])
+                        .await;
+                // What zcode advertises at initialize: the extended vocabulary.
+                lp.state.write().await.steering_outcomes = vec![
+                    SteerOutcome::Injected,
+                    SteerOutcome::Queued,
+                    SteerOutcome::PromptRequired,
+                    SteerOutcome::StartedNewTurn,
+                    SteerOutcome::Failed,
+                ];
+                lp.steer_outcomes.lock().unwrap().extend([
+                    serde_json::json!({
+                        "outcome": "queued",
+                        "_meta": {"steering": {"delivery": "queue", "steerState": "fellBack"}}
+                    }),
+                ]);
+
+                lp.open_turn("build the page", "Building the page.").await;
+                let receipt = lp.steer("run this after the turn").await.unwrap();
+                assert_eq!(receipt.outcome, SteerOutcome::Queued);
+                assert_eq!(receipt.steer_state.as_deref(), Some("fellBack"));
+                lp.agent_sends(vec![custom_text("Page built.")]);
+                lp.until_text("Page built.").await;
+                lp.close_turn().await;
+                lp.shutdown().await;
+
+                let turns = recorded_custom_turns(agent_id).await;
+                let transcript = std::fs::read_to_string(
+                    crate::paths::codeg_acp_transcripts_root()
+                        .join(agent_id)
+                        .join("s1.jsonl"),
+                )
+                .expect("the transcript file");
+                (turns, transcript)
+            })
+            .await;
+
+        // The queued message is a user turn of its own in the rebuilt history,
+        // exactly where the live view drew it.
+        assert_eq!(
+            turn_shape(&turns),
+            vec![
+                r#"User: text "build the page""#,
+                r#"Assistant: text "Building the page.""#,
+                r#"User: text "run this after the turn""#,
+                r#"Assistant: text "Page built.""#,
+            ]
+        );
+        let steers: Vec<serde_json::Value> = transcript
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|entry| entry.get("s") == Some(&serde_json::Value::Bool(true)))
+            .collect();
+        assert_eq!(steers.len(), 1, "{transcript}");
+        assert_eq!(steers[0]["k"], "prompt");
+        assert_eq!(
+            steers[0]["p"],
+            serde_json::json!([{"type": "text", "text": "run this after the turn"}])
+        );
+    }
+
+    // ── Interrupt-and-send at the loop level (P3) ───────────────────────────
+    //
+    // The admission side (the `turn_in_flight` gate, the `preempt_pending`
+    // single-flight, the linked path's side effects) is covered by the manager
+    // tests. What only the real loop can prove is the wire order the handover
+    // produces: the cancel reaching the agent STRICTLY before the interrupting
+    // prompt's own blocks, the new turn opening on the gate the cancelled one
+    // held (no `Connected` edge in between for the frontend's queue flush to
+    // race), and a second interrupt against that new turn running the same
+    // sequence again.
+
+    /// The text of a prompt's blocks, for the echo the scripted agent answers
+    /// with. The fixture's prompts are single text blocks by construction.
+    fn preempt_prompt_text(blocks: &[ContentBlock]) -> String {
+        blocks
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("|")
+    }
+
+    /// `run_conversation_loop` for the interrupt tests. Every `session/prompt`
+    /// the agent receives is recorded with its blocks (text), answered with one
+    /// scripted frame ("reply to …"), and its response HELD until the test
+    /// releases it — so the turn stays open across the whole interrupt. Every
+    /// `session/cancel` is recorded on the same ledger, which makes the wire
+    /// order ("cancel before the new prompt") directly assertable. Gated holds
+    /// are released oldest-first by [`PreemptLoop::release_next`].
+    struct PreemptLoop {
+        state: Arc<RwLock<SessionState>>,
+        cmd_tx: mpsc::Sender<ConnectionCommand>,
+        events: tokio::sync::broadcast::Receiver<Arc<crate::acp::types::EventEnvelope>>,
+        /// Every event the loop emitted so far, in order.
+        seen: Vec<AcpEvent>,
+        /// What the agent received, in arrival order: `prompt:<text>` / `cancel`.
+        received: Arc<std::sync::Mutex<Vec<String>>>,
+        /// One releaser per held prompt response, oldest first.
+        holds: Arc<std::sync::Mutex<VecDeque<oneshot::Sender<()>>>>,
+        client: tokio::task::JoinHandle<()>,
+        agent: tokio::task::JoinHandle<()>,
+    }
+
+    impl PreemptLoop {
+        async fn start() -> Self {
+            use agent_client_protocol::schema::v1::PromptResponse;
+
+            let agent_type = AgentType::custom(IDLE_PROBE_AGENT).expect("a valid custom id");
+            let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let holds = Arc::new(std::sync::Mutex::new(VecDeque::new()));
+            let agent_received_prompt = Arc::clone(&received);
+            let agent_received_cancel = Arc::clone(&received);
+            let agent_holds = Arc::clone(&holds);
+            let (client_end, agent_end) = agent_client_protocol::Channel::duplex();
+
+            let agent = tokio::spawn(async move {
+                let _ = Agent
+                    .builder()
+                    .on_receive_request(
+                        async |_req: NewSessionRequest,
+                               responder: Responder<NewSessionResponse>,
+                               _cx: ConnectionTo<Client>| {
+                            responder.respond(NewSessionResponse::new(SessionId::new("s1")))
+                        },
+                        on_receive_request!(),
+                    )
+                    .on_receive_request(
+                        async move |req: PromptRequest,
+                                    responder: Responder<PromptResponse>,
+                                    cx: ConnectionTo<Client>| {
+                            let text = preempt_prompt_text(&req.prompt);
+                            agent_received_prompt
+                                .lock()
+                                .unwrap()
+                                .push(format!("prompt:{text}"));
+                            // Register the releaser BEFORE streaming, so a test
+                            // that sees the frame can release immediately.
+                            let (release, released) = oneshot::channel::<()>();
+                            agent_holds.lock().unwrap().push_back(release);
+                            send_grok_frames(&cx, &[custom_text(&format!("reply to {text}"))])?;
+                            // Off the handler, so the held response doesn't hold
+                            // up the agent's other incoming messages — the
+                            // cancel that the interrupt sends while this turn is
+                            // still open has to be read.
+                            tokio::spawn(async move {
+                                let _ = released.await;
+                                responder.respond(PromptResponse::new(StopReason::EndTurn))
+                            });
+                            Ok(())
+                        },
+                        on_receive_request!(),
+                    )
+                    .on_receive_notification(
+                        async move |_cancel: CancelNotification, _cx: ConnectionTo<Client>| {
+                            agent_received_cancel.lock().unwrap().push("cancel".into());
+                            Ok(())
+                        },
+                        on_receive_notification!(),
+                    )
+                    .connect_with(agent_end, async |_cx: ConnectionTo<Client>| {
+                        std::future::pending::<Result<(), agent_client_protocol::Error>>().await
+                    })
+                    .await;
+            });
+
+            let state = Arc::new(RwLock::new(SessionState::new(
+                "conn-preempt".to_string(),
+                agent_type,
+                None,
+                "win".to_string(),
+                None,
+            )));
+            let events = state.read().await.event_stream().subscribe();
+            let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+            let loop_state = Arc::clone(&state);
+            let client = tokio::spawn(async move {
+                let _ = Client
+                    .builder()
+                    .connect_with(client_end, async move |cx: ConnectionTo<Agent>| {
+                        let raw = cx
+                            .send_request_to(
+                                Agent,
+                                UntypedMessage::new("session/new", NewSessionRequest::new("/tmp"))?,
+                            )
+                            .block_task()
+                            .await?;
+                        let response: NewSessionResponse = serde_json::from_value(raw)
+                            .map_err(agent_client_protocol::Error::into_internal_error)?;
+                        let mut session = AgentSession::attach(&cx, response)?;
+                        let perms = PendingPermissions::default();
+                        let ledger = background_watch::PromptLedger::shared();
+                        let stderr_tail = Arc::new(StderrTail::new());
+                        run_conversation_loop(
+                            &mut session,
+                            "conn-preempt",
+                            &EventEmitter::Noop,
+                            &loop_state,
+                            agent_type,
+                            &perms,
+                            &mut cmd_rx,
+                            Arc::new(TerminalRuntime::with_base_env(BTreeMap::new())),
+                            "/tmp",
+                            false,
+                            &[],
+                            &ledger,
+                            None,
+                            &stderr_tail,
+                        )
+                        .await?;
+                        Ok(())
+                    })
+                    .await;
+            });
+
+            Self {
+                state,
+                cmd_tx,
+                events,
+                seen: Vec::new(),
+                received,
+                holds,
+                client,
+                agent,
+            }
+        }
+
+        /// What the agent has received so far, in order.
+        fn received(&self) -> Vec<String> {
+            self.received.lock().unwrap().clone()
+        }
+
+        /// Send one `ConnectionCommand::Prompt` the way the manager does. The
+        /// gate is the test's own setup: an ordinary prompt is admitted with
+        /// `turn_in_flight` already held (as `send_prompt_inner` leaves it).
+        async fn send_prompt(&self, text: &str, preempt: bool) {
+            self.cmd_tx
+                .send(ConnectionCommand::Prompt {
+                    blocks: vec![PromptInputBlock::Text { text: text.into() }],
+                    user_message: None,
+                    internal_suffix: Vec::new(),
+                    source: None,
+                    preempt,
+                })
+                .await
+                .expect("the loop is running");
+        }
+
+        /// Claim the hand-over the way `prompt_interrupt` does, inside the
+        /// state lock that decides the prompt is an interrupt. Refuses to
+        /// overwrite an existing claim: a second interrupt in that window is
+        /// what the manager answers `TurnInProgress`, so the loop must never
+        /// see one.
+        async fn claim_preempt(&self) {
+            let mut s = self.state.write().await;
+            assert!(
+                !s.preempt_pending,
+                "the manager refuses a second interrupt instead of overwriting the claim"
+            );
+            s.preempt_pending = true;
+        }
+
+        /// Release the oldest held prompt response — the test releases the
+        /// turns in the order the agent received them.
+        async fn release_next(&self) {
+            let deadline = std::time::Duration::from_secs(10);
+            let release = tokio::time::timeout(deadline, async {
+                loop {
+                    if let Some(release) = self.holds.lock().unwrap().pop_front() {
+                        break release;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("a held prompt response to release");
+            release.send(()).expect("the responder is waiting");
+        }
+
+        async fn until_text(&mut self, text: &str) -> usize {
+            self.until("the reply", |e| {
+                matches!(e, AcpEvent::ContentDelta { text: delta, .. } if delta == text)
+            })
+            .await
+        }
+
+        /// Record events until one matches, and return its index in `seen`.
+        async fn until(&mut self, what: &str, matches: impl Fn(&AcpEvent) -> bool) -> usize {
+            let deadline = std::time::Duration::from_secs(10);
+            loop {
+                let envelope = tokio::time::timeout(deadline, self.events.recv())
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!("timed out waiting for {what}; saw {:#?}", self.seen)
+                    })
+                    .expect("event stream");
+                self.seen.push(envelope.payload.clone());
+                if matches(&envelope.payload) {
+                    return self.seen.len() - 1;
+                }
+            }
+        }
+
+        /// The index of the first already-seen `TurnComplete` carrying
+        /// `stop_reason`.
+        fn seen_turn_complete(&self, stop_reason: &str) -> Option<usize> {
+            self.seen.iter().position(|e| {
+                matches!(e, AcpEvent::TurnComplete { stop_reason: reason, .. } if reason == stop_reason)
+            })
+        }
+
+        async fn shutdown(self) {
+            let _ = self.cmd_tx.send(ConnectionCommand::Disconnect).await;
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), self.client).await;
+            self.agent.abort();
+        }
+    }
+
+    /// M2/I1/I2: an interrupt-and-send is ONE admission. The running turn is
+    /// stopped first — the agent sees `session/cancel` strictly before the
+    /// interrupting prompt's own blocks, which go out exactly once — and the
+    /// new turn opens on the very gate the cancelled turn held: the
+    /// intermediate `TurnComplete{cancelled}` consumes the hand-over without
+    /// releasing `turn_in_flight`, the admission is settled at the turn
+    /// opening, and no `Connected` edge lands between the two turns (the
+    /// frontend's queue auto-flush races a send against that edge).
+    #[tokio::test]
+    async fn a_mid_turn_preempt_cancels_first_then_opens_the_new_turn() {
+        let mut lp = PreemptLoop::start().await;
+
+        // Turn A, admitted by the manager as any prompt: the gate already held.
+        lp.state.write().await.turn_in_flight = true;
+        lp.send_prompt("first", false).await;
+        lp.until_text("reply to first").await;
+
+        // The interrupt: exactly what `prompt_interrupt` admits.
+        lp.claim_preempt().await;
+        lp.send_prompt("actually this", true).await;
+        lp.until_text("reply to actually this").await;
+
+        // The agent's view: cancel first, then the interrupt's own blocks —
+        // once, and no second concurrent prompt behind them.
+        assert_eq!(
+            lp.received(),
+            vec!["prompt:first", "cancel", "prompt:actually this"],
+            "cancel strictly before the interrupting prompt's own blocks, sent once"
+        );
+
+        // The gate hand-over, visible in the state the manager's next admission
+        // reads: held for the new turn, hand-over consumed by the intermediate
+        // TurnComplete, admission settled at the turn opening.
+        {
+            let s = lp.state.read().await;
+            assert!(
+                s.turn_in_flight,
+                "the new turn owns the gate the cancelled one held"
+            );
+            assert!(
+                !s.preempt_handover,
+                "consumed by the intermediate TurnComplete"
+            );
+            assert!(!s.preempt_pending, "settled at the turn opening");
+        }
+        // The loop went straight from the cancel into the new turn — no status
+        // repaint between them.
+        let cancel_at = lp
+            .seen_turn_complete("cancelled")
+            .expect("the intermediate TurnComplete{cancelled}");
+        assert!(
+            !lp.seen[cancel_at + 1..]
+                .iter()
+                .any(|e| matches!(
+                    e,
+                    AcpEvent::StatusChanged {
+                        status: ConnectionStatus::Connected
+                    }
+                )),
+            "no Connected edge between the interrupted turn and its successor; saw {:#?}",
+            lp.seen
+        );
+
+        // Wind the interrupted turn's held response and the new turn's down.
+        lp.release_next().await;
+        lp.release_next().await;
+        lp.until("the new turn's end", |e| {
+            matches!(e, AcpEvent::TurnComplete { stop_reason, .. } if stop_reason == "end_turn")
+        })
+        .await;
+        assert!(
+            !lp.state.read().await.turn_in_flight,
+            "the new turn's own completion releases the gate"
+        );
+        lp.shutdown().await;
+    }
+
+    /// I5: an interrupt that lands while the PREVIOUS interrupt's new turn is
+    /// still running is legal. That turn is an ordinary running turn as far as
+    /// the hand-over is concerned — its predecessor's `preempt_handover` was
+    /// consumed and its admission settled at its opening — so the same
+    /// cancel-then-prompt sequence runs again, every prompt reaches the agent
+    /// exactly once, and only the last turn's own completion releases the gate.
+    #[tokio::test]
+    async fn a_preempt_during_the_new_turn_is_legal() {
+        let mut lp = PreemptLoop::start().await;
+
+        lp.state.write().await.turn_in_flight = true;
+        lp.send_prompt("first", false).await;
+        lp.until_text("reply to first").await;
+
+        lp.claim_preempt().await;
+        lp.send_prompt("second", true).await;
+        lp.until_text("reply to second").await;
+        assert_eq!(lp.received(), vec!["prompt:first", "cancel", "prompt:second"]);
+
+        // The turn the first interrupt opened is a turn like any other: the
+        // second interrupt is admitted against it and runs the same sequence.
+        lp.claim_preempt().await;
+        lp.send_prompt("third", true).await;
+        lp.until_text("reply to third").await;
+        assert_eq!(
+            lp.received(),
+            vec![
+                "prompt:first",
+                "cancel",
+                "prompt:second",
+                "cancel",
+                "prompt:third"
+            ]
+        );
+        {
+            let s = lp.state.read().await;
+            assert!(
+                s.turn_in_flight && !s.preempt_handover && !s.preempt_pending,
+                "the newest turn owns the gate, with no hand-over left behind"
+            );
+        }
+
+        // Wind every held response down, oldest first, and let the last turn
+        // end: its own completion releases the gate.
+        lp.release_next().await;
+        lp.release_next().await;
+        lp.release_next().await;
+        lp.until("the last turn's end", |e| {
+            matches!(e, AcpEvent::TurnComplete { stop_reason, .. } if stop_reason == "end_turn")
+        })
+        .await;
+        assert!(
+            !lp.state.read().await.turn_in_flight,
+            "the last turn's own completion releases the gate"
+        );
+        lp.shutdown().await;
+    }
 }
 
 #[cfg(test)]
@@ -44206,470 +44684,4 @@ mod trae_handshake_tests {
         }
     }
 
-    /// N3: a `queued` steer is CONSUMED (the adapter will run it after the
-    /// running turn), and zcode's bridge never echoes the user message into the
-    /// ACP stream — so the loop must record it exactly like an injection, or
-    /// the message would be permanently absent from a custom agent's history
-    /// (which IS codeg's transcript). `promptRequired` — the unconsumed arm,
-    /// covered above — stays unrecorded.
-    #[tokio::test]
-    async fn a_queued_steer_a_custom_agent_accepted_is_recorded_too() {
-        let home = tempfile::tempdir().expect("tempdir");
-        let home_str = home.path().to_string_lossy().into_owned();
-        let (turns, transcript) =
-            temp_env::async_with_vars([("CODEG_HOME", Some(home_str.as_str()))], async {
-                let agent_id = "idle-probe-queued-steer";
-                let mut lp =
-                    CustomLoop::start(agent_id, vec![vec![custom_text("Building the page.")]])
-                        .await;
-                // What zcode advertises at initialize: the extended vocabulary.
-                lp.state.write().await.steering_outcomes = vec![
-                    SteerOutcome::Injected,
-                    SteerOutcome::Queued,
-                    SteerOutcome::PromptRequired,
-                    SteerOutcome::StartedNewTurn,
-                    SteerOutcome::Failed,
-                ];
-                lp.steer_outcomes.lock().unwrap().extend([
-                    serde_json::json!({
-                        "outcome": "queued",
-                        "_meta": {"steering": {"delivery": "queue", "steerState": "fellBack"}}
-                    }),
-                ]);
-
-                lp.open_turn("build the page", "Building the page.").await;
-                let receipt = lp.steer("run this after the turn").await.unwrap();
-                assert_eq!(receipt.outcome, SteerOutcome::Queued);
-                assert_eq!(receipt.steer_state.as_deref(), Some("fellBack"));
-                lp.agent_sends(vec![custom_text("Page built.")]);
-                lp.until_text("Page built.").await;
-                lp.close_turn().await;
-                lp.shutdown().await;
-
-                let turns = recorded_custom_turns(agent_id).await;
-                let transcript = std::fs::read_to_string(
-                    crate::paths::codeg_acp_transcripts_root()
-                        .join(agent_id)
-                        .join("s1.jsonl"),
-                )
-                .expect("the transcript file");
-                (turns, transcript)
-            })
-            .await;
-
-        // The queued message is a user turn of its own in the rebuilt history,
-        // exactly where the live view drew it.
-        assert_eq!(
-            turn_shape(&turns),
-            vec![
-                r#"User: text "build the page""#,
-                r#"Assistant: text "Building the page.""#,
-                r#"User: text "run this after the turn""#,
-                r#"Assistant: text "Page built.""#,
-            ]
-        );
-        let steers: Vec<serde_json::Value> = transcript
-            .lines()
-            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-            .filter(|entry| entry.get("s") == Some(&serde_json::Value::Bool(true)))
-            .collect();
-        assert_eq!(steers.len(), 1, "{transcript}");
-        assert_eq!(steers[0]["k"], "prompt");
-        assert_eq!(
-            steers[0]["p"],
-            serde_json::json!([{"type": "text", "text": "run this after the turn"}])
-        );
-    }
-
-    // ── Interrupt-and-send at the loop level (P3) ───────────────────────────
-    //
-    // The admission side (the `turn_in_flight` gate, the `preempt_pending`
-    // single-flight, the linked path's side effects) is covered by the manager
-    // tests. What only the real loop can prove is the wire order the handover
-    // produces: the cancel reaching the agent STRICTLY before the interrupting
-    // prompt's own blocks, the new turn opening on the gate the cancelled one
-    // held (no `Connected` edge in between for the frontend's queue flush to
-    // race), and a second interrupt against that new turn running the same
-    // sequence again.
-
-    /// The text of a prompt's blocks, for the echo the scripted agent answers
-    /// with. The fixture's prompts are single text blocks by construction.
-    fn preempt_prompt_text(blocks: &[ContentBlock]) -> String {
-        blocks
-            .iter()
-            .filter_map(|block| match block {
-                ContentBlock::Text(text) => Some(text.text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("|")
-    }
-
-    /// `run_conversation_loop` for the interrupt tests. Every `session/prompt`
-    /// the agent receives is recorded with its blocks (text), answered with one
-    /// scripted frame ("reply to …"), and its response HELD until the test
-    /// releases it — so the turn stays open across the whole interrupt. Every
-    /// `session/cancel` is recorded on the same ledger, which makes the wire
-    /// order ("cancel before the new prompt") directly assertable. Gated holds
-    /// are released oldest-first by [`PreemptLoop::release_next`].
-    struct PreemptLoop {
-        state: Arc<RwLock<SessionState>>,
-        cmd_tx: mpsc::Sender<ConnectionCommand>,
-        events: tokio::sync::broadcast::Receiver<Arc<crate::acp::types::EventEnvelope>>,
-        /// Every event the loop emitted so far, in order.
-        seen: Vec<AcpEvent>,
-        /// What the agent received, in arrival order: `prompt:<text>` / `cancel`.
-        received: Arc<std::sync::Mutex<Vec<String>>>,
-        /// One releaser per held prompt response, oldest first.
-        holds: Arc<std::sync::Mutex<VecDeque<oneshot::Sender<()>>>>,
-        client: tokio::task::JoinHandle<()>,
-        agent: tokio::task::JoinHandle<()>,
-    }
-
-    impl PreemptLoop {
-        async fn start() -> Self {
-            use agent_client_protocol::schema::v1::PromptResponse;
-
-            let agent_type = AgentType::custom(IDLE_PROBE_AGENT).expect("a valid custom id");
-            let received = Arc::new(std::sync::Mutex::new(Vec::new()));
-            let holds = Arc::new(std::sync::Mutex::new(VecDeque::new()));
-            let agent_received_prompt = Arc::clone(&received);
-            let agent_received_cancel = Arc::clone(&received);
-            let agent_holds = Arc::clone(&holds);
-            let (client_end, agent_end) = agent_client_protocol::Channel::duplex();
-
-            let agent = tokio::spawn(async move {
-                let _ = Agent
-                    .builder()
-                    .on_receive_request(
-                        async |_req: NewSessionRequest,
-                               responder: Responder<NewSessionResponse>,
-                               _cx: ConnectionTo<Client>| {
-                            responder.respond(NewSessionResponse::new(SessionId::new("s1")))
-                        },
-                        on_receive_request!(),
-                    )
-                    .on_receive_request(
-                        async move |req: PromptRequest,
-                                    responder: Responder<PromptResponse>,
-                                    cx: ConnectionTo<Client>| {
-                            let text = preempt_prompt_text(&req.prompt);
-                            agent_received_prompt
-                                .lock()
-                                .unwrap()
-                                .push(format!("prompt:{text}"));
-                            // Register the releaser BEFORE streaming, so a test
-                            // that sees the frame can release immediately.
-                            let (release, released) = oneshot::channel::<()>();
-                            agent_holds.lock().unwrap().push_back(release);
-                            send_grok_frames(&cx, &[custom_text(&format!("reply to {text}"))])?;
-                            // Off the handler, so the held response doesn't hold
-                            // up the agent's other incoming messages — the
-                            // cancel that the interrupt sends while this turn is
-                            // still open has to be read.
-                            tokio::spawn(async move {
-                                let _ = released.await;
-                                responder.respond(PromptResponse::new(StopReason::EndTurn))
-                            });
-                            Ok(())
-                        },
-                        on_receive_request!(),
-                    )
-                    .on_receive_notification(
-                        async move |_cancel: CancelNotification, _cx: ConnectionTo<Client>| {
-                            agent_received_cancel.lock().unwrap().push("cancel".into());
-                            Ok(())
-                        },
-                        on_receive_notification!(),
-                    )
-                    .connect_with(agent_end, async |_cx: ConnectionTo<Client>| {
-                        std::future::pending::<Result<(), agent_client_protocol::Error>>().await
-                    })
-                    .await;
-            });
-
-            let state = Arc::new(RwLock::new(SessionState::new(
-                "conn-preempt".to_string(),
-                agent_type,
-                None,
-                "win".to_string(),
-                None,
-            )));
-            let events = state.read().await.event_stream().subscribe();
-            let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
-            let loop_state = Arc::clone(&state);
-            let client = tokio::spawn(async move {
-                let _ = Client
-                    .builder()
-                    .connect_with(client_end, async move |cx: ConnectionTo<Agent>| {
-                        let raw = cx
-                            .send_request_to(
-                                Agent,
-                                UntypedMessage::new("session/new", NewSessionRequest::new("/tmp"))?,
-                            )
-                            .block_task()
-                            .await?;
-                        let response: NewSessionResponse = serde_json::from_value(raw)
-                            .map_err(agent_client_protocol::Error::into_internal_error)?;
-                        let mut session = AgentSession::attach(&cx, response)?;
-                        let perms = PendingPermissions::default();
-                        let ledger = background_watch::PromptLedger::shared();
-                        let stderr_tail = Arc::new(StderrTail::new());
-                        run_conversation_loop(
-                            &mut session,
-                            "conn-preempt",
-                            &EventEmitter::Noop,
-                            &loop_state,
-                            agent_type,
-                            &perms,
-                            &mut cmd_rx,
-                            Arc::new(TerminalRuntime::with_base_env(BTreeMap::new())),
-                            "/tmp",
-                            false,
-                            &ledger,
-                            None,
-                            &stderr_tail,
-                        )
-                        .await?;
-                        Ok(())
-                    })
-                    .await;
-            });
-
-            Self {
-                state,
-                cmd_tx,
-                events,
-                seen: Vec::new(),
-                received,
-                holds,
-                client,
-                agent,
-            }
-        }
-
-        /// What the agent has received so far, in order.
-        fn received(&self) -> Vec<String> {
-            self.received.lock().unwrap().clone()
-        }
-
-        /// Send one `ConnectionCommand::Prompt` the way the manager does. The
-        /// gate is the test's own setup: an ordinary prompt is admitted with
-        /// `turn_in_flight` already held (as `send_prompt_inner` leaves it).
-        async fn send_prompt(&self, text: &str, preempt: bool) {
-            self.cmd_tx
-                .send(ConnectionCommand::Prompt {
-                    blocks: vec![PromptInputBlock::Text { text: text.into() }],
-                    user_message: None,
-                    source: None,
-                    preempt,
-                })
-                .await
-                .expect("the loop is running");
-        }
-
-        /// Claim the hand-over the way `prompt_interrupt` does, inside the
-        /// state lock that decides the prompt is an interrupt. Refuses to
-        /// overwrite an existing claim: a second interrupt in that window is
-        /// what the manager answers `TurnInProgress`, so the loop must never
-        /// see one.
-        async fn claim_preempt(&self) {
-            let mut s = self.state.write().await;
-            assert!(
-                !s.preempt_pending,
-                "the manager refuses a second interrupt instead of overwriting the claim"
-            );
-            s.preempt_pending = true;
-        }
-
-        /// Release the oldest held prompt response — the test releases the
-        /// turns in the order the agent received them.
-        async fn release_next(&self) {
-            let deadline = std::time::Duration::from_secs(10);
-            let release = tokio::time::timeout(deadline, async {
-                loop {
-                    if let Some(release) = self.holds.lock().unwrap().pop_front() {
-                        break release;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                }
-            })
-            .await
-            .expect("a held prompt response to release");
-            release.send(()).expect("the responder is waiting");
-        }
-
-        async fn until_text(&mut self, text: &str) -> usize {
-            self.until("the reply", |e| {
-                matches!(e, AcpEvent::ContentDelta { text: delta, .. } if delta == text)
-            })
-            .await
-        }
-
-        /// Record events until one matches, and return its index in `seen`.
-        async fn until(&mut self, what: &str, matches: impl Fn(&AcpEvent) -> bool) -> usize {
-            let deadline = std::time::Duration::from_secs(10);
-            loop {
-                let envelope = tokio::time::timeout(deadline, self.events.recv())
-                    .await
-                    .unwrap_or_else(|_| {
-                        panic!("timed out waiting for {what}; saw {:#?}", self.seen)
-                    })
-                    .expect("event stream");
-                self.seen.push(envelope.payload.clone());
-                if matches(&envelope.payload) {
-                    return self.seen.len() - 1;
-                }
-            }
-        }
-
-        /// The index of the first already-seen `TurnComplete` carrying
-        /// `stop_reason`.
-        fn seen_turn_complete(&self, stop_reason: &str) -> Option<usize> {
-            self.seen.iter().position(|e| {
-                matches!(e, AcpEvent::TurnComplete { stop_reason: reason, .. } if reason == stop_reason)
-            })
-        }
-
-        async fn shutdown(self) {
-            let _ = self.cmd_tx.send(ConnectionCommand::Disconnect).await;
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), self.client).await;
-            self.agent.abort();
-        }
-    }
-
-    /// M2/I1/I2: an interrupt-and-send is ONE admission. The running turn is
-    /// stopped first — the agent sees `session/cancel` strictly before the
-    /// interrupting prompt's own blocks, which go out exactly once — and the
-    /// new turn opens on the very gate the cancelled turn held: the
-    /// intermediate `TurnComplete{cancelled}` consumes the hand-over without
-    /// releasing `turn_in_flight`, the admission is settled at the turn
-    /// opening, and no `Connected` edge lands between the two turns (the
-    /// frontend's queue auto-flush races a send against that edge).
-    #[tokio::test]
-    async fn a_mid_turn_preempt_cancels_first_then_opens_the_new_turn() {
-        let mut lp = PreemptLoop::start().await;
-
-        // Turn A, admitted by the manager as any prompt: the gate already held.
-        lp.state.write().await.turn_in_flight = true;
-        lp.send_prompt("first", false).await;
-        lp.until_text("reply to first").await;
-
-        // The interrupt: exactly what `prompt_interrupt` admits.
-        lp.claim_preempt().await;
-        lp.send_prompt("actually this", true).await;
-        lp.until_text("reply to actually this").await;
-
-        // The agent's view: cancel first, then the interrupt's own blocks —
-        // once, and no second concurrent prompt behind them.
-        assert_eq!(
-            lp.received(),
-            vec!["prompt:first", "cancel", "prompt:actually this"],
-            "cancel strictly before the interrupting prompt's own blocks, sent once"
-        );
-
-        // The gate hand-over, visible in the state the manager's next admission
-        // reads: held for the new turn, hand-over consumed by the intermediate
-        // TurnComplete, admission settled at the turn opening.
-        {
-            let s = lp.state.read().await;
-            assert!(
-                s.turn_in_flight,
-                "the new turn owns the gate the cancelled one held"
-            );
-            assert!(
-                !s.preempt_handover,
-                "consumed by the intermediate TurnComplete"
-            );
-            assert!(!s.preempt_pending, "settled at the turn opening");
-        }
-        // The loop went straight from the cancel into the new turn — no status
-        // repaint between them.
-        let cancel_at = lp
-            .seen_turn_complete("cancelled")
-            .expect("the intermediate TurnComplete{cancelled}");
-        assert!(
-            !lp.seen[cancel_at + 1..]
-                .iter()
-                .any(|e| matches!(
-                    e,
-                    AcpEvent::StatusChanged {
-                        status: ConnectionStatus::Connected
-                    }
-                )),
-            "no Connected edge between the interrupted turn and its successor; saw {:#?}",
-            lp.seen
-        );
-
-        // Wind the interrupted turn's held response and the new turn's down.
-        lp.release_next().await;
-        lp.release_next().await;
-        lp.until("the new turn's end", |e| {
-            matches!(e, AcpEvent::TurnComplete { stop_reason, .. } if stop_reason == "end_turn")
-        })
-        .await;
-        assert!(
-            !lp.state.read().await.turn_in_flight,
-            "the new turn's own completion releases the gate"
-        );
-        lp.shutdown().await;
-    }
-
-    /// I5: an interrupt that lands while the PREVIOUS interrupt's new turn is
-    /// still running is legal. That turn is an ordinary running turn as far as
-    /// the hand-over is concerned — its predecessor's `preempt_handover` was
-    /// consumed and its admission settled at its opening — so the same
-    /// cancel-then-prompt sequence runs again, every prompt reaches the agent
-    /// exactly once, and only the last turn's own completion releases the gate.
-    #[tokio::test]
-    async fn a_preempt_during_the_new_turn_is_legal() {
-        let mut lp = PreemptLoop::start().await;
-
-        lp.state.write().await.turn_in_flight = true;
-        lp.send_prompt("first", false).await;
-        lp.until_text("reply to first").await;
-
-        lp.claim_preempt().await;
-        lp.send_prompt("second", true).await;
-        lp.until_text("reply to second").await;
-        assert_eq!(lp.received(), vec!["prompt:first", "cancel", "prompt:second"]);
-
-        // The turn the first interrupt opened is a turn like any other: the
-        // second interrupt is admitted against it and runs the same sequence.
-        lp.claim_preempt().await;
-        lp.send_prompt("third", true).await;
-        lp.until_text("reply to third").await;
-        assert_eq!(
-            lp.received(),
-            vec![
-                "prompt:first",
-                "cancel",
-                "prompt:second",
-                "cancel",
-                "prompt:third"
-            ]
-        );
-        {
-            let s = lp.state.read().await;
-            assert!(
-                s.turn_in_flight && !s.preempt_handover && !s.preempt_pending,
-                "the newest turn owns the gate, with no hand-over left behind"
-            );
-        }
-
-        // Wind every held response down, oldest first, and let the last turn
-        // end: its own completion releases the gate.
-        lp.release_next().await;
-        lp.release_next().await;
-        lp.release_next().await;
-        lp.until("the last turn's end", |e| {
-            matches!(e, AcpEvent::TurnComplete { stop_reason, .. } if stop_reason == "end_turn")
-        })
-        .await;
-        assert!(
-            !lp.state.read().await.turn_in_flight,
-            "the last turn's own completion releases the gate"
-        );
-        lp.shutdown().await;
-    }
 }
