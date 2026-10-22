@@ -907,8 +907,7 @@ struct CodeModeCallSite {
 /// desynchronizes everything after it (`/'/` opens a "string" that skips the
 /// real call and closes in a later comment, which then reads as code).
 fn code_mode_call_site(code: &str) -> Option<CodeModeCallSite> {
-    // A heuristic scan cap in UTF-8 bytes — the TS mirror measures the same.
-    const MAX_CODE_BYTES: usize = 1 << 20;
+    // A heuristic scan cap in UTF-8 bytes — the TS mirror measures the same.    const MAX_CODE_BYTES: usize = 1 << 20;
     if code.len() > MAX_CODE_BYTES {
         return None;
     }

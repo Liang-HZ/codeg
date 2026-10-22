@@ -18812,6 +18812,26 @@ fn is_zcode_family(agent_type: AgentType) -> bool {
     }
 }
 
+/// The CodeBuddy quirk scope: the built-in entry plus any custom registration
+/// whose launch recipe runs the same CodeBuddy CLI (`codebuddy --acp` or an
+/// `npx @tencent-ai/codebuddy-code` launch — the dual-account variants
+/// `codebuddy-cn` / `codebuddy-intl` share it). Not `AgentType::CodeBuddy`
+/// alone, so custom variants leaked sub-agent thought/message chunks into the
+/// main stream (each also rendered inside the Agent pill's window, out of
+/// order) and missed the Agent-pill title rewrite and deferred-MCP unwraps.
+/// The scope is anchored on the launch RECIPE, not the registry id
+/// (2026-10-16): an id is free-form user input — renamed, it would silently
+/// drop every quirk — while the CLI cannot be replaced. Only the real CLI
+/// emits the `codebuddy.ai/*` `_meta` keys those quirks read, so "launched the
+/// CodeBuddy CLI" cannot alias an unrelated agent in.
+fn is_codebuddy_family(agent_type: AgentType) -> bool {
+    match agent_type {
+        AgentType::CodeBuddy => true,
+        AgentType::Custom(_) => crate::acp::registry::uses_codebuddy_cli_backend(agent_type),
+        _ => false,
+    }
+}
+
 /// Mirrors `parsers/opencode.rs:425-429` (and `parsers/codebuddy.rs`'s
 /// `subagent_type → "Agent"` rewrite) so streaming and reload-from-DB render the
 /// same Agent card. The SQLite-side condition is
@@ -18826,7 +18846,7 @@ fn is_zcode_family(agent_type: AgentType) -> bool {
 /// identify a sub-agent invocation in practice. Other agents stay excluded to
 /// avoid any cross-agent collision a generic `subagent_type` field could cause.
 fn is_subagent_invocation(agent_type: AgentType, raw_input: &Option<String>) -> bool {
-    if !matches!(agent_type, AgentType::OpenCode | AgentType::CodeBuddy) {
+    if !matches!(agent_type, AgentType::OpenCode) && !is_codebuddy_family(agent_type) {
         return false;
     }
     let Some(text) = raw_input.as_deref() else {
@@ -18856,7 +18876,7 @@ fn is_subagent_invocation(agent_type: AgentType, raw_input: &Option<String>) -> 
 /// (the cards peel `params` themselves, and that keeps `inferFromInput` from
 /// misclassifying `cancel_delegation`'s `{task_id}` as a generic task).
 fn codebuddy_deferred_tool_name(agent_type: AgentType, raw_input: &Option<String>) -> Option<String> {
-    if agent_type != AgentType::CodeBuddy {
+    if !is_codebuddy_family(agent_type) {
         return None;
     }
     let text = raw_input.as_deref()?;
@@ -18885,7 +18905,7 @@ fn codebuddy_deferred_tool_name(agent_type: AgentType, raw_input: &Option<String
 /// those pass through untouched. Unlike the title rewrite, this needs no
 /// `raw_input`, so it also normalizes a result-only `ToolCallUpdate` that omits it.
 fn unwrap_codebuddy_deferred_output(agent_type: AgentType, text: &str) -> Option<String> {
-    if agent_type != AgentType::CodeBuddy {
+    if !is_codebuddy_family(agent_type) {
         return None;
     }
     // Cheap substring guard before parsing a potentially large payload.
@@ -18914,7 +18934,7 @@ fn codebuddy_meta_marks_subagent(
     agent_type: AgentType,
     meta: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> bool {
-    if agent_type != AgentType::CodeBuddy {
+    if !is_codebuddy_family(agent_type) {
         return false;
     }
     let Some(meta) = meta else {
@@ -20209,7 +20229,7 @@ fn codebuddy_meta_marks_background(
     agent_type: AgentType,
     meta: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> bool {
-    if agent_type != AgentType::CodeBuddy {
+    if !is_codebuddy_family(agent_type) {
         return false;
     }
     meta.and_then(|m| m.get("codebuddy.ai/isBackground"))
@@ -20228,7 +20248,7 @@ fn codebuddy_chunk_marks_subagent(
     agent_type: AgentType,
     meta: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> bool {
-    if agent_type != AgentType::CodeBuddy {
+    if !is_codebuddy_family(agent_type) {
         return false;
     }
     let Some(meta) = meta else {
@@ -20250,9 +20270,15 @@ fn codebuddy_chunk_marks_subagent(
     // `codebuddy_member_channel`, which reroutes exactly the chunks this arm
     // claims (and only those) onto the member channel as `AcpEvent::MemberChunk`.
     // A member-tagged chunk that DOES carry a parent link stays routed — the
-    // link wins, via `should_suppress_subagent_chunk`'s
-    // `subagent_chunk_parent_tool_use_id` early return.
-    meta.get("codebuddy.ai/memberEvent")
+    // link wins, exactly like the other markers below.
+    if meta
+        .get("codebuddy.ai/memberEvent")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.is_empty())
+    {
+        return true;
+    }
+    meta.get("codebuddy.ai/parentToolCallId")
         .and_then(|v| v.as_str())
         .is_some_and(|s| !s.is_empty())
 }
@@ -20277,7 +20303,7 @@ fn codebuddy_member_channel(
     agent_type: AgentType,
     meta: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Option<String> {
-    if agent_type != AgentType::CodeBuddy {
+    if !is_codebuddy_family(agent_type) {
         return None;
     }
     let meta = meta?;
@@ -20340,7 +20366,7 @@ fn should_suppress_subagent_chunk(
     window_open: bool,
     chunk_meta: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> bool {
-    if agent_type != AgentType::CodeBuddy {
+    if !is_codebuddy_family(agent_type) {
         return false;
     }
     if subagent_chunk_parent_tool_use_id(agent_type, chunk_meta).is_some() {
@@ -20375,8 +20401,8 @@ fn subagent_chunk_parent_tool_use_id(
     meta: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Option<String> {
     // CodeBuddy's link is a flat single key, not nested under a namespace
-    // object — read it before the namespaced pair.
-    if agent_type == AgentType::CodeBuddy {
+    // object — read it before the namespaced pairs.
+    if is_codebuddy_family(agent_type) {
         return meta?
             .get("codebuddy.ai/parentToolCallId")?
             .as_str()
@@ -20631,7 +20657,7 @@ fn track_subagent_window(
     open: &mut HashSet<String>,
     closed: &mut HashSet<String>,
 ) {
-    if agent_type != AgentType::CodeBuddy || !is_agent {
+    if !is_codebuddy_family(agent_type) || !is_agent {
         return;
     }
     let is_final = matches!(status, Some("completed") | Some("failed"));
@@ -44909,17 +44935,31 @@ mod tests {
             false,
             None
         ));
-        // Window closed but the chunk's own meta marks it → suppress (precision
-        // supplement; never relied on alone).
+        // Window closed, meta marks it but carries NO parent link → suppress
+        // (the fallback path; suppression is never relied on alone).
         let sub = serde_json::json!({ "codebuddy.ai/isSubagent": true });
+        assert!(should_suppress_subagent_chunk(
+            AgentType::CodeBuddy,
+            false,
+            sub.as_object()
+        ));
+        // Window closed and the chunk carries its own parent link → ROUTED, not
+        // suppressed: it emits with that attribution and the frontend files it
+        // into the live Agent capsule (LOCAL, codeg-fix: sub-agent thinking/text
+        // survives into the settled card instead of vanishing).
         let parented = serde_json::json!({ "codebuddy.ai/parentToolCallId": "call_x" });
-        for meta in [&sub, &parented] {
-            assert!(should_suppress_subagent_chunk(
-                AgentType::CodeBuddy,
-                false,
-                meta.as_object()
-            ));
-        }
+        assert!(!should_suppress_subagent_chunk(
+            AgentType::CodeBuddy,
+            false,
+            parented.as_object()
+        ));
+        // Even inside an open window a linked chunk is routed — suppression
+        // only ever catches chunks the wire did not link.
+        assert!(!should_suppress_subagent_chunk(
+            AgentType::CodeBuddy,
+            true,
+            parented.as_object()
+        ));
         // Other agents never suppress, even inside a (spurious) open window.
         assert!(!should_suppress_subagent_chunk(AgentType::OpenCode, true, None));
     }
@@ -44937,6 +44977,9 @@ mod tests {
     /// tests below pin the two decisions together.
     #[test]
     fn member_event_chunks_are_suppressed_unless_linked() {
+        use crate::acp::custom_registry::{hydrate, hydrate_test_guard};
+        let _guard = hydrate_test_guard();
+        assert!(hydrate(&[codebuddy_cli_def("codebuddy-intl")]).is_empty());
         // The unlinked member stream (and its record echo) → suppressed even
         // with the window closed: the meta arm alone catches it. A member is
         // NOT window-excluded as a background worker — its start frame carries
@@ -44984,6 +45027,7 @@ mod tests {
             false,
             main.as_object()
         ));
+        hydrate(&[]);
     }
 
     /// Unit contract of the member-channel decision: the flat
@@ -44993,6 +45037,13 @@ mod tests {
     /// veto — mirroring `codebuddy_chunk_parent_reads_the_flat_meta_only_for_the_family`.
     #[test]
     fn member_channel_reads_the_flat_meta_only_for_the_family() {
+        use crate::acp::custom_registry::{hydrate, hydrate_test_guard};
+        let _guard = hydrate_test_guard();
+        let defs = [
+            codebuddy_cli_def("codebuddy-cn"),
+            codebuddy_cli_def("codebuddy-intl"),
+        ];
+        assert!(hydrate(&defs).is_empty());
         let tagged = serde_json::json!({
             "codebuddy.ai/memberEvent": "impl-x",
             "codebuddy.ai/memberHistoryItemId": "h1",
@@ -45062,6 +45113,7 @@ mod tests {
         assert_eq!(member_history_item_id(absent.as_object()), None);
         let empty_hist = serde_json::json!({ "codebuddy.ai/memberHistoryItemId": "" });
         assert_eq!(member_history_item_id(empty_hist.as_object()), None);
+        hydrate(&[]);
     }
 
     /// Drive `frames` (raw `session/update` payloads) through
@@ -45401,31 +45453,115 @@ mod tests {
         assert_eq!(subagent_chunk_parent_tool_use_id(AgentType::CodeBuddy, None), None);
     }
 
-    /// The quirk gate is the exact built-in registration, never an id prefix:
-    /// a custom registration whose id merely starts with "codebuddy" gets
-    /// none of the built-in CodeBuddy quirk handling. Pins the review
-    /// decision that removed the prefix-based `is_codebuddy_family`.
+    // ─── is_codebuddy_family (LOCAL: anchored on the launch recipe) ──────
+
+    /// A custom registration launching `package`'s `cmd` with `--acp` — the
+    /// npx shape the built-in CodeBuddy entry and the dual-account variants
+    /// share.
+    fn npx_acp_def(
+        registry_id: &str,
+        package: &str,
+        cmd: &str,
+    ) -> crate::acp::custom_registry::CustomAgentDef {
+        use crate::acp::custom_registry::{
+            CustomAgentDef, CustomAgentSpec, CustomDistributionKind, NpxSpec,
+        };
+        CustomAgentDef {
+            registry_id: registry_id.into(),
+            name: registry_id.into(),
+            description: String::new(),
+            version: "2.164.0".into(),
+            distribution_kind: CustomDistributionKind::Npx,
+            spec: CustomAgentSpec {
+                npx: Some(NpxSpec {
+                    package: package.into(),
+                    args: vec!["--acp".into()],
+                    env: Default::default(),
+                    cmd: Some(cmd.into()),
+                    node_required: None,
+                }),
+                ..Default::default()
+            },
+            icon_url: None,
+            skills_shared_store: false,
+            skills_dir: None,
+            source: Default::default(),
+            version_probe: None,
+            supports_mcp: true,
+        }
+    }
+
+    /// The dual-account shape: the built-in entry's CLI (`codebuddy --acp`)
+    /// under an arbitrary registry id.
+    fn codebuddy_cli_def(registry_id: &str) -> crate::acp::custom_registry::CustomAgentDef {
+        npx_acp_def(registry_id, "@tencent-ai/codebuddy-code@2.164.0", "codebuddy")
+    }
+
+    /// The family follows the LAUNCH RECIPE, not the registry id: a custom
+    /// registration that runs `codebuddy --acp` gets the quirks under any id
+    /// (`cb-intl` — a rename drops every `codebuddy` prefix the old gate keyed
+    /// on), while a registration that runs a different CLI stays out even when
+    /// its id still says `codebuddy-cn`. `hydrate` replaces the process-global
+    /// registry, so the test holds `hydrate_test_guard` and clears at the end.
     #[test]
-    fn custom_codebuddy_registrations_get_no_builtin_quirks() {
+    fn codebuddy_family_follows_the_launch_recipe_not_the_registry_id() {
+        use crate::acp::custom_registry::{hydrate, hydrate_test_guard};
+        let _guard = hydrate_test_guard();
+
+        assert!(is_codebuddy_family(AgentType::CodeBuddy));
+        assert!(!is_codebuddy_family(AgentType::ClaudeCode));
+        assert!(!is_codebuddy_family(AgentType::OpenCode));
+
+        let defs = [
+            codebuddy_cli_def("cb-intl"),
+            npx_acp_def("codebuddy-cn", "other-agent@1.0.0", "other-agent"),
+            npx_acp_def("other-agent", "other-agent@1.0.0", "other-agent"),
+        ];
+        assert!(hydrate(&defs).is_empty());
+        assert!(is_codebuddy_family(AgentType::Custom("cb-intl")));
+        assert!(!is_codebuddy_family(AgentType::Custom("codebuddy-cn")));
+        assert!(!is_codebuddy_family(AgentType::Custom("other-agent")));
+        hydrate(&[]);
+    }
+
+    /// The suppression window is the core of the sub-agent folding the custom
+    /// agents were missing: an open Agent window must suppress chunks for a
+    /// custom CodeBuddy variant exactly like the built-in.
+    #[test]
+    fn custom_codebuddy_variant_gets_subagent_suppression_and_meta_reads() {
+        use crate::acp::custom_registry::{hydrate, hydrate_test_guard};
+        let _guard = hydrate_test_guard();
+        assert!(hydrate(&[codebuddy_cli_def("codebuddy-cn")]).is_empty());
         let custom = AgentType::Custom("codebuddy-cn");
-        let meta = serde_json::json!({
-            "codebuddy.ai/toolName": "Agent",
-            "codebuddy.ai/isSubagent": true,
-            "codebuddy.ai/parentToolCallId": "chatcmpl-tool-1",
-        });
-        assert!(!codebuddy_meta_marks_subagent(custom, meta.as_object()));
-        assert!(!should_suppress_subagent_chunk(
-            custom,
-            true,
-            meta.as_object()
-        ));
+        // Window open, chunk meta absent → suppressed (the window invariant).
+        assert!(should_suppress_subagent_chunk(custom, true, None));
+        // Window closed, meta marks a sub-agent but carries no link → suppressed
+        // (fallback path).
+        let meta = serde_json::json!({ "codebuddy.ai/isSubagent": true });
+        assert!(should_suppress_subagent_chunk(custom, false, meta.as_object()));
+        // Window closed, no marker → emitted.
+        assert!(!should_suppress_subagent_chunk(custom, false, None));
+        // A LINKED chunk is routed, not suppressed: it emits with its parent id
+        // (even inside an open window) and the frontend files it into the live
+        // Agent capsule — this is the settled-card fix.
+        let linked = serde_json::json!({ "codebuddy.ai/parentToolCallId": "chatcmpl-tool-x" });
+        assert!(!should_suppress_subagent_chunk(custom, true, linked.as_object()));
         assert_eq!(
-            subagent_chunk_parent_tool_use_id(custom, meta.as_object()),
-            None
+            subagent_chunk_parent_tool_use_id(custom, linked.as_object()),
+            Some("chatcmpl-tool-x".to_string())
         );
-        let raw = Some("{\"toolName\":\"x\"}".to_string());
-        assert_eq!(codebuddy_deferred_tool_name(custom, &raw), None);
-        assert_eq!(unwrap_codebuddy_deferred_output(custom, "\"type\""), None);
+        // Meta-based classification and title rewrite work for the variant.
+        let agent_meta = serde_json::json!({ "codebuddy.ai/toolName": "Agent" });
+        assert!(codebuddy_meta_marks_subagent(custom, agent_meta.as_object()));
+        let mut overrides: HashMap<String, String> = HashMap::new();
+        assert_eq!(
+            resolve_rewritten_title(custom, &None, "tc1", false, true, &mut overrides).as_deref(),
+            Some("agent")
+        );
+        // Still scoped: a non-family agent with the same meta is untouched.
+        assert!(!codebuddy_meta_marks_subagent(AgentType::Qoder, agent_meta.as_object()));
+        assert!(!should_suppress_subagent_chunk(AgentType::Qoder, true, None));
+        hydrate(&[]);
     }
 
     /// Drive `emit_conversation_update` over several updates sharing one
