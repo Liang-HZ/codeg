@@ -1495,6 +1495,9 @@ fn attach_subagent_tool_calls(turns: &mut [MessageTurn], session_path: &Path) {
 
     struct TaskInfo {
         status: Option<String>,
+        total_tokens: Option<u64>,
+        duration_ms: Option<u64>,
+        tool_uses: Option<u32>,
         // What the task file filed as the run's outcome. For a COMPLETED run
         // that is the child's final report — reachable here even when the
         // parent turn died before the async result was delivered. The parser
@@ -1527,11 +1530,22 @@ fn attach_subagent_tool_calls(turns: &mut [MessageTurn], session_path: &Path) {
             else {
                 continue;
             };
+            let usage = value.get("usage");
             tasks.entry(parent.to_string()).or_insert_with(|| TaskInfo {
                 status: value
                     .get("status")
                     .and_then(Value::as_str)
                     .map(str::to_string),
+                total_tokens: usage
+                    .and_then(|u| u.get("total_tokens"))
+                    .and_then(Value::as_u64),
+                duration_ms: usage
+                    .and_then(|u| u.get("duration_ms"))
+                    .and_then(Value::as_u64),
+                tool_uses: usage
+                    .and_then(|u| u.get("tool_uses"))
+                    .and_then(Value::as_u64)
+                    .map(|n| n as u32),
                 result: value
                     .get("result")
                     .and_then(Value::as_str)
@@ -1576,16 +1590,44 @@ fn attach_subagent_tool_calls(turns: &mut [MessageTurn], session_path: &Path) {
         let (calls, timeline, _usage, _started, transcript_duration) =
             crate::parsers::claude::parse_subagent_tool_calls(&transcript);
         let info = tasks.remove(&parent);
+        let (mut read, mut search, mut bash, mut edit, mut other) = (0u32, 0u32, 0u32, 0u32, 0u32);
+        for call in &calls {
+            match call.tool_name.as_str() {
+                "Read" => read += 1,
+                "Grep" | "Glob" | "LS" | "List" => search += 1,
+                "Bash" => bash += 1,
+                "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => edit += 1,
+                _ => other += 1,
+            }
+        }
         let stats = AgentExecutionStats {
             agent_type,
             status: info.as_ref().and_then(|i| i.status.clone()),
-            // Neither the task nor the meta file records a duration; the child
-            // transcript's own first/last-record span stands in.
-            total_duration_ms: transcript_duration,
-            total_tool_use_count: Some(calls.len() as u32),
+            // A task file that records a duration wins; current qodercli builds
+            // write none, so the child transcript's own first/last-record span
+            // stands in.
+            total_duration_ms: info
+                .as_ref()
+                .and_then(|i| i.duration_ms)
+                .or(transcript_duration),
+            total_tokens: info.as_ref().and_then(|i| i.total_tokens),
+            total_tool_use_count: Some(
+                info.as_ref()
+                    .and_then(|i| i.tool_uses)
+                    .filter(|n| *n > 0)
+                    .unwrap_or(calls.len() as u32),
+            ),
+            read_count: Some(read),
+            search_count: Some(search),
+            bash_count: Some(bash),
+            edit_file_count: Some(edit),
+            other_tool_count: Some(other),
             tool_calls: calls,
             timeline,
-            recovered_result: info.and_then(|i| i.result),
+            recovered_result: info
+                .as_ref()
+                .and_then(|i| i.result.clone())
+                .filter(|s| !s.trim().is_empty()),
             ..Default::default()
         };
         let target = turns

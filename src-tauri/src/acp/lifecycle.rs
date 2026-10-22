@@ -835,7 +835,6 @@ fn extract_args_match_key(raw_input: Option<&str>) -> Option<DelegationMatchKey>
 /// An escape-free quoted `task` is accepted: with no backslash present, the
 /// evaluated value is exactly the source text (reviewed deviation from plan
 /// v2's blanket "quoted task → no key").
-
 /// `(open, close)` byte offsets of the `(` … `)` wrapping the arguments of
 /// the first `delegate_to_agent(` call reached via a `tools` accessor in real
 /// (non-string, non-comment) JS. `None` when the code exceeds the scan cap,
