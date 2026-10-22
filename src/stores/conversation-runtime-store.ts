@@ -619,7 +619,7 @@ function batchStartCapture(
   // transcript and aligns this batch from its end. A fresh chat streams under
   // a virtual (negative) runtime id until its first send creates the row.
   if (detail === null && current.conversationId > 0) {
-    return { baseline: null, boundaryIndex: null, boundaryHash: null }
+    return { baseline: null, boundaryIndex: null, boundaryHash: null, retiredCount: 0 }
   }
   const turns = detail?.turns ?? []
   const inFlightId = detail?.in_flight_user_turn_id ?? null
@@ -681,7 +681,7 @@ function recaptureBatchStart(
   const prompt = session.optimisticTurns[0]
   const detail = session.detail
   if (session.localTurns.length > 0 || !prompt || !detail) {
-    return { baseline: null, boundaryIndex: null, boundaryHash: null }
+    return { baseline: null, boundaryIndex: null, boundaryHash: null, retiredCount: 0 }
   }
   const turns = detail.turns
   const stamped =
@@ -1873,6 +1873,15 @@ export function computeTurnMetadataPatches(params: {
    */
   parseOpensAtBatch: boolean
   /**
+   * A verified window that leads with this batch's retired twins (their
+   * records landed at/after the boundary, past the batch's own prompt) has no
+   * counterpart for that prompt: `parsedTurns` opens MID-ROUND, so the parse's
+   * first round pairs with the tab's first NON-empty round, not round 0.
+   * Pairing then skips the leading empty local rounds. Requires
+   * `parseOpensAtBatch`.
+   */
+  parseLeadsMidRound?: boolean
+  /**
    * Whether the LAST turn of the parse (any role) is an assistant turn — i.e.
    * the reply that just completed has reached disk — or the line closing the
    * failed round that just ended (see `parseHoldsTheLatestRound`). Agents
@@ -1896,6 +1905,13 @@ export function computeTurnMetadataPatches(params: {
     round.map((index) => sessionTurns[index])
   )
   const surplus = parsedRounds.length - localRounds.length
+  const roundShift =
+    params.parseLeadsMidRound === true
+      ? Math.max(
+          0,
+          localRounds.findIndex((round) => round.length > 0)
+        )
+      : 0
   const fromEnd = !params.parseOpensAtBatch && surplus > 0
   // Whether every round holds as many parsed sub-turns as local ones — the
   // naming gate below needs it on top of the flat count.
@@ -1905,7 +1921,7 @@ export function computeTurnMetadataPatches(params: {
       ? r === 0
         ? parsedRounds.slice(0, surplus + 1).flat()
         : parsedRounds[r + surplus]
-      : (parsedRounds[r] ?? [])
+      : (parsedRounds[r - roundShift] ?? [])
     if (parsedRound.length !== localRound.length) everyRoundLinesUp = false
     alignRoundStats(localRound, parsedRound, stats)
   })
@@ -4845,10 +4861,17 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
               legacyCut && boundaryIndex != null
                 ? parsed.turns.slice(boundaryIndex)
                 : parsed.turns
-            const persistedAssistantCount =
-              responseWindowed || legacyCut
+            // Retired twins from earlier refetches still lead whatever the
+            // response holds (window or full parse), so the alignment skips
+            // exactly that many persisted assistants on top of the history
+            // baseline. A fired `legacyCut` already sliced the parse at the
+            // batch boundary — nothing retired is left in front of it.
+            const retiredAssistants = cur.batchRetiredAssistantCount
+            const persistedAssistantCount = responseWindowed
+              ? retiredAssistants
+              : legacyCut
                 ? 0
-                : (cur.historyAssistantBaseline ?? 0)
+                : (cur.historyAssistantBaseline ?? 0) + retiredAssistants
             const patches =
               responseWindowed && !windowVerified
                 ? []
@@ -4857,6 +4880,13 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
                     parsedTurns,
                     persistedAssistantCount,
                     parseOpensAtBatch: windowVerified || legacyCut,
+                    // A verified window leads with the batch's retired twins
+                    // (they landed past the batch's own prompt), so its
+                    // rounds start mid-round.
+                    parseLeadsMidRound:
+                      responseWindowed &&
+                      windowVerified &&
+                      retiredAssistants > 0,
                     parseEndsWithAssistant: parseHoldsTheLatestRound(
                       parsed.turns,
                       cur.localTurns

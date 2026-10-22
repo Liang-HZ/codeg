@@ -72,7 +72,7 @@ export function isOutOfTurnContentEvent(envelope: {
   // `prompt_suggestion` withdrawal or a `member_chunk` tool frame); the string
   // arms below treat it as absent.
   text?: string | null
-  tool_call_id?: string
+  tool_call_id?: string | null
 }): boolean {
   if (envelope.type === "content_delta" || envelope.type === "thinking") {
     return (envelope.text?.trim().length ?? 0) > 0
