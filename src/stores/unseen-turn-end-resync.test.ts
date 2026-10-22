@@ -116,6 +116,7 @@ function seedStreamingOwner(
     historyAssistantBaseline: 0,
     batchBoundaryIndex: 0,
     batchBoundaryPrefixHash: null,
+    batchRetiredAssistantCount: 0,
     loadingOlderTurns: false,
     olderTurnsPrependEpoch: 0,
     pendingOutOfTurnContent: false,
