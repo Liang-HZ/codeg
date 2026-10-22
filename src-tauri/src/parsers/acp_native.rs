@@ -3443,6 +3443,7 @@ mod zcode_history_tests {
             "attachments",
             EntryKind::Prompt,
             payload.clone(),
+            None,
         )
         .await
         .unwrap();
@@ -3453,6 +3454,7 @@ mod zcode_history_tests {
                 "attachments",
                 EntryKind::Update,
                 serde_json::json!({"sessionUpdate":"user_message_chunk", "content":content}),
+                None,
             )
             .await
             .unwrap();
@@ -3460,6 +3462,7 @@ mod zcode_history_tests {
         acp_transcript::record_entry_in(
             dir.path(), agent, "attachments", EntryKind::Update,
             serde_json::json!({"sessionUpdate":"agent_message_chunk", "content":{"type":"text","text":"Read both"}}),
+            None,
         ).await.unwrap();
         acp_transcript::record_entry_in(
             dir.path(),
@@ -3467,6 +3470,7 @@ mod zcode_history_tests {
             "attachments",
             EntryKind::TurnEnd,
             serde_json::json!({"stopReason":"end_turn"}),
+            None,
         )
         .await
         .unwrap();
@@ -3537,7 +3541,7 @@ mod zcode_history_tests {
                 serde_json::json!({"stopReason":"end_turn","model":"glm-test","usage":{"inputTokens":10,"outputTokens":5}}),
             ),
         ] {
-            acp_transcript::record_entry_in(root, agent, "old", kind, payload)
+            acp_transcript::record_entry_in(root, agent, "old", kind, payload, None)
                 .await
                 .unwrap();
         }
@@ -3575,6 +3579,7 @@ mod zcode_history_tests {
             "new",
             EntryKind::Prompt,
             serde_json::json!([{"type":"text","text":"Continue"}]),
+            None,
         )
         .await
         .unwrap();
@@ -3627,6 +3632,7 @@ mod zcode_legacy_history_tests {
                     sid,
                     EntryKind::Prompt,
                     serde_json::json!([{"type":"text","text":format!("{marker}:{sid}")}]),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -3636,6 +3642,7 @@ mod zcode_legacy_history_tests {
                     sid,
                     EntryKind::TurnEnd,
                     serde_json::json!({"stopReason":"end_turn"}),
+                    None,
                 )
                 .await
                 .unwrap();

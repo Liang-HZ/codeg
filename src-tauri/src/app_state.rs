@@ -214,7 +214,6 @@ pub fn build_delegation_stack(
         DelegationBroker::with_writers(spawner, depth_lookup, meta_writer, event_emitter)
             .with_status_lookup(status_lookup)
             .with_live_reply_lookup(live_reply_lookup)
-            .with_live_reply_lookup(live_reply_lookup)
             .with_assistants(assistants)
             .with_result_sink(result_sink),
     );
