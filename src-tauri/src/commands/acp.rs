@@ -6164,11 +6164,7 @@ pub(crate) fn pi_enabled_model_patterns_for_env(
 /// inherits codeg's own. `~` and the default expand against the child's home
 /// ([`pi_child_home`]). Never trimmed: pi reads the raw value (`normalizePath`
 /// expands `~` and nothing else).
-<<<<<<< HEAD
 pub(crate) fn pi_agent_dir_for_env(runtime_env: &BTreeMap<String, String>) -> PathBuf {
-=======
-fn pi_agent_dir_for_env(runtime_env: &BTreeMap<String, String>) -> PathBuf {
->>>>>>> 78868818 (refactor(acp): make the opencode desktop model toggles the only filter source)
     pi_agent_dir_for_child(runtime_env, std::env::var_os("PI_CODING_AGENT_DIR"))
 }
 

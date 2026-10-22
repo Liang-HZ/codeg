@@ -6179,6 +6179,7 @@ mod tests {
             None,
             None,
             Some(format!("{NOTICE_MESSAGE_ID_PREFIX}task-1")),
+            false,
         )
         .await
         .expect("enqueue should succeed with a live receiver");
@@ -6188,6 +6189,7 @@ mod tests {
                 blocks,
                 user_message,
                 source,
+                ..
             }) => {
                 assert!(
                     user_message.is_none(),
@@ -6380,6 +6382,7 @@ mod tests {
             blocks,
             user_message,
             internal_suffix,
+            ..
         } = cmd_rx.try_recv().expect("one prompt command")
         else {
             panic!("expected prompt command");
