@@ -3601,7 +3601,6 @@ impl ConnectionManager {
                 let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                 cmd_tx
                     .send(ConnectionCommand::Steer {
-                    source: None,
                         blocks: wire_blocks,
                         reply: reply_tx,
                     })
@@ -3672,6 +3671,45 @@ impl ConnectionManager {
     /// `check_user_feedback` round-trip so the listener can commit delivery only
     /// after the response is actually written (a dropped / failed write leaves
     /// the notes pending for the agent's next check).
+    /// Lightweight native steer for delegation notices: inject text into the
+    /// running turn without creating a `FeedbackItem` or broadcasting one.
+    /// Used by the delegation result-delivery sink when the parent is busy.
+    pub async fn steer_notice(
+        &self,
+        conn_id: &str,
+        blocks: Vec<PromptInputBlock>,
+    ) -> Result<(), AcpError> {
+        let (state, cmd_tx) = {
+            let connections = self.connections.lock().await;
+            let conn = connections
+                .get(conn_id)
+                .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.to_string()))?;
+            (conn.state.clone(), conn.cmd_tx.clone())
+        };
+        if !state.read().await.native_steering_available {
+            return Err(AcpError::NoActiveTurn);
+        }
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        cmd_tx
+            .send(ConnectionCommand::Steer {
+                blocks,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| AcpError::ProcessExited)?;
+        let steer = reply_rx
+            .await
+            .map_err(|_| AcpError::protocol("Steer reply channel closed".to_string()))??;
+        match steer {
+            SteerOutcome::Injected => Ok(()),
+            SteerOutcome::PromptRequired => Err(AcpError::NoActiveTurn),
+            SteerOutcome::StartedNewTurn => {
+                state.write().await.native_steering_available = false;
+                Err(AcpError::NoActiveTurn)
+            }
+        }
+    }
+
     pub async fn read_pending_feedback(&self, conn_id: &str) -> Vec<PendingFeedback> {
         let Some(state) = self.get_state(conn_id).await else {
             return Vec::new();
