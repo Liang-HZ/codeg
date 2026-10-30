@@ -15155,7 +15155,7 @@ async fn run_conversation_loop(
                 // order matches the wire order even if the agent replies
                 // instantly — and awaited, so the replay gate can never see
                 // this conversation as transcript-less (see `record_prompt`).
-                record_prompt(agent_type, &sid.0, &prompt_blocks, source.as_deref()).await;
+                record_prompt(agent_type, &sid.0, &prompt_blocks, None).await;
                 prompted = true;
                 // claude-agent-acp answers a `/remote-control` prompt itself;
                 // its reply says whether Remote Control is on.
@@ -15897,11 +15897,7 @@ async fn run_conversation_loop(
                                         let _ = reply.send(landed);
                                     }
                                 }
-                                Some(ConnectionCommand::Steer {
-                                    blocks,
-                                    reply,
-                                    source,
-                                }) => {
+                                Some(ConnectionCommand::Steer { blocks, reply }) => {
                                     // Protocol round-trip only — the manager's
                                     // cancellation-shielded task records the
                                     // note + broadcasts `FeedbackSubmitted`
@@ -15973,7 +15969,7 @@ async fn run_conversation_loop(
                                             agent_type,
                                             &sid.0,
                                             &map_prompt_blocks(blocks.clone()),
-                                            source.as_deref(),
+                                            None,
                                         )
                                         .await;
                                     }
@@ -16272,11 +16268,7 @@ async fn run_conversation_loop(
                     let _ = reply.send(landed);
                 }
             }
-            Some(ConnectionCommand::Steer {
-                blocks: _,
-                reply,
-                source: _,
-            }) => {
+            Some(ConnectionCommand::Steer { blocks: _, reply }) => {
                 // Steering only means something for a RUNNING turn. Reply —
                 // never drop — so the manager's shielded task can't hang on
                 // the oneshot; the caller falls back to a normal prompt (the
