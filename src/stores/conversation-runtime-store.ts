@@ -619,7 +619,7 @@ function batchStartCapture(
   // transcript and aligns this batch from its end. A fresh chat streams under
   // a virtual (negative) runtime id until its first send creates the row.
   if (detail === null && current.conversationId > 0) {
-    return { baseline: null, boundaryIndex: null, boundaryHash: null, retiredCount: 0 }
+    return { baseline: null, boundaryIndex: null, boundaryHash: null }
   }
   const turns = detail?.turns ?? []
   const inFlightId = detail?.in_flight_user_turn_id ?? null
@@ -681,7 +681,7 @@ function recaptureBatchStart(
   const prompt = session.optimisticTurns[0]
   const detail = session.detail
   if (session.localTurns.length > 0 || !prompt || !detail) {
-    return { baseline: null, boundaryIndex: null, boundaryHash: null, retiredCount: 0 }
+    return { baseline: null, boundaryIndex: null, boundaryHash: null }
   }
   const turns = detail.turns
   const stamped =
@@ -4866,7 +4866,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
             // exactly that many persisted assistants on top of the history
             // baseline. A fired `legacyCut` already sliced the parse at the
             // batch boundary — nothing retired is left in front of it.
-            const retiredAssistants = cur.batchRetiredAssistantCount
+            const retiredAssistants = 0
             const persistedAssistantCount = responseWindowed
               ? retiredAssistants
               : legacyCut

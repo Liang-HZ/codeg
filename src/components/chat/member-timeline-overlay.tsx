@@ -35,9 +35,7 @@ import {
 } from "lucide-react"
 
 import {
-  Reasoning,
-  ReasoningContent,
-  ReasoningTrigger,
+  ReasoningMarkdown,
 } from "@/components/ai-elements/reasoning"
 import { MessageResponse } from "@/components/ai-elements/message"
 import { CollapsedOverlayChip } from "@/components/chat/collapsed-overlay-chip"
@@ -190,12 +188,13 @@ function MemberItemRow({ item }: { item: MemberTimelineItem }) {
     case "thought": {
       // The main thread's reasoning chrome, same expand rule.
       const hasContent = item.text.trim().length > 0
-      const expandable = hasContent || !item.final
+      if (!hasContent) return null
       return (
-        <Reasoning isStreaming={!item.final} expandable={expandable}>
-          <ReasoningTrigger />
-          {expandable && <ReasoningContent>{item.text}</ReasoningContent>}
-        </Reasoning>
+        <div className="max-w-[65ch] text-sm leading-relaxed text-muted-foreground [&_p]:my-1.5">
+          <ReasoningMarkdown isStreaming={!item.final}>
+            {item.text}
+          </ReasoningMarkdown>
+        </div>
       )
     }
     case "user":
