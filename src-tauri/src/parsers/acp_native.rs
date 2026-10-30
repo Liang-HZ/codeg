@@ -63,7 +63,6 @@ use crate::models::message::{
 use crate::parsers::{
     truncate_str, user_turn_block, user_turn_block_from_wire, AgentEnv, AgentParser, ParseError,
 };
-};
 
 pub struct AcpNativeParser {
     agent_type: AgentType,

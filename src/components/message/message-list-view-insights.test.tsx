@@ -208,7 +208,6 @@ function seed(over: Partial<DbConversationDetail> = {}): void {
     historyAssistantBaseline: null,
     batchBoundaryIndex: null,
     batchBoundaryPrefixHash: null,
-    batchRetiredAssistantCount: 0,
     loadingOlderTurns: false,
     olderTurnsPrependEpoch: 0,
     pendingOutOfTurnContent: false,
