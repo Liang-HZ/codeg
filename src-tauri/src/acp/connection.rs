@@ -4635,6 +4635,19 @@ async fn emit_config_options(
     // preference replay, retirement healing) keeps the agent's raw one.
     let visible = crate::acp::model_visibility::filter_model_options(&availability, visible);
     if update && agent_type == AgentType::Hermes {
+        // Folded against the selectors on screen under the same lock that
+        // replaces them, so a pick landing in between is not undone.
+        let native = map_session_config_options(&visible);
+        emit_with_state_built(state, emitter, |s| {
+            let config_options = match s.config_options.as_deref() {
+                Some(shown) => fold_hermes_config_options(shown, native),
+                None => native,
+            };
+            Some(AcpEvent::SessionConfigOptions { config_options })
+        })
+        .await;
+        return;
+    }
     emit_with_state(
         state,
         emitter,
